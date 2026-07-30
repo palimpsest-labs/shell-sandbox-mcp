@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shell-sandbox-mcp"
+version = "0.1.0"
+description = "MCP server for safe shell command execution via pledge() + busybox sandbox"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0,<2.0.0",
+]
+
+[project.scripts]
+shell-sandbox-mcp = "shell_sandbox_mcp.server:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]

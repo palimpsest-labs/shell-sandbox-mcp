@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+bin/sandbox.aarch64.elf
+bin/sandbox.com.dbg
