@@ -100,9 +100,11 @@ int main(int argc, char *argv[]) {
     unveil("/tmp", "rwc");
     unveil("/etc", "r");  /* git needs /etc for config */
     /* file(1) magic database; curl needs DNS resolver config in /run
-       (/etc/resolv.conf is a symlink to /run/systemd/resolve/stub-resolv.conf) */
+       (/etc/resolv.conf is a symlink to /run/systemd/resolve/stub-resolv.conf).
+       Narrow the unveil to just the DNS config path — not all of /run,
+       which would expose /run/user/<uid> session state. */
     unveil("/usr/share", "r");
-    unveil("/run", "r");
+    unveil("/run/systemd/resolve", "r");
     /* Devices: git, cargo, and shell tools need /dev/null and /dev/urandom */
     unveil("/dev/null", "rw");
     unveil("/dev/urandom", "r");

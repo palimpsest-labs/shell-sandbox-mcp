@@ -40,11 +40,12 @@ def _git_config_paths() -> list[str]:
 
     Covers the user-global config (~/.gitconfig) and the XDG config file
     (~/.config/git/config). Missing paths are ignored by the sandbox.
+    Paths are resolved to their canonical form, matching the rest of the code.
     """
-    home = Path.home()
+    home = Path.home().resolve()
     return [
-        str(home / ".gitconfig"),
-        str(home / ".config" / "git" / "config"),
+        str((home / ".gitconfig").resolve()),
+        str((home / ".config" / "git" / "config").resolve()),
     ]
 
 
@@ -171,6 +172,7 @@ def _resolve_command(
                 "binary": binary,
                 "promises": "stdio rpath wpath cpath prot_exec",
                 "description": f"Local binary under cwd: {binary}",
+                "is_local_binary": True,
             }
             return binary, args, cfg
 
@@ -188,13 +190,8 @@ def _resolve_local_binary(cmd_name: str, work_dir: Path) -> Optional[str]:
     if cmd_name in (".", ".."):
         return None
 
-    try:
-        raw = Path(cmd_name)
-        candidate = raw if raw.is_absolute() else (work_dir / raw)
-        candidate = candidate.resolve()
-        # Must stay inside the working directory (or below it).
-        candidate.relative_to(work_dir)
-    except (ValueError, OSError):
+    candidate = _contained_path(cmd_name, work_dir)
+    if candidate is None:
         return None
 
     if not candidate.is_file() or not os.access(candidate, os.X_OK):
@@ -203,16 +200,48 @@ def _resolve_local_binary(cmd_name: str, work_dir: Path) -> Optional[str]:
     return str(candidate)
 
 
+def _contained_path(cmd_name: str, work_dir: Path) -> Optional[Path]:
+    """Resolve `cmd_name` relative to `work_dir`, returning the resolved
+    path only if it stays within the working tree; else None.
 
-def _validate_cwd(cwd: str) -> Optional[str]:
-    """Validate working directory. Returns error or None."""
+    Uses `resolve()` (which follows symlinks), so a symlink inside the cwd
+    pointing outside it is caught by the containment check.
+    """
     try:
-        resolved = Path(cwd).expanduser().resolve()
-    except Exception:
-        return f"Invalid path: {cwd}"
+        raw = Path(cmd_name)
+        candidate = raw if raw.is_absolute() else (work_dir / raw)
+        candidate = candidate.resolve()
+        # Must stay inside the working directory (or below it).
+        candidate.relative_to(work_dir)
+    except (ValueError, OSError):
+        return None
+    return candidate
 
+
+def _binary_still_contained(binary: str, work_dir: Path) -> bool:
+    """Re-verify a previously-resolved local binary path is still an
+    executable file contained within the work dir, right before exec.
+
+    Narrows the TOCTOU window between initial resolution and exec: if a
+    directory component was swapped for a symlink escaping the tree in the
+    meantime, the re-resolve + containment check catches it. Called with the
+    path actually passed to the sandbox.
+    """
+    candidate = _contained_path(binary, work_dir)
+    if candidate is None:
+        return False
+    return candidate.is_file() and os.access(candidate, os.X_OK)
+
+
+
+def _validate_cwd(resolved: Path, raw: str) -> Optional[str]:
+    """Validate a working directory. `resolved` must be an already-resolved
+    absolute path; `raw` is the user's original input for error messages.
+
+    Returns an error string, or None if valid.
+    """
     if not resolved.is_dir():
-        return f"Directory not found: {cwd}"
+        return f"Directory not found: {raw}"
 
     # Must be within an allowed tree or a subdirectory thereof
     for allowed in DEFAULT_ALLOWED_DIRS:
@@ -223,7 +252,7 @@ def _validate_cwd(cwd: str) -> Optional[str]:
         except ValueError:
             continue
 
-    return f"Directory not in allowed paths: {cwd}"
+    return f"Directory not in allowed paths: {raw}"
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +295,7 @@ def shell_run(
     except Exception:
         return f"Invalid path: {raw_cwd}"
 
-    err = _validate_cwd(str(work_dir))
+    err = _validate_cwd(work_dir, raw_cwd)
     if err:
         return err
 
@@ -314,6 +343,12 @@ def shell_run(
 
     if unveil_env:
         env = {**os.environ, **unveil_env}
+
+    # Narrow the TOCTOU window for local binaries: re-verify the resolved
+    # path is still an executable contained within the work dir right before
+    # exec, in case a directory component was swapped in the meantime.
+    if cfg.get("is_local_binary") and not _binary_still_contained(binary, work_dir):
+        return f"Local binary no longer valid inside working directory: {binary}"
 
     try:
         result = subprocess.run(
