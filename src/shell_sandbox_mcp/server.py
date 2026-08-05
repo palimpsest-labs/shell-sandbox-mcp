@@ -103,6 +103,25 @@ COMMANDS = {
         ),
         "extra_unveil_rx": _cosmo_toolchain_paths,
     },
+    # Compiler aliases — all map to the same vendored cosmocc driver.
+    "gcc": {
+        "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
+        "extra_unveil_rx": _cosmo_toolchain_paths,
+    },
+    "cc": {
+        "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
+        "extra_unveil_rx": _cosmo_toolchain_paths,
+    },
+    "clang": {
+        "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
+        "extra_unveil_rx": _cosmo_toolchain_paths,
+    },
     "python3": {
         "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),
         "promises": "stdio rpath wpath cpath inet dns recvfd",
