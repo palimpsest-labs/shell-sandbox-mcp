@@ -49,12 +49,23 @@ def _git_config_paths() -> list[str]:
     ]
 
 
+def _git_credential_paths() -> list[str]:
+    """Return the git credential store file under $HOME that must be unveiled
+    read-write, so the `store` credential helper can read and update it
+    (e.g. for authenticated pushes against GitHub).
+    """
+    return [
+        str((Path.home().resolve() / ".git-credentials").resolve()),
+    ]
+
+
 COMMANDS = {
     "git": {
         "binary": "/usr/bin/git",
-        "promises": "stdio rpath wpath cpath prot_exec",
+        "promises": "stdio rpath wpath cpath prot_exec inet dns proc",
         "description": "Git version control",
         "extra_unveil": _git_config_paths,
+        "extra_unveil_rw": _git_credential_paths,
     },
     "cargo": {
         "binary": "cargo",
@@ -325,6 +336,12 @@ def shell_run(
         paths = extra_unveil() if callable(extra_unveil) else extra_unveil
         if paths:
             unveil_env["SANDBOX_UNVEIL_R"] = ":".join(paths)
+
+    extra_unveil_rw = cfg.get("extra_unveil_rw")
+    if extra_unveil_rw:
+        paths = extra_unveil_rw() if callable(extra_unveil_rw) else extra_unveil_rw
+        if paths:
+            unveil_env["SANDBOX_UNVEIL_RW"] = ":".join(paths)
 
     # Sandbox-local python site dir: create <cwd>/.py-site, expose the base
     # via PYTHONUSERBASE (so `pip install --user` lands inside the sandbox)
