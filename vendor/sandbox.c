@@ -65,6 +65,13 @@ int main(int argc, char *argv[]) {
     unveil("/bin", "rx");
     unveil("/tmp", "rwc");
     unveil("/etc", "r");  /* git needs /etc for config */
+    /* file(1) magic database; curl needs DNS resolver config in /run
+       (/etc/resolv.conf is a symlink to /run/systemd/resolve/stub-resolv.conf) */
+    unveil("/usr/share", "r");
+    unveil("/run", "r");
+    /* Devices: git, cargo, and shell tools need /dev/null and /dev/urandom */
+    unveil("/dev/null", "rw");
+    unveil("/dev/urandom", "r");
     /* Also unveil the binary itself if we can determine its path */
     if (cmd[0] == '/') {
         unveil(cmd, "rx");

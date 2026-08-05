@@ -46,14 +46,29 @@ COMMANDS = {
         "promises": "stdio rpath wpath cpath proc prot_exec",
         "description": "Rust package manager (build, test, check, fmt, clippy)",
     },
+    "python3": {
+        "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),
+        "promises": "stdio rpath wpath cpath",
+        "description": "Python 3 interpreter (Cosmopolitan static build)",
+    },
+    "file": {
+        "binary": str(REPO_ROOT / "bin" / "cosmo" / "file"),
+        "promises": "stdio rpath",
+        "description": "Determine file type (Cosmopolitan static build)",
+    },
 }
 
 BUSYBOX_APPLETS = [
-    "cat", "head", "tail", "wc", "sort", "uniq",
-    "grep", "ls", "echo", "test", "expr",
-    "mkdir", "cp", "mv", "chmod",
+    # text/read
+    "cat", "head", "tail", "wc", "sort", "uniq", "nl", "tac", "tee",
+    "grep", "ls", "echo", "printf", "test", "expr",
     "cut", "tr", "diff", "cmp", "md5sum", "sha256sum",
     "which", "basename", "dirname", "realpath",
+    # file manipulation
+    "mkdir", "cp", "mv", "rm", "touch", "chmod",
+    # inspection
+    "find", "sed", "awk", "stat", "readlink", "df", "du", "uname",
+    "id", "date", "env", "seq", "shuf", "xargs", "unzip",
     "true", "false", "sleep",
 ]
 
