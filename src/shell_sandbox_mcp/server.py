@@ -121,8 +121,17 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_command(args: list[str]) -> tuple[str, list[str], dict] | tuple[None, str, None]:
+def _resolve_command(
+    args: list[str],
+    work_dir: Optional[Path] = None,
+) -> tuple[str, list[str], dict] | tuple[None, str, None]:
     """Resolve and validate a command against the allowlist.
+
+    If the command is not a known allowlisted command, and a working
+    directory is provided, tries to resolve the first token as a local
+    binary path relative to that directory (e.g. "./scripts/foo" or
+    "target/release/bar"). Such a binary is only allowed if it resolves
+    to an executable file inside (or below) the working directory.
 
     Returns (binary_path, final_args, command_config) or (None, error_msg, None).
     """
@@ -149,13 +158,50 @@ def _resolve_command(args: list[str]) -> tuple[str, list[str], dict] | tuple[Non
             f"Use individual applets instead: {', '.join(BUSYBOX_APPLETS[:10])}..."
         ), None
 
-    # Check direct commands (git, cargo)
-    if cmd_name not in COMMANDS:
-        return None, f"Command not allowed: {cmd_name}. Use shell_list to see allowed commands.", None
+    # Check direct commands (git, cargo, ...)
+    if cmd_name in COMMANDS:
+        cfg = COMMANDS[cmd_name]
+        return cfg["binary"], args, cfg
 
-    cfg = COMMANDS[cmd_name]
-    binary = cfg["binary"]
-    return binary, args, cfg
+    # Fall back to resolving a local binary under the working directory.
+    if work_dir is not None:
+        binary = _resolve_local_binary(cmd_name, work_dir)
+        if binary is not None:
+            cfg = {
+                "binary": binary,
+                "promises": "stdio rpath wpath cpath prot_exec",
+                "description": f"Local binary under cwd: {binary}",
+            }
+            return binary, args, cfg
+
+    return None, f"Command not allowed: {cmd_name}. Use shell_list to see allowed commands.", None
+
+
+def _resolve_local_binary(cmd_name: str, work_dir: Path) -> Optional[str]:
+    """Try to resolve `cmd_name` to an executable file under `work_dir`.
+
+    Accepts a bare name, a relative path (e.g. "scripts/foo" or
+    "./target/bar"), or an absolute path, as long as it stays within the
+    working tree. Returns the resolved binary path, or None if it is not
+    an allowed local executable.
+    """
+    if cmd_name in (".", ".."):
+        return None
+
+    try:
+        raw = Path(cmd_name)
+        candidate = raw if raw.is_absolute() else (work_dir / raw)
+        candidate = candidate.resolve()
+        # Must stay inside the working directory (or below it).
+        candidate.relative_to(work_dir)
+    except (ValueError, OSError):
+        return None
+
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        return None
+
+    return str(candidate)
+
 
 
 def _validate_cwd(cwd: str) -> Optional[str]:
@@ -212,12 +258,8 @@ def shell_run(
     if not args:
         return "Empty command."
 
-    # Resolve and validate
-    binary, final_args, cfg = _resolve_command(args)
-    if binary is None:
-        return final_args  # error message
-
-    # Validate cwd — resolve once, use for both validation and execution
+    # Validate cwd first — resolve once, use for validation, resolution and
+    # execution. Required before resolving so local binaries can be located.
     raw_cwd = cwd or "."
     try:
         work_dir = Path(raw_cwd).expanduser().resolve()
@@ -227,6 +269,11 @@ def shell_run(
     err = _validate_cwd(str(work_dir))
     if err:
         return err
+
+    # Resolve and validate against the allowlist (or a local binary under cwd)
+    binary, final_args, cfg = _resolve_command(args, work_dir)
+    if binary is None:
+        return final_args  # error message
 
     # Build sandbox invocation via the exec wrapper (bypasses posix_spawn APE issue)
     # Prepend per-command args (e.g. python3's "-S") before the user's args.
@@ -318,6 +365,11 @@ def shell_list() -> str:
     lines.append(f"  busybox applets ({len(BUSYBOX_APPLETS)}): {', '.join(BUSYBOX_APPLETS)}")
     lines.append(f"    Binary: {BUSYBOX_BIN.resolve()}")
     lines.append(f"    Promises: stdio rpath wpath cpath")
+    lines.append("")
+    lines.append("Local binaries: any executable file inside the working")
+    lines.append("    directory (or below) can be run by name or path, e.g.")
+    lines.append("    './scripts/foo' or 'target/release/bar'. Paths escaping")
+    lines.append("    the working directory are rejected.")
     lines.append("")
     lines.append(f"Sandbox binary: {SANDBOX_BIN.resolve()}")
     lines.append(f"Allowed directories: {', '.join(DEFAULT_ALLOWED_DIRS)}")

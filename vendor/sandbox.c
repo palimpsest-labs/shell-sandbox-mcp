@@ -56,7 +56,7 @@ static int unveil_list_from_env(const char *name, const char *perms) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 6) {
+    if (argc < 5) {
         fprintf(stderr, "Usage: sandbox PROMISES UNVEIL_DIR -- cmd [args...]\n");
         fprintf(stderr, "Example: sandbox 'stdio rpath' /tmp -- cat /etc/hostname\n");
         return 1;
