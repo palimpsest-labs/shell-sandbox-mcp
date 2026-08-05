@@ -749,6 +749,28 @@ class ExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(redirs[0].op, ">&")
         self.assertEqual(redirs[0].target_fd, 2)
 
+    def test_2gt1x_not_fd_dup(self) -> None:
+        # `2>&1x` — the `x` after `1` means this is a `2>` redirect to file
+        # `&1x`, NOT an fd-dup operator.
+        args, redirs, err = self._extract("cmd 2>&1x")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 2)
+        self.assertEqual(redirs[0].op, ">")
+        self.assertEqual(redirs[0].raw_target, "&1x")
+
+    def test_1gt2y_not_fd_dup(self) -> None:
+        # `1>&2y` — the `y` after `2` means this is a `1>` redirect to file
+        # `&2y`, NOT an fd-dup operator.
+        args, redirs, err = self._extract("cmd 1>&2y")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 1)
+        self.assertEqual(redirs[0].op, ">")
+        self.assertEqual(redirs[0].raw_target, "&2y")
+
     def test_quoted_operator_not_redirect(self) -> None:
         args, redirs, err = self._extract('echo ">" hello')
         self.assertIsNone(err)
@@ -819,17 +841,9 @@ class ExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(err, "Redirects only support fds 1 and 2 (got 0)")
 
     def test_2gt3_error(self) -> None:
-        # 2>&3 is checked — only 1 and 2 are valid target fds.
-        # Actually 2>&3 doesn't match 2>&1 (3 != 1), so it falls through to
-        # 2> matching, and the target is "&3". That's a file named "&3", not
-        # an fd-dup error. Let's verify:
+        # 2>&3 — only 1 and 2 are valid dup target fds.
         args, redirs, err = self._extract("cmd 2>&3")
-        self.assertIsNone(err)
-        self.assertEqual(args, ["cmd"])
-        self.assertEqual(len(redirs), 1)
-        self.assertEqual(redirs[0].fd, 2)
-        self.assertEqual(redirs[0].op, ">")
-        self.assertEqual(redirs[0].raw_target, "&3")
+        self.assertEqual(err, "Redirect dup target fd must be 1 or 2")
 
     def test_input_redirect_error(self) -> None:
         args, redirs, err = self._extract("cmd < file")

@@ -521,15 +521,28 @@ def _extract_redirects(segment: str) -> tuple[list[str], list[Redirect], Optiona
 
         rem = segment[i:]
 
-        # -- longest-match-first: 4-char patterns --
-        if rem.startswith('2>&1'):
+        # -- longest-match-first: 4-char fd-dup patterns --
+        # Only treat `2>&1` / `1>&2` as fd-dup when the char after the
+        # 4-char sequence (if any) is NOT alphanumeric or underscore
+        # (whitespace, end-of-input, or another operator).  Otherwise
+        # `cmd 2>&1x` is a `2>` redirect to file `&1x`, not fd-dup.
+        if rem.startswith('2>&1') and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_')):
             i += 4
             redirects.append(Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1'))
             continue
-        if rem.startswith('1>&2'):
+        if rem.startswith('1>&2') and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_')):
             i += 4
             redirects.append(Redirect(fd=1, op='>&', target_path=None, target_fd=2, raw_target='2'))
             continue
+
+        # -- 4-char fd-dup patterns for disallowed target fds --
+        # e.g. `2>&3`, `1>&4` — only 1 and 2 are valid dup targets.
+        # Require a word boundary after the 4-char sequence, otherwise
+        # `2>&3x` is a `2>` redirect to file `&3x`, not fd-dup.
+        if (len(rem) >= 4 and rem[0].isdigit() and rem[1:3] == '>&'
+                and rem[3].isdigit()
+                and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_'))):
+            return [], [], "Redirect dup target fd must be 1 or 2"
 
         # -- 3-char patterns --
         if rem.startswith('2>>'):
@@ -803,6 +816,11 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
         redirects, subprocess.PIPE, subprocess.PIPE,
     )
 
+    # Ensure shared_read_fd is closed on every exit path (including
+    # TimeoutExpired / OSError), not just the success path.
+    if shared_read_fd is not None:
+        to_close.append(shared_read_fd)
+
     try:
         result = subprocess.run(
             sandbox_args,
@@ -820,13 +838,7 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
 
         # If a shared pipe was created by 1>&2, read the combined output from it.
         if shared_read_fd is not None:
-            try:
-                combined = os.read(shared_read_fd, MAX_OUTPUT + 1)
-            finally:
-                try:
-                    os.close(shared_read_fd)
-                except OSError:
-                    pass
+            combined = os.read(shared_read_fd, MAX_OUTPUT + 1)
             stdout_bytes = combined
             stderr_bytes = b""
 
@@ -856,9 +868,12 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
     except OSError as e:
         return 1, f"Error running command: {e}"
     finally:
-        for fh in to_close:
+        for item in to_close:
             try:
-                fh.close()
+                if isinstance(item, int):
+                    os.close(item)
+                else:
+                    item.close()
             except OSError:
                 pass
 
@@ -924,19 +939,40 @@ def _run_pipeline(
     # Launch every stage, chaining each one's stdout into the next one's stdin.
     procs: list[subprocess.Popen] = []
     prev: Optional[subprocess.Popen] = None
-    for i, (sandbox_args, env, _redirects) in enumerate(invocations):
-        p = subprocess.Popen(
-            sandbox_args,
-            stdin=prev.stdout if prev is not None else None,
-            stdout=stdout_targets[i],
-            stderr=stderr_targets[i],
-            cwd=str(work_dir),
-            env=env,
-        )
-        if prev is not None:
-            prev.stdout.close()  # parent no longer holds the read end
-        procs.append(p)
-        prev = p
+    try:
+        for i, (sandbox_args, env, _redirects) in enumerate(invocations):
+            p = subprocess.Popen(
+                sandbox_args,
+                stdin=prev.stdout if prev is not None else None,
+                stdout=stdout_targets[i],
+                stderr=stderr_targets[i],
+                cwd=str(work_dir),
+                env=env,
+            )
+            if prev is not None:
+                prev.stdout.close()  # parent no longer holds the read end
+            procs.append(p)
+            prev = p
+    except Exception as e:
+        # Clean up already-launched procs and open handles so nothing leaks.
+        for p in procs:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+        for p in procs:
+            p.wait()
+        for fh in all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if last_shared_read_fd is not None:
+            try:
+                os.close(last_shared_read_fd)
+            except OSError:
+                pass
+        return 1, f"Failed to launch pipeline: {e}"
 
     # Drain the stderr of every stage but the last on a thread, so a chatty
     # producer can't deadlock on a full stderr pipe. Skip stages whose stderr
@@ -1014,7 +1050,9 @@ def _run_pipeline(
 
     rc = last.returncode
     with bufs_lock:
-        intermediate_err = b"\n".join(stderr_bufs.values())
+        intermediate_err = b"\n".join(
+            stderr_bufs.get(i, b"") for i in range(len(procs) - 1)
+        )
     combined_err = (intermediate_err + b"\n" + (last_stderr or b"")).strip()
 
     # Handle last-stage stdout: may be None when redirected to a file.
@@ -1057,9 +1095,18 @@ def _run_pipeline(
 _reaper_lock = threading.Lock()
 _reaper_started = False
 
+# PIDs launched by the background machinery; the reaper thread only reaps
+# these children so it never races with a concurrent foreground process.
+_bg_pids: set[int] = set()
+_bg_pids_lock = threading.Lock()
+
 
 def _start_reaper() -> None:
-    """Start a daemon thread that reaps zombie background children."""
+    """Start a daemon thread that reaps zombie background children.
+
+    Only reaps PIDs that were added to ``_bg_pids`` by ``_run_background``
+    so we never steal an exit status from a concurrent foreground process.
+    """
     global _reaper_started
     with _reaper_lock:
         if _reaper_started:
@@ -1069,13 +1116,17 @@ def _start_reaper() -> None:
     def _reap() -> None:
         while True:
             try:
-                while True:
+                with _bg_pids_lock:
+                    pids = list(_bg_pids)
+                for pid in pids:
                     try:
-                        pid, _ = os.waitpid(-1, os.WNOHANG)
-                        if pid == 0:
-                            break
+                        wpid, _status = os.waitpid(pid, os.WNOHANG)
+                        if wpid != 0:
+                            with _bg_pids_lock:
+                                _bg_pids.discard(wpid)
                     except ChildProcessError:
-                        break
+                        with _bg_pids_lock:
+                            _bg_pids.discard(pid)
             except Exception:
                 pass
             time.sleep(5)
@@ -1141,20 +1192,36 @@ def _run_background(
 
     procs: list[subprocess.Popen] = []
     prev: Optional[subprocess.Popen] = None
-    for i, (sandbox_args, env, _redirects) in enumerate(invocations):
-        p = subprocess.Popen(
-            sandbox_args,
-            stdin=prev.stdout if prev is not None else None,
-            stdout=stdout_targets[i],
-            stderr=stderr_targets[i],
-            cwd=str(work_dir),
-            env=env,
-            start_new_session=True,
-        )
-        if prev is not None:
-            prev.stdout.close()
-        procs.append(p)
-        prev = p
+    try:
+        for i, (sandbox_args, env, _redirects) in enumerate(invocations):
+            p = subprocess.Popen(
+                sandbox_args,
+                stdin=prev.stdout if prev is not None else None,
+                stdout=stdout_targets[i],
+                stderr=stderr_targets[i],
+                cwd=str(work_dir),
+                env=env,
+                start_new_session=True,
+            )
+            if prev is not None:
+                prev.stdout.close()
+            procs.append(p)
+            prev = p
+    except Exception as e:
+        # Clean up already-launched procs and open handles so nothing leaks.
+        for p in procs:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+        for p in procs:
+            p.wait()
+        for fh in all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        return 1, f"Failed to launch background pipeline: {e}"
 
     # Parent releases its handles; children hold their own copies.
     for fh in all_to_close:
@@ -1162,6 +1229,12 @@ def _run_background(
             fh.close()
         except OSError:
             pass
+
+    # Register every launched pid so the reaper thread only reaps our own
+    # children and never races with a concurrent foreground process.
+    with _bg_pids_lock:
+        for p in procs:
+            _bg_pids.add(p.pid)
 
     # Build the message with report details.
     msg_parts = [f"Backgrounded PID {procs[0].pid}; output -> {log_path}"]
