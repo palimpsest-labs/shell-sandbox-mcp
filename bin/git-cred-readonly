@@ -1,0 +1,13 @@
+#!/bin/sh
+# Read-only credential helper for sandboxed git.
+#
+# `get`  : delegate to the stock store helper's READ path against the user's
+#          ~/.git-credentials (unveiled read-only). The store helper's `get`
+#          takes NO lock — only `store` does.
+# `store`/`erase` : no-op, so the sandboxed git never tries to create
+#          ~/.git-credentials.lock (which would need write+create on $HOME —
+#          deliberately NOT granted by the sandbox).
+case "$1" in
+  get) exec git credential-store --file="$HOME/.git-credentials" get ;;
+  *)   exit 0 ;;
+esac

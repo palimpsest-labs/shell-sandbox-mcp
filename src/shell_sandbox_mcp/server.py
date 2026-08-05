@@ -9,6 +9,7 @@ Tools:
 import os
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -70,16 +71,72 @@ def _git_config_paths() -> list[str]:
 
 
 def _git_credential_paths() -> list[str]:
-    """Return the git credential store file under $HOME that must be unveiled
-    read-write, so the `store` credential helper can read and update it
-    (e.g. for authenticated pushes against GitHub).
+    """Return the git credential store file under $HOME that must be unveiled.
+
+    Now unveiled read-ONLY: the read-only credential helper shim
+    (bin/git-cred-readonly) handles `get` and no-ops `store`, so the
+    sandboxed git never writes ~/.git-credentials (which would need wc on
+    $HOME — not granted).
     """
     return [
         str((Path.home().resolve() / ".git-credentials").resolve()),
     ]
 
 
-def _cosmo_toolchain_paths() -> list[str]:
+def _git_extra_rx_paths(work_dir: Path) -> list[str]:
+    """Read-execute paths git needs inside the sandbox.
+
+    - <work_dir>/.git/hooks: so git can exec hook scripts (pre-push,
+      post-commit, ...) installed by tools like git-lfs. rx only (no write):
+      git runs existing hooks, it never writes them here. The dir may not
+      exist yet; unveil tolerates ENOENT.
+    - bin/git-cred-readonly: the read-only credential helper shim (Issue 2),
+      which git must exec when credential.helper fires.
+    """
+    return [
+        str((work_dir / ".git" / "hooks").resolve()),
+        str((REPO_ROOT / "bin" / "git-cred-readonly").resolve()),
+    ]
+
+
+# Staged sandbox-global git config (idempotent, atomic write).
+# Written once per python process under /tmp; reused across invocations.
+_GIT_GLOBAL_CONFIG = Path(tempfile.gettempdir()) / f"sbx-git-global-{os.getuid()}-{os.getpid()}.config"
+_GIT_CRED_SHIM = REPO_ROOT / "bin" / "git-cred-readonly"
+
+
+def _git_readonly_paths() -> list[str]:
+    """Read-only $HOME paths git needs: global/XDG config AND the credential
+    store file. The cred file is read-ONLY here because the read-only helper
+    shim (bin/git-cred-readonly) handles `get` and no-ops `store`, so the
+    sandboxed git never writes ~/.git-credentials (which would need wc on
+    $HOME — not granted)."""
+    return _git_config_paths() + _git_credential_paths()
+
+
+def _stage_git_global_config() -> str:
+    """Write a sandbox-global git config = copy of ~/.gitconfig with
+    `credential.helper` replaced by the read-only shim. Idempotent: content
+    is identical across invocations, so concurrent writes are safe. Returns
+    the path to set as GIT_CONFIG_GLOBAL."""
+    cfg = _GIT_GLOBAL_CONFIG
+    src = Path.home() / ".gitconfig"
+    tmp = cfg.with_suffix(".tmp")
+    if src.is_file():
+        tmp.write_bytes(src.read_bytes())
+    else:
+        tmp.write_text("")
+    subprocess.run(
+        ["/usr/bin/git", "config", "--file", str(tmp),
+         "--replace-all", "credential.helper", str(_GIT_CRED_SHIM.resolve())],
+        check=True,
+    )
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, cfg)  # atomic
+    return str(cfg)
+
+
+def _cosmo_toolchain_paths(work_dir: Optional[Path] = None) -> list[str]:
     """Return the paths that must be unveiled read-execute for the vendored
     cosmocc toolchain to run: the toolchain tree itself (its compilers read
     headers/libs from it), the busybox binary (used as a non-preserving `mv`
@@ -109,8 +166,9 @@ COMMANDS = {
         "binary": "/usr/bin/git",
         "promises": "stdio rpath wpath cpath prot_exec inet dns proc",
         "description": "Git version control",
-        "extra_unveil": _git_config_paths,
-        "extra_unveil_rw": _git_credential_paths,
+        "extra_unveil": _git_readonly_paths,      # config + cred file, READ-ONLY
+        "extra_unveil_rx": _git_extra_rx_paths,   # .git/hooks + cred shim
+        "is_git": True,
     },
     "cargo": {
         "binary": "cargo",
@@ -703,7 +761,7 @@ def _build_invocation(
     # the Cosmopolitan APE loader) so build tools can exec their subprocesses.
     extra_unveil_rx = cfg.get("extra_unveil_rx")
     if extra_unveil_rx:
-        paths = extra_unveil_rx() if callable(extra_unveil_rx) else extra_unveil_rx
+        paths = extra_unveil_rx(work_dir) if callable(extra_unveil_rx) else extra_unveil_rx
         if paths:
             unveil_env["SANDBOX_UNVEIL_RX"] = ":".join(paths)
 
@@ -721,6 +779,13 @@ def _build_invocation(
         site_packages.mkdir(parents=True, exist_ok=True)
         unveil_env["PYTHONUSERBASE"] = str(site_base)
         unveil_env["PYTHONPATH"] = str(site_packages)
+
+    # For git, stage a sandbox-global config that swaps credential.helper for
+    # the read-only shim, preserving all other ~/.gitconfig settings (including
+    # [filter "lfs"]). GIT_CONFIG_GLOBAL overrides the default global config
+    # path, so git uses the staged copy rather than ~/.gitconfig directly.
+    if cfg.get("is_git"):
+        unveil_env["GIT_CONFIG_GLOBAL"] = _stage_git_global_config()
 
     if unveil_env:
         env = {**os.environ, **unveil_env}
