@@ -65,6 +65,24 @@ int main(int argc, char *argv[]) {
     unveil("/bin", "rx");
     unveil("/tmp", "rwc");
     unveil("/etc", "r");  /* git needs /etc for config */
+    /* Unveil minimal /dev entries: git and other tools need /dev/null and
+     * /dev/urandom (random). Keep the surface as tight as possible. */
+    unveil("/dev/null", "rw");
+    unveil("/dev/urandom", "r");
+    /* Git reads global config from the user's home dir (~/.gitconfig and
+     * ~/.config/git/config). Unveil just those files, not the whole home. */
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        size_t home_len = strlen(home);
+        if (home_len < 1024) {
+            char gitconfig[1100];
+            snprintf(gitconfig, sizeof(gitconfig), "%s/.gitconfig", home);
+            unveil(gitconfig, "r");
+            char xdg_config[1100];
+            snprintf(xdg_config, sizeof(xdg_config), "%s/.config/git/config", home);
+            unveil(xdg_config, "r");
+        }
+    }
     /* Also unveil the binary itself if we can determine its path */
     if (cmd[0] == '/') {
         unveil(cmd, "rx");

@@ -193,13 +193,14 @@ def shell_run(
         result = subprocess.run(
             sandbox_args,
             capture_output=True,
-            text=True,
             timeout=timeout,
             cwd=str(work_dir),
         )
 
-        stdout = result.stdout[:MAX_OUTPUT]
-        stderr_out = result.stderr[:MAX_OUTPUT]
+        # Capture raw bytes and decode lossily so binary/non-UTF-8 output
+        # never crashes the tool.
+        stdout = result.stdout[:MAX_OUTPUT].decode("utf-8", errors="replace")
+        stderr_out = result.stderr[:MAX_OUTPUT].decode("utf-8", errors="replace")
 
         output = []
         if result.returncode != 0:
