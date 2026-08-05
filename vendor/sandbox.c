@@ -10,6 +10,9 @@
  * to unveil read-only (e.g. git config dotfiles under $HOME).
  * SANDBOX_UNVEIL_RW — extra paths to unveil read-write (e.g. python's
  * user site-packages and pip/uv caches).
+ * SANDBOX_UNVEIL_RX — extra paths to unveil read-execute (e.g. a vendored
+ * compiler toolchain and the Cosmopolitan APE loader) so build tools can
+ * exec their subprocesses.
  *
  * Compile with cosmocc for a portable static binary:
  *   cosmocc -o sandbox sandbox.c
@@ -122,6 +125,12 @@ int main(int argc, char *argv[]) {
        e.g. python's user site-packages and pip/uv caches so packages can be
        installed and used from inside the sandbox. */
     if (unveil_list_from_env("SANDBOX_UNVEIL_RW", "rwc") != 0)
+        return 1;
+    /* Additional read-execute paths from SANDBOX_UNVEIL_RX (colon-separated),
+       e.g. a vendored compiler toolchain and the Cosmopolitan APE loader, so
+       build tools like cosmocc/make can exec their subprocesses. No write
+       access is granted. */
+    if (unveil_list_from_env("SANDBOX_UNVEIL_RX", "rx") != 0)
         return 1;
     /* Lock unveil — no further paths can be added */
     if (unveil(NULL, NULL) != 0) {

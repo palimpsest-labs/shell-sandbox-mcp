@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SANDBOX_BIN = REPO_ROOT / "bin" / "sandbox"
 SANDBOX_WRAPPER = REPO_ROOT / "bin" / "run-sandbox"
 BUSYBOX_BIN = REPO_ROOT / "bin" / "busybox"
+COSMO_TOOLCHAIN = REPO_ROOT / "bin" / "cosmo-toolchain"
 DEFAULT_ALLOWED_DIRS = [
     str(Path.home() / "projects"),
     "/tmp",
@@ -59,6 +60,18 @@ def _git_credential_paths() -> list[str]:
     ]
 
 
+def _cosmo_toolchain_paths() -> list[str]:
+    """Return the paths that must be unveiled read-execute for the vendored
+    cosmocc toolchain to run: the toolchain tree itself (its compilers read
+    headers/libs from it) and the Cosmopolitan APE loader under $HOME. The
+    loaders at /usr/bin are already unveiled by the sandbox default.
+    """
+    return [
+        str(COSMO_TOOLCHAIN.resolve()),
+        str((Path.home().resolve() / ".ape-1.10").resolve()),
+    ]
+
+
 COMMANDS = {
     "git": {
         "binary": "/usr/bin/git",
@@ -73,9 +86,22 @@ COMMANDS = {
         "description": "Rust package manager (build, test, check, fmt, clippy)",
     },
     "make": {
-        "binary": "make",
+        "binary": str((COSMO_TOOLCHAIN / "bin" / "make").resolve()),
         "promises": "stdio rpath wpath cpath proc prot_exec",
-        "description": "GNU make build tool (spawns compiler subprocesses)",
+        "description": (
+            "GNU make build tool (vendored). Spawns compiler subprocesses, "
+            "so it needs exec access to the toolchain."
+        ),
+        "extra_unveil_rx": _cosmo_toolchain_paths,
+    },
+    "cosmocc": {
+        "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "description": (
+            "Cosmopolitan C/C++ compiler (vendored toolchain). Compiles "
+            "portable APE binaries for both x86_64 and aarch64."
+        ),
+        "extra_unveil_rx": _cosmo_toolchain_paths,
     },
     "python3": {
         "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),
@@ -267,53 +293,94 @@ def _validate_cwd(resolved: Path, raw: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Command chaining
+# ---------------------------------------------------------------------------
+
+def _split_command(command: str) -> list[tuple[Optional[str], str]]:
+    """Split a command string on top-level `;`, `&&`, and `||` operators.
+
+    Operators nested inside single or double quotes are preserved as literal
+    text of the segment (they are not shell operators). Returns a list of
+    ``(operator, segment)`` pairs where ``operator`` is None for the first
+    segment and ``';'``, ``'&&'``, or ``'||'`` for each subsequent one.
+    Leading/trailing whitespace is stripped from each segment; empty segments
+    are dropped.
+    """
+    segments: list[tuple[Optional[str], str]] = []
+    i, n = 0, len(command)
+    current: list[str] = []
+    quote: Optional[str] = None
+    prev_op: Optional[str] = None
+
+    def flush() -> None:
+        nonlocal prev_op
+        text = "".join(current).strip()
+        if text:
+            segments.append((prev_op, text))
+        current.clear()
+        prev_op = None
+
+    while i < n:
+        c = command[i]
+        if quote is not None:
+            current.append(c)
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            current.append(c)
+            i += 1
+            continue
+        if c == ";":
+            flush()
+            prev_op = ";"
+            i += 1
+            continue
+        if c == "&" and i + 1 < n and command[i + 1] == "&":
+            flush()
+            prev_op = "&&"
+            i += 2
+            continue
+        if c == "|" and i + 1 < n and command[i + 1] == "|":
+            flush()
+            prev_op = "||"
+            i += 2
+            continue
+        current.append(c)
+        i += 1
+
+    flush()
+    return segments
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-def shell_run(
-    command: str,
-    cwd: Optional[str] = None,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> str:
-    """Run a shell command in a pledge sandbox.
+def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
+    """Run a single operator-free command segment in the sandbox.
 
-    Commands are executed via the pledge-wrapped sandbox binary with
-    restricted system call promises. Only allowlisted commands can run.
-
-    Args:
-        command: The command to run (e.g., "git status", "busybox grep pattern file")
-        cwd:     Working directory (must be within allowed paths)
-        timeout: Timeout in seconds (default 30, max 300)
+    Returns ``(returncode, output_string)``. ``returncode`` is 0 on success and
+    non-zero on failure, an error, or an invalid/denied command, so callers can
+    apply ``&&``/``||`` short-circuit semantics. ``output_string`` is the
+    formatted output, or ``""`` when the segment produced nothing to report.
     """
-    timeout = min(timeout, MAX_TIMEOUT)
-
     # Parse command into args
     try:
         args = shlex.split(command)
     except ValueError as e:
-        return f"Invalid command syntax: {e}"
+        return 1, f"Invalid command syntax: {e}"
 
     if not args:
-        return "Empty command."
-
-    # Validate cwd first — resolve once, use for validation, resolution and
-    # execution. Required before resolving so local binaries can be located.
-    raw_cwd = cwd or "."
-    try:
-        work_dir = Path(raw_cwd).expanduser().resolve()
-    except Exception:
-        return f"Invalid path: {raw_cwd}"
-
-    err = _validate_cwd(work_dir, raw_cwd)
-    if err:
-        return err
+        return 0, ""
 
     # Resolve and validate against the allowlist (or a local binary under cwd)
     binary, final_args, cfg = _resolve_command(args, work_dir)
     if binary is None:
-        return final_args  # error message
+        return 1, final_args  # error message
 
     # Build sandbox invocation via the exec wrapper (bypasses posix_spawn APE issue)
     # Prepend per-command args (e.g. python3's "-S") before the user's args.
@@ -343,6 +410,14 @@ def shell_run(
         if paths:
             unveil_env["SANDBOX_UNVEIL_RW"] = ":".join(paths)
 
+    # Extra read-execute unveil paths (e.g. a vendored compiler toolchain and
+    # the Cosmopolitan APE loader) so build tools can exec their subprocesses.
+    extra_unveil_rx = cfg.get("extra_unveil_rx")
+    if extra_unveil_rx:
+        paths = extra_unveil_rx() if callable(extra_unveil_rx) else extra_unveil_rx
+        if paths:
+            unveil_env["SANDBOX_UNVEIL_RX"] = ":".join(paths)
+
     # Sandbox-local python site dir: create <cwd>/.py-site, expose the base
     # via PYTHONUSERBASE (so `pip install --user` lands inside the sandbox)
     # and the site-packages via PYTHONPATH (so imports resolve).
@@ -352,7 +427,7 @@ def shell_run(
         try:
             site_base.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            return f"Error creating python site dir {site_base}: {e}"
+            return 1, f"Error creating python site dir {site_base}: {e}"
         site_packages = site_base / "lib" / "python3.12" / "site-packages"
         site_packages.mkdir(parents=True, exist_ok=True)
         unveil_env["PYTHONUSERBASE"] = str(site_base)
@@ -365,7 +440,7 @@ def shell_run(
     # path is still an executable contained within the work dir right before
     # exec, in case a directory component was swapped in the meantime.
     if cfg.get("is_local_binary") and not _binary_still_contained(binary, work_dir):
-        return f"Local binary no longer valid inside working directory: {binary}"
+        return 1, f"Local binary no longer valid inside working directory: {binary}"
 
     try:
         result = subprocess.run(
@@ -394,17 +469,88 @@ def shell_run(
         if len(result.stderr) > MAX_OUTPUT:
             output.append(f"\n[stderr truncated at {MAX_OUTPUT} bytes]")
 
-        if not output:
-            return "(no output)"
-
-        return "\n".join(output)
+        return result.returncode, "\n".join(output)
 
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s"
+        return 1, f"Command timed out after {timeout}s"
     except FileNotFoundError:
-        return f"Sandbox binary not found: {SANDBOX_BIN}"
+        return 1, f"Sandbox binary not found: {SANDBOX_BIN}"
     except OSError as e:
-        return f"Error running command: {e}"
+        return 1, f"Error running command: {e}"
+
+
+@mcp.tool()
+def shell_run(
+    command: str,
+    cwd: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> str:
+    """Run a shell command in a pledge sandbox.
+
+    Commands are executed via the pledge-wrapped sandbox binary with
+    restricted system call promises. Only allowlisted commands can run.
+
+    Command chaining with `;`, `&&`, and `||` is supported: the command string
+    is split on those operators and each segment is run through the sandbox and
+    checked against the allowlist independently. `&&` runs its segment only if
+    the previous one succeeded; `||` only if it failed; `;` always runs. Pipes
+    (`|`) and redirects (`>`, `>>`) are not supported.
+
+    Args:
+        command: The command to run (e.g., "git status", "cd build && make test")
+        cwd:     Working directory (must be within allowed paths)
+        timeout: Timeout in seconds (default 30, max 300)
+    """
+    timeout = min(timeout, MAX_TIMEOUT)
+
+    # Validate cwd first — resolve once, use for validation, resolution and
+    # execution. Required before resolving so local binaries can be located.
+    raw_cwd = cwd or "."
+    try:
+        work_dir = Path(raw_cwd).expanduser().resolve()
+    except Exception:
+        return f"Invalid path: {raw_cwd}"
+
+    err = _validate_cwd(work_dir, raw_cwd)
+    if err:
+        return err
+
+    # Split into allowlist-checked segments on ; / && / ||
+    segments = _split_command(command)
+    if not segments:
+        return "Empty command."
+
+    # Single-command fast path — preserves the exact prior behaviour.
+    if len(segments) == 1 and segments[0][0] is None:
+        _rc, out = _run_segment(segments[0][1], work_dir, timeout)
+        return out if out else "(no output)"
+
+    # Multi-segment chain: run each segment through the sandbox, applying
+    # `&&` / `||` short-circuit semantics based on the previous segment's exit
+    # code. Segments are independent processes (no shared shell variables), but
+    # they share the same cwd, so file-based state persists across segments.
+    outputs: list[str] = []
+    prev_rc = 0
+    ran_any = False
+
+    for op, segment in segments:
+        if op == "&&" and ran_any and prev_rc != 0:
+            outputs.append(f"(skipped: previous command exited {prev_rc}) — {segment}")
+            continue
+        if op == "||" and ran_any and prev_rc == 0:
+            outputs.append("(skipped: previous command succeeded) — " + segment)
+            continue
+
+        rc, out = _run_segment(segment, work_dir, timeout)
+        prev_rc = rc
+        ran_any = True
+        if out:
+            outputs.append(out)
+
+    if not outputs:
+        return "(no output)"
+
+    return "\n".join(outputs)
 
 
 @mcp.tool()
@@ -422,6 +568,11 @@ def shell_list() -> str:
     lines.append("    directory (or below) can be run by name or path, e.g.")
     lines.append("    './scripts/foo' or 'target/release/bar'. Paths escaping")
     lines.append("    the working directory are rejected.")
+    lines.append("")
+    lines.append("Command chaining: ';', '&&', and '||' are supported. Each")
+    lines.append("    segment is run through the sandbox and checked against the")
+    lines.append("    allowlist independently. '&&' runs only after success, '||'")
+    lines.append("    only after failure, ';' always. No pipes ('|') or redirects.")
     lines.append("")
     lines.append(f"Sandbox binary: {SANDBOX_BIN.resolve()}")
     lines.append(f"Allowed directories: {', '.join(DEFAULT_ALLOWED_DIRS)}")

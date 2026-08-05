@@ -182,6 +182,147 @@ class BinaryStillContainedTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _split_command
+# ---------------------------------------------------------------------------
+
+
+class SplitCommandTest(unittest.TestCase):
+    def test_no_operator_single_segment(self) -> None:
+        self.assertEqual(
+            server._split_command("ls -la"),
+            [(None, "ls -la")],
+        )
+
+    def test_semicolon_splits(self) -> None:
+        self.assertEqual(
+            server._split_command("echo hi; echo bye"),
+            [(None, "echo hi"), (";", "echo bye")],
+        )
+
+    def test_and_and_splits(self) -> None:
+        self.assertEqual(
+            server._split_command("make && make test"),
+            [(None, "make"), ("&&", "make test")],
+        )
+
+    def test_or_or_splits(self) -> None:
+        self.assertEqual(
+            server._split_command("false || echo fallback"),
+            [(None, "false"), ("||", "echo fallback")],
+        )
+
+    def test_mixed_operators(self) -> None:
+        self.assertEqual(
+            server._split_command("a && b; c || d"),
+            [(None, "a"), ("&&", "b"), (";", "c"), ("||", "d")],
+        )
+
+    def test_operator_inside_quotes_preserved(self) -> None:
+        self.assertEqual(
+            server._split_command('echo "a; b"'),
+            [(None, 'echo "a; b"')],
+        )
+        self.assertEqual(
+            server._split_command("printf 'a && b'; ls"),
+            [(None, "printf 'a && b'"), (";", "ls")],
+        )
+
+    def test_whitespace_and_empty_segments_dropped(self) -> None:
+        self.assertEqual(
+            server._split_command("  a   ;;  b  "),
+            [(None, "a"), (";", "b")],
+        )
+
+    def test_empty_command(self) -> None:
+        self.assertEqual(server._split_command(""), [])
+        self.assertEqual(server._split_command("   "), [])
+
+    def test_only_operator_is_empty(self) -> None:
+        self.assertEqual(server._split_command(";"), [])
+
+    def test_single_pipe_is_not_split(self) -> None:
+        # A lone '|' is not a supported chaining operator, so it stays literal.
+        self.assertEqual(
+            server._split_command("ls | wc"),
+            [(None, "ls | wc")],
+        )
+
+
+# ---------------------------------------------------------------------------
+# _run_segment (chaining orchestration)
+# ---------------------------------------------------------------------------
+
+
+class ShellRunChainingTest(unittest.TestCase):
+    """Exercise `shell_run` chaining semantics without invoking the real
+    sandbox by stubbing `_run_segment`."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name)
+        # /tmp is allowed by default config
+        self.allowed = Path(tempfile.gettempdir()) / ("sandbox-chain-" + os.urandom(4).hex())
+        self.allowed.mkdir()
+        self._orig_run_segment = server._run_segment
+        self.calls: list[str] = []
+
+    def tearDown(self) -> None:
+        import shutil
+
+        server._run_segment = self._orig_run_segment
+        shutil.rmtree(self.allowed, ignore_errors=True)
+        self._tmp.cleanup()
+
+    def _stub(self, rc_map: dict[str, int]) -> None:
+        def fake(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
+            self.calls.append(command)
+            rc = rc_map.get(command, 0)
+            return rc, f"out:{command}" if rc == 0 else f"err:{command}"
+
+        server._run_segment = fake
+
+    def _run(self, command: str) -> str:
+        return server.shell_run(command, cwd=str(self.allowed))
+
+    def test_semicolon_runs_all_segments(self) -> None:
+        self._stub({"a": 0, "b": 0})
+        out = self._run("a ; b")
+        self.assertEqual(self.calls, ["a", "b"])
+        self.assertIn("out:a", out)
+        self.assertIn("out:b", out)
+
+    def test_andand_skips_after_failure(self) -> None:
+        self._stub({"a": 1, "b": 0, "c": 0})
+        out = self._run("a && b && c")
+        self.assertEqual(self.calls, ["a"])
+        self.assertIn("skipped", out)
+        self.assertNotIn("out:b", out)
+        self.assertNotIn("out:c", out)
+
+    def test_andand_runs_after_success(self) -> None:
+        self._stub({"a": 0, "b": 0})
+        self._run("a && b")
+        self.assertEqual(self.calls, ["a", "b"])
+
+    def test_oror_runs_after_failure(self) -> None:
+        self._stub({"a": 1, "b": 0})
+        self._run("a || b")
+        self.assertEqual(self.calls, ["a", "b"])
+
+    def test_oror_skips_after_success(self) -> None:
+        self._stub({"a": 0, "b": 0})
+        out = self._run("a || b")
+        self.assertEqual(self.calls, ["a"])
+        self.assertIn("skipped", out)
+
+    def test_resolution_failure_short_circuits_andand(self) -> None:
+        # 'notallowed' fails resolution inside _run_segment (rc 1).
+        self._stub({"notallowed": 1, "b": 0})
+        out = self._run("notallowed && b")
+        self.assertEqual(self.calls, ["notallowed"])
+
+
+# ---------------------------------------------------------------------------
 # _git_config_paths
 # ---------------------------------------------------------------------------
 
@@ -194,6 +335,31 @@ class GitConfigPathsTest(unittest.TestCase):
             # must be absolute, canonical (no '..' or symlinked HOME remainder)
             self.assertTrue(Path(p).is_absolute())
             self.assertEqual(str(Path(p).resolve()), p)
+
+
+# ---------------------------------------------------------------------------
+# _cosmo_toolchain_paths
+# ---------------------------------------------------------------------------
+
+
+class CosmoToolchainPathsTest(unittest.TestCase):
+    def test_paths_resolved(self) -> None:
+        paths = server._cosmo_toolchain_paths()
+        # toolchain tree + APE loader
+        self.assertEqual(len(paths), 2)
+        for p in paths:
+            self.assertTrue(Path(p).is_absolute())
+            self.assertEqual(str(Path(p).resolve()), p)
+        # first path must be the vendored toolchain root
+        self.assertEqual(Path(paths[0]), server.COSMO_TOOLCHAIN.resolve())
+
+    def test_cosmocc_configured_with_local_toolchain(self) -> None:
+        cfg = server.COMMANDS["cosmocc"]
+        # binary must point inside the vendored toolchain, not the host install
+        self.assertTrue(
+            cfg["binary"].startswith(str(server.COSMO_TOOLCHAIN.resolve()))
+        )
+        self.assertEqual(cfg["extra_unveil_rx"], server._cosmo_toolchain_paths)
 
 
 if __name__ == "__main__":
