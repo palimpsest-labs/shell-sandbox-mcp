@@ -46,6 +46,11 @@ COMMANDS = {
         "promises": "stdio rpath wpath cpath proc prot_exec",
         "description": "Rust package manager (build, test, check, fmt, clippy)",
     },
+    "make": {
+        "binary": "make",
+        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "description": "GNU make build tool (spawns compiler subprocesses)",
+    },
 }
 
 BUSYBOX_APPLETS = [
