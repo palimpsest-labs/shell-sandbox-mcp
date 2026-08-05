@@ -743,13 +743,20 @@ def _resolve_fd_targets(
     redirects: list[Redirect],
     default_stdout,
     default_stderr,
+    *,
+    snapshot_2gt1: bool = True,
 ) -> tuple:
     """Apply redirects in order (last-wins per fd) and return fd targets.
 
     Returns ``(stdout_target, stderr_target, files_to_close, report_lines,
     shared_pipe_read_fd)`` where ``shared_pipe_read_fd`` is ``None`` unless
-    a ``1>&2`` redirect forced creation of a shared pipe (when stderr is
-    ``subprocess.PIPE``).
+    a ``1>&2`` (or ``2>&1`` when ``snapshot_2gt1``) redirect forced creation
+    of a shared pipe (when the source fd is ``subprocess.PIPE``).
+
+    ``snapshot_2gt1=False`` is used for intermediate pipeline stages, where
+    a ``2>&1`` must merge stderr into the existing stdout pipe (so a later
+    ``>file`` cannot apply to it) rather than snapshot a fresh shared pipe
+    that would break the pipe chaining.
     """
     stdout_target = default_stdout
     stderr_target = default_stderr
@@ -759,8 +766,14 @@ def _resolve_fd_targets(
 
     for r in redirects:
         if r.op in (">", ">>"):
-            mode = "wb" if r.op == ">" else "ab"
-            fh = open(r.target_path, mode)
+            # O_NOFOLLOW closes the symlink-swap TOCTOU: the path was
+            # containment-validated earlier, so a redirect target must not be
+            # a symlink pointing outside the work tree at open time.
+            flags = os.O_WRONLY | os.O_CREAT
+            flags |= os.O_TRUNC if r.op == ">" else os.O_APPEND
+            flags |= os.O_NOFOLLOW
+            fd = os.open(r.target_path, flags, 0o666)
+            fh = os.fdopen(fd, "wb" if r.op == ">" else "ab")
             files_to_close.append(fh)
             if r.fd == 1:
                 stdout_target = fh
@@ -772,7 +785,27 @@ def _resolve_fd_targets(
                 report_lines.append(f"[stderr {arrow} {r.raw_target}]")
         elif r.op == ">&":
             if r.fd == 2 and r.target_fd == 1:  # 2>&1
-                stderr_target = subprocess.STDOUT
+                # If a LATER `>file` will redirect stdout, snapshot stdout's
+                # current destination so stderr isn't dragged along with it
+                # (matches POSIX: `2>&1 >file` puts stderr on the original
+                # stdout). Otherwise a plain subprocess.STDOUT (merge stderr
+                # into stdout's target) is correct and lighter.
+                later_stdout_redirect = any(
+                    rr.fd == 1 and rr.op in (">", ">>") for rr in redirects
+                )
+                if (
+                    snapshot_2gt1
+                    and later_stdout_redirect
+                    and isinstance(stdout_target, int)
+                    and stdout_target == subprocess.PIPE
+                ):
+                    rfd, wfd = os.pipe()
+                    shared_pipe_read_fd = rfd
+                    stdout_target = wfd
+                    stderr_target = wfd
+                    files_to_close.append(wfd)
+                else:
+                    stderr_target = subprocess.STDOUT
                 report_lines.append("[stderr -> stdout]")
             elif r.fd == 1 and r.target_fd == 2:  # 1>&2
                 if isinstance(stderr_target, int) and stderr_target == subprocess.PIPE:
@@ -784,7 +817,7 @@ def _resolve_fd_targets(
                     stderr_target = wfd
                     files_to_close.append(wfd)
                 else:
-                    # stderr is a real file handle (or STDOUT sentinel);
+                    # stderr is a real file handle (or a shared-pipe fd);
                     # just point stdout at the same target.
                     stdout_target = stderr_target
                 report_lines.append("[stdout -> stderr]")
@@ -812,9 +845,14 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
     if cfg.get("is_local_binary") and not _binary_still_contained(binary, work_dir):
         return 1, f"Local binary no longer valid inside working directory: {binary}"
 
-    stdout_t, stderr_t, to_close, report, shared_read_fd = _resolve_fd_targets(
-        redirects, subprocess.PIPE, subprocess.PIPE,
-    )
+    try:
+        stdout_t, stderr_t, to_close, report, shared_read_fd = _resolve_fd_targets(
+            redirects, subprocess.PIPE, subprocess.PIPE,
+        )
+    except OSError as e:
+        # Redirect target failed to open (e.g. ELOOP on a symlink target, or a
+        # permission error). Surface it cleanly instead of crashing.
+        return 1, f"Error opening redirect target: {e}"
 
     # Ensure shared_read_fd is closed on every exit path (including
     # TimeoutExpired / OSError), not just the success path.
@@ -924,17 +962,26 @@ def _run_pipeline(
     all_to_close: list = []
     all_report: list[list[str]] = []
     last_shared_read_fd = None
-    for i, (_sa, _env, redirects) in enumerate(invocations):
-        is_last = i == len(invocations) - 1
-        st, et, tc, rpt, srf = _resolve_fd_targets(
-            redirects, subprocess.PIPE, subprocess.PIPE,
-        )
-        stdout_targets.append(st)
-        stderr_targets.append(et)
-        all_to_close.extend(tc)
-        all_report.append(rpt)
-        if is_last:
-            last_shared_read_fd = srf
+    try:
+        for i, (_sa, _env, redirects) in enumerate(invocations):
+            is_last = i == len(invocations) - 1
+            st, et, tc, rpt, srf = _resolve_fd_targets(
+                redirects, subprocess.PIPE, subprocess.PIPE,
+                snapshot_2gt1=is_last,
+            )
+            stdout_targets.append(st)
+            stderr_targets.append(et)
+            all_to_close.extend(tc)
+            all_report.append(rpt)
+            if is_last:
+                last_shared_read_fd = srf
+    except OSError as e:
+        for fh in all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        return 1, f"Error opening redirect target: {e}"
 
     # Launch every stage, chaining each one's stdout into the next one's stdin.
     procs: list[subprocess.Popen] = []
@@ -1173,22 +1220,50 @@ def _run_background(
                 )
 
     log_path = work_dir / f".bg-{int(time.time() * 1000)}.log"
-    log_fh = open(str(log_path), "wb")
+
+    # Sentinel marking "fall through to the background log". We only open the
+    # log lazily, after resolving fd targets, so we don't create an empty log
+    # file when the last stage redirects both stdout and stderr to user files.
+    LOG_SENTINEL = object()
 
     # Resolve fd targets per stage; last stage defaults to the log file.
     stdout_targets: list = []
     stderr_targets: list = []
-    all_to_close: list = [log_fh]
+    all_to_close: list = []
     all_report: list[list[str]] = []
-    for i, (_sa, _env, redirects) in enumerate(invocations):
-        is_last = i == len(invocations) - 1
-        def_stdout = log_fh if is_last else subprocess.PIPE
-        def_stderr = log_fh if is_last else subprocess.PIPE
-        st, et, tc, rpt, _srf = _resolve_fd_targets(redirects, def_stdout, def_stderr)
-        stdout_targets.append(st)
-        stderr_targets.append(et)
-        all_to_close.extend(tc)
-        all_report.append(rpt)
+    log_opened = False
+    log_fh = None
+    try:
+        for i, (_sa, _env, redirects) in enumerate(invocations):
+            is_last = i == len(invocations) - 1
+            def_stdout = LOG_SENTINEL if is_last else subprocess.PIPE
+            def_stderr = LOG_SENTINEL if is_last else subprocess.PIPE
+            st, et, tc, rpt, _srf = _resolve_fd_targets(
+                redirects, def_stdout, def_stderr, snapshot_2gt1=is_last,
+            )
+            if is_last:
+                # Substitute the log handle for any fd that fell through to the
+                # sentinel (i.e. was not redirected to a user file).
+                if st is LOG_SENTINEL or et is LOG_SENTINEL:
+                    if not log_opened:
+                        log_fh = open(str(log_path), "wb")
+                        all_to_close.append(log_fh)
+                        log_opened = True
+                    if st is LOG_SENTINEL:
+                        st = log_fh
+                    if et is LOG_SENTINEL:
+                        et = log_fh
+            stdout_targets.append(st)
+            stderr_targets.append(et)
+            all_to_close.extend(tc)
+            all_report.append(rpt)
+    except OSError as e:
+        for fh in all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        return 1, f"Error opening redirect target: {e}"
 
     procs: list[subprocess.Popen] = []
     prev: Optional[subprocess.Popen] = None
@@ -1237,7 +1312,10 @@ def _run_background(
             _bg_pids.add(p.pid)
 
     # Build the message with report details.
-    msg_parts = [f"Backgrounded PID {procs[0].pid}; output -> {log_path}"]
+    if log_opened:
+        msg_parts = [f"Backgrounded PID {procs[0].pid}; output -> {log_path}"]
+    else:
+        msg_parts = [f"Backgrounded PID {procs[0].pid}"]
     # Collect all unique report lines across stages.
     seen: set[str] = set()
     for rpt in all_report:

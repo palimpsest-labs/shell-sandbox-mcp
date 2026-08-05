@@ -1097,6 +1097,59 @@ class RunSegmentRedirectTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("[stderr -> stdout]", out)
 
+    def test_2gt1_then_stdout_redirect_snapshots(self) -> None:
+        # `2>&1 >file`: stderr must be bound to the ORIGINAL stdout (a shared
+        # pipe), not dragged into `file` by the later stdout redirect.
+        import subprocess as _sp
+
+        outfile = self.root / "out.txt"
+        self._stub_build([
+            server.Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1'),
+            server.Redirect(fd=1, op='>', target_path=str(outfile), target_fd=None, raw_target='out.txt'),
+        ])
+        captured = {}
+        def fake_run(args, **kwargs):
+            captured["stdout"] = kwargs.get("stdout")
+            captured["stderr"] = kwargs.get("stderr")
+            # Simulate writing to both redirected targets
+            if hasattr(kwargs.get("stdout"), "write"):
+                kwargs["stdout"].write(b"to-file\n")
+            elif isinstance(kwargs.get("stdout"), int):
+                os.write(kwargs["stdout"], b"to-file\n")
+            if hasattr(kwargs.get("stderr"), "write"):
+                kwargs["stderr"].write(b"to-stderr\n")
+            elif isinstance(kwargs.get("stderr"), int):
+                os.write(kwargs["stderr"], b"to-stderr\n")
+            return _sp.CompletedProcess(args, 0, stdout=None, stderr=None)
+        server.subprocess.run = fake_run
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        self.assertEqual(rc, 0)
+        # stdout target is the file; stderr target is a shared pipe fd (int)
+        self.assertTrue(hasattr(captured["stdout"], "write"))
+        self.assertIsInstance(captured["stderr"], int)
+        # stderr must NOT have gone to out.txt
+        self.assertEqual(outfile.read_text(), "to-file\n")
+        self.assertIn("[stderr -> stdout]", out)
+
+    def test_redirect_target_symlink_rejected(self) -> None:
+        # O_NOFOLLOW: a redirect target that is a symlink (even inside the
+        # work dir) must not be followed when opening for output.
+        target = self.root / "real.txt"
+        link = self.root / "out.txt"
+        link.symlink_to(target)
+        self._stub_build([
+            server.Redirect(fd=1, op='>', target_path=str(link), target_fd=None, raw_target='out.txt'),
+        ])
+        def fake_run(args, **kwargs):
+            return _sp.CompletedProcess(args, 1, stdout=None, stderr=None)
+        server.subprocess.run = fake_run
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        # The open should raise (ELOOP), surfaced as a clean error -> rc 1.
+        self.assertEqual(rc, 1)
+        self.assertIn("Error opening redirect target", out)
+        # The symlink target must NOT have been created/truncated.
+        self.assertFalse(target.exists())
+
 
 # ---------------------------------------------------------------------------
 # _run_pipeline with redirects
