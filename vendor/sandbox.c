@@ -8,6 +8,8 @@
  *
  * Optional env: SANDBOX_UNVEIL_R — a colon-separated list of extra paths
  * to unveil read-only (e.g. git config dotfiles under $HOME).
+ * SANDBOX_UNVEIL_RW — extra paths to unveil read-write (e.g. python's
+ * user site-packages and pip/uv caches).
  *
  * Compile with cosmocc for a portable static binary:
  *   cosmocc -o sandbox sandbox.c
@@ -23,6 +25,35 @@
 /* pledge() and unveil() are available on Linux (including Cosmopolitan) */
 extern int pledge(const char *, const char *);
 extern int unveil(const char *, const char *);
+
+/*
+ * Unveil each colon-separated path from env var `name` with the given
+ * permissions. Missing paths are tolerated (ENOENT), since optional dirs
+ * may not exist yet. Returns 0 on success, -1 on error.
+ */
+static int unveil_list_from_env(const char *name, const char *perms) {
+    const char *value = getenv(name);
+    if (!value || !*value)
+        return 0;
+
+    char *copy = strdup(value);
+    if (!copy) {
+        fprintf(stderr, "sandbox: out of memory\n");
+        return -1;
+    }
+    int rc = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        if (*tok && unveil(tok, perms) != 0 && errno != ENOENT) {
+            fprintf(stderr, "sandbox: unveil('%s', '%s') failed: %s\n",
+                    tok, perms, strerror(errno));
+            rc = -1;
+            break;
+        }
+    }
+    free(copy);
+    return rc;
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 6) {
@@ -83,27 +114,13 @@ int main(int argc, char *argv[]) {
        Used to let commands like git read config dotfiles under $HOME that
        the default unveil set doesn't cover. Paths may not exist yet (unveil
        on a missing path is a no-op, which is fine for optional config). */
-    const char *extra = getenv("SANDBOX_UNVEIL_R");
-    if (extra && *extra) {
-        char *copy = strdup(extra);
-        if (!copy) {
-            fprintf(stderr, "sandbox: out of memory\n");
-            return 1;
-        }
-        char *save = NULL;
-        for (char *tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
-            if (*tok && unveil(tok, "r") != 0) {
-                /* Optional paths may not exist — that's fine (ENOENT). */
-                if (errno != ENOENT) {
-                    fprintf(stderr, "sandbox: unveil('%s', 'r') failed: %s\n",
-                            tok, strerror(errno));
-                    free(copy);
-                    return 1;
-                }
-            }
-        }
-        free(copy);
-    }
+    if (unveil_list_from_env("SANDBOX_UNVEIL_R", "r") != 0)
+        return 1;
+    /* Additional read-write paths from SANDBOX_UNVEIL_RW (colon-separated),
+       e.g. python's user site-packages and pip/uv caches so packages can be
+       installed and used from inside the sandbox. */
+    if (unveil_list_from_env("SANDBOX_UNVEIL_RW", "rwc") != 0)
+        return 1;
     /* Lock unveil — no further paths can be added */
     if (unveil(NULL, NULL) != 0) {
         fprintf(stderr, "sandbox: unveil lock failed: %s\n", strerror(errno));
