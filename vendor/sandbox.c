@@ -6,6 +6,11 @@
  * Pledges the given promises, unveils UNVEIL_DIR for rwc access,
  * then execs cmd with args.
  *
+ * Optional env: SANDBOX_UNVEIL_R — a colon-separated list of extra paths
+ * to unveil read-only (e.g. git config dotfiles under $HOME).
+ * SANDBOX_UNVEIL_RW — extra paths to unveil read-write (e.g. python's
+ * user site-packages and pip/uv caches).
+ *
  * Compile with cosmocc for a portable static binary:
  *   cosmocc -o sandbox sandbox.c
  */
@@ -20,6 +25,35 @@
 /* pledge() and unveil() are available on Linux (including Cosmopolitan) */
 extern int pledge(const char *, const char *);
 extern int unveil(const char *, const char *);
+
+/*
+ * Unveil each colon-separated path from env var `name` with the given
+ * permissions. Missing paths are tolerated (ENOENT), since optional dirs
+ * may not exist yet. Returns 0 on success, -1 on error.
+ */
+static int unveil_list_from_env(const char *name, const char *perms) {
+    const char *value = getenv(name);
+    if (!value || !*value)
+        return 0;
+
+    char *copy = strdup(value);
+    if (!copy) {
+        fprintf(stderr, "sandbox: out of memory\n");
+        return -1;
+    }
+    int rc = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        if (*tok && unveil(tok, perms) != 0 && errno != ENOENT) {
+            fprintf(stderr, "sandbox: unveil('%s', '%s') failed: %s\n",
+                    tok, perms, strerror(errno));
+            rc = -1;
+            break;
+        }
+    }
+    free(copy);
+    return rc;
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 6) {
@@ -65,28 +99,28 @@ int main(int argc, char *argv[]) {
     unveil("/bin", "rx");
     unveil("/tmp", "rwc");
     unveil("/etc", "r");  /* git needs /etc for config */
-    /* Unveil minimal /dev entries: git and other tools need /dev/null and
-     * /dev/urandom (random). Keep the surface as tight as possible. */
+    /* file(1) magic database; curl needs DNS resolver config in /run
+       (/etc/resolv.conf is a symlink to /run/systemd/resolve/stub-resolv.conf) */
+    unveil("/usr/share", "r");
+    unveil("/run", "r");
+    /* Devices: git, cargo, and shell tools need /dev/null and /dev/urandom */
     unveil("/dev/null", "rw");
     unveil("/dev/urandom", "r");
-    /* Git reads global config from the user's home dir (~/.gitconfig and
-     * ~/.config/git/config). Unveil just those files, not the whole home. */
-    const char *home = getenv("HOME");
-    if (home && home[0]) {
-        size_t home_len = strlen(home);
-        if (home_len < 1024) {
-            char gitconfig[1100];
-            snprintf(gitconfig, sizeof(gitconfig), "%s/.gitconfig", home);
-            unveil(gitconfig, "r");
-            char xdg_config[1100];
-            snprintf(xdg_config, sizeof(xdg_config), "%s/.config/git/config", home);
-            unveil(xdg_config, "r");
-        }
-    }
     /* Also unveil the binary itself if we can determine its path */
     if (cmd[0] == '/') {
         unveil(cmd, "rx");
     }
+    /* Additional read-only paths from SANDBOX_UNVEIL_R (colon-separated).
+       Used to let commands like git read config dotfiles under $HOME that
+       the default unveil set doesn't cover. Paths may not exist yet (unveil
+       on a missing path is a no-op, which is fine for optional config). */
+    if (unveil_list_from_env("SANDBOX_UNVEIL_R", "r") != 0)
+        return 1;
+    /* Additional read-write paths from SANDBOX_UNVEIL_RW (colon-separated),
+       e.g. python's user site-packages and pip/uv caches so packages can be
+       installed and used from inside the sandbox. */
+    if (unveil_list_from_env("SANDBOX_UNVEIL_RW", "rwc") != 0)
+        return 1;
     /* Lock unveil — no further paths can be added */
     if (unveil(NULL, NULL) != 0) {
         fprintf(stderr, "sandbox: unveil lock failed: %s\n", strerror(errno));

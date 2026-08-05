@@ -23,7 +23,6 @@ SANDBOX_BIN = REPO_ROOT / "bin" / "sandbox"
 SANDBOX_WRAPPER = REPO_ROOT / "bin" / "run-sandbox"
 BUSYBOX_BIN = REPO_ROOT / "bin" / "busybox"
 DEFAULT_ALLOWED_DIRS = [
-    str(Path.home() / "github"),
     str(Path.home() / "projects"),
     "/tmp",
 ]
@@ -35,11 +34,26 @@ MAX_OUTPUT = 1_000_000  # 1 MB
 # Command definitions
 # ---------------------------------------------------------------------------
 
+
+def _git_config_paths() -> list[str]:
+    """Return the git config dotfiles under $HOME that must be unveiled.
+
+    Covers the user-global config (~/.gitconfig) and the XDG config file
+    (~/.config/git/config). Missing paths are ignored by the sandbox.
+    """
+    home = Path.home()
+    return [
+        str(home / ".gitconfig"),
+        str(home / ".config" / "git" / "config"),
+    ]
+
+
 COMMANDS = {
     "git": {
         "binary": "/usr/bin/git",
         "promises": "stdio rpath wpath cpath prot_exec",
         "description": "Git version control",
+        "extra_unveil": _git_config_paths,
     },
     "cargo": {
         "binary": "cargo",
@@ -51,14 +65,43 @@ COMMANDS = {
         "promises": "stdio rpath wpath cpath proc prot_exec",
         "description": "GNU make build tool (spawns compiler subprocesses)",
     },
+    "python3": {
+        "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),
+        "promises": "stdio rpath wpath cpath inet dns recvfd",
+        "description": (
+            "Python 3 interpreter (Cosmopolitan static build). Runs with "
+            "-S so PYTHONPATH (a sandbox-local site dir inside the cwd) "
+            "is honored; supports pip/network installs."
+        ),
+        # Prepend -S: the cosmo python's patched site module wipes PYTHONPATH
+        # entries, so we disable it and rely on PYTHONPATH for the sandbox-
+        # local site-packages dir.
+        "prepend_args": ["-S"],
+        # A per-invocation sandbox-local site base dir, created under the
+        # cwd and exposed via PYTHONPATH/PYTHONUSERBASE. `pip install --user`
+        # installs into <dir>/lib/python3.12/site-packages, and imports pick
+        # it up via PYTHONPATH. Keeps packages inside the sandbox workspace
+        # rather than unveiling the host's ~/.local.
+        "site_dir_name": ".py-site",
+    },
+    "file": {
+        "binary": str(REPO_ROOT / "bin" / "cosmo" / "file"),
+        "promises": "stdio rpath",
+        "description": "Determine file type (Cosmopolitan static build)",
+    },
 }
 
 BUSYBOX_APPLETS = [
-    "cat", "head", "tail", "wc", "sort", "uniq",
-    "grep", "ls", "echo", "test", "expr",
-    "mkdir", "cp", "mv", "chmod",
+    # text/read
+    "cat", "head", "tail", "wc", "sort", "uniq", "nl", "tac", "tee",
+    "grep", "ls", "echo", "printf", "test", "expr",
     "cut", "tr", "diff", "cmp", "md5sum", "sha256sum",
     "which", "basename", "dirname", "realpath",
+    # file manipulation
+    "mkdir", "cp", "mv", "rm", "touch", "chmod",
+    # inspection
+    "find", "sed", "awk", "stat", "readlink", "df", "du", "uname",
+    "id", "date", "env", "seq", "shuf", "xargs", "unzip",
     "true", "false", "sleep",
 ]
 
@@ -186,13 +229,44 @@ def shell_run(
         return err
 
     # Build sandbox invocation via the exec wrapper (bypasses posix_spawn APE issue)
+    # Prepend per-command args (e.g. python3's "-S") before the user's args.
+    prepend = cfg.get("prepend_args", [])
     sandbox_args = [
         str(SANDBOX_WRAPPER.resolve()),
         cfg["promises"],
         str(work_dir),  # unveil directory
         "--",
         binary,
-    ] + final_args[1:]
+    ] + prepend + final_args[1:]
+
+    # Extra unveil paths via env vars the sandbox honors:
+    #   SANDBOX_UNVEIL_R  — read-only (e.g. git config dotfiles under $HOME)
+    #   SANDBOX_UNVEIL_RW — read-write (optional)
+    env = None
+    unveil_env: dict[str, str] = {}
+    extra_unveil = cfg.get("extra_unveil")
+    if extra_unveil:
+        paths = extra_unveil() if callable(extra_unveil) else extra_unveil
+        if paths:
+            unveil_env["SANDBOX_UNVEIL_R"] = ":".join(paths)
+
+    # Sandbox-local python site dir: create <cwd>/.py-site, expose the base
+    # via PYTHONUSERBASE (so `pip install --user` lands inside the sandbox)
+    # and the site-packages via PYTHONPATH (so imports resolve).
+    site_dir_name = cfg.get("site_dir_name")
+    if site_dir_name:
+        site_base = work_dir / site_dir_name
+        try:
+            site_base.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return f"Error creating python site dir {site_base}: {e}"
+        site_packages = site_base / "lib" / "python3.12" / "site-packages"
+        site_packages.mkdir(parents=True, exist_ok=True)
+        unveil_env["PYTHONUSERBASE"] = str(site_base)
+        unveil_env["PYTHONPATH"] = str(site_packages)
+
+    if unveil_env:
+        env = {**os.environ, **unveil_env}
 
     try:
         result = subprocess.run(
@@ -200,6 +274,7 @@ def shell_run(
             capture_output=True,
             timeout=timeout,
             cwd=str(work_dir),
+            env=env,
         )
 
         # Capture raw bytes and decode lossily so binary/non-UTF-8 output
