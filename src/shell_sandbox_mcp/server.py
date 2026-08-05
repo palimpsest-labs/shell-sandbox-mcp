@@ -413,6 +413,13 @@ def _split_command(command: str) -> list[tuple[Optional[str], list[str], bool]]:
             prev_op = "&&"
             i += 2
             continue
+        if c == "&" and i > 0 and command[i - 1] == ">" and i + 1 < n and command[i + 1].isdigit():
+            # fd-dup redirect like `2>&1` / `1>&2`: the `&` here is part of a
+            # redirect operator, not a backgrounding operator. Leave it in the
+            # current segment so _extract_redirects can parse it.
+            current_seg.append(c)
+            i += 1
+            continue
         if c == "&":
             # Bare '&' backgrounding: flush the current pipeline marked as
             # backgrounded and reset prev_op (like ';' — next pipeline always

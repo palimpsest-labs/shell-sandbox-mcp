@@ -326,6 +326,23 @@ class SplitCommandTest(unittest.TestCase):
             [(None, ["a"], False), ("&&", ["b"], False)],
         )
 
+    def test_fd_dup_ampersand_is_not_backgrounding(self) -> None:
+        # The '&' inside `2>&1` / `1>&2` is part of a redirect operator, not a
+        # backgrounding operator, so the whole segment must stay intact.
+        self.assertEqual(
+            server._split_command("echo hi 2>&1"),
+            [(None, ["echo hi 2>&1"], False)],
+        )
+        self.assertEqual(
+            server._split_command("cmd 1>&2"),
+            [(None, ["cmd 1>&2"], False)],
+        )
+        # Backgrounding still works when '&' is NOT preceded by '>' + digit.
+        self.assertEqual(
+            server._split_command("grep x 2>err &"),
+            [(None, ["grep x 2>err"], True)],
+        )
+
     def test_ampersand_inside_quotes_preserved(self) -> None:
         # '&' inside quotes is literal text, not a backgrounding operator.
         self.assertEqual(
