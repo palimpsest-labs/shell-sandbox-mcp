@@ -23,7 +23,6 @@ SANDBOX_BIN = REPO_ROOT / "bin" / "sandbox"
 SANDBOX_WRAPPER = REPO_ROOT / "bin" / "run-sandbox"
 BUSYBOX_BIN = REPO_ROOT / "bin" / "busybox"
 DEFAULT_ALLOWED_DIRS = [
-    str(Path.home() / "github"),
     str(Path.home() / "projects"),
     "/tmp",
 ]
@@ -35,11 +34,26 @@ MAX_OUTPUT = 1_000_000  # 1 MB
 # Command definitions
 # ---------------------------------------------------------------------------
 
+
+def _git_config_paths() -> list[str]:
+    """Return the git config dotfiles under $HOME that must be unveiled.
+
+    Covers the user-global config (~/.gitconfig) and the XDG config file
+    (~/.config/git/config). Missing paths are ignored by the sandbox.
+    """
+    home = Path.home()
+    return [
+        str(home / ".gitconfig"),
+        str(home / ".config" / "git" / "config"),
+    ]
+
+
 COMMANDS = {
     "git": {
         "binary": "/usr/bin/git",
         "promises": "stdio rpath wpath cpath prot_exec",
         "description": "Git version control",
+        "extra_unveil": _git_config_paths,
     },
     "cargo": {
         "binary": "cargo",
@@ -204,6 +218,14 @@ def shell_run(
         binary,
     ] + final_args[1:]
 
+    # Extra read-only unveil paths (e.g. git config dotfiles under $HOME).
+    env = None
+    extra_unveil = cfg.get("extra_unveil")
+    if extra_unveil:
+        paths = extra_unveil() if callable(extra_unveil) else extra_unveil
+        if paths:
+            env = {**os.environ, "SANDBOX_UNVEIL_R": ":".join(paths)}
+
     try:
         result = subprocess.run(
             sandbox_args,
@@ -211,6 +233,7 @@ def shell_run(
             text=True,
             timeout=timeout,
             cwd=str(work_dir),
+            env=env,
         )
 
         stdout = result.stdout[:MAX_OUTPUT]

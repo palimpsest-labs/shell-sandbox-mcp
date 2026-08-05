@@ -6,6 +6,9 @@
  * Pledges the given promises, unveils UNVEIL_DIR for rwc access,
  * then execs cmd with args.
  *
+ * Optional env: SANDBOX_UNVEIL_R — a colon-separated list of extra paths
+ * to unveil read-only (e.g. git config dotfiles under $HOME).
+ *
  * Compile with cosmocc for a portable static binary:
  *   cosmocc -o sandbox sandbox.c
  */
@@ -75,6 +78,31 @@ int main(int argc, char *argv[]) {
     /* Also unveil the binary itself if we can determine its path */
     if (cmd[0] == '/') {
         unveil(cmd, "rx");
+    }
+    /* Additional read-only paths from SANDBOX_UNVEIL_R (colon-separated).
+       Used to let commands like git read config dotfiles under $HOME that
+       the default unveil set doesn't cover. Paths may not exist yet (unveil
+       on a missing path is a no-op, which is fine for optional config). */
+    const char *extra = getenv("SANDBOX_UNVEIL_R");
+    if (extra && *extra) {
+        char *copy = strdup(extra);
+        if (!copy) {
+            fprintf(stderr, "sandbox: out of memory\n");
+            return 1;
+        }
+        char *save = NULL;
+        for (char *tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+            if (*tok && unveil(tok, "r") != 0) {
+                /* Optional paths may not exist — that's fine (ENOENT). */
+                if (errno != ENOENT) {
+                    fprintf(stderr, "sandbox: unveil('%s', 'r') failed: %s\n",
+                            tok, strerror(errno));
+                    free(copy);
+                    return 1;
+                }
+            }
+        }
+        free(copy);
     }
     /* Lock unveil — no further paths can be added */
     if (unveil(NULL, NULL) != 0) {
