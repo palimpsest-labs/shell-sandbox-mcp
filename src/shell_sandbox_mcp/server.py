@@ -63,13 +63,26 @@ def _git_credential_paths() -> list[str]:
 def _cosmo_toolchain_paths() -> list[str]:
     """Return the paths that must be unveiled read-execute for the vendored
     cosmocc toolchain to run: the toolchain tree itself (its compilers read
-    headers/libs from it) and the Cosmopolitan APE loader under $HOME. The
-    loaders at /usr/bin are already unveiled by the sandbox default.
+    headers/libs from it), the busybox binary (used as a non-preserving `mv`
+    by build tools), and the Cosmopolitan APE loader under $HOME. The loaders
+    at /usr/bin are already unveiled by the sandbox default.
     """
     return [
         str(COSMO_TOOLCHAIN.resolve()),
+        str(BUSYBOX_BIN.resolve()),
         str((Path.home().resolve() / ".ape-1.10").resolve()),
     ]
+
+
+def _cosmo_toolchain_bin() -> str:
+    """Return the vendored toolchain's bin directory.
+
+    Prepended to PATH for build commands so that `mv` (a busybox applet
+    symlinked into the toolchain bin) is resolved instead of GNU /usr/bin/mv,
+    which would otherwise try to preserve file attributes that the sandbox
+    blocks (noisy but harmless warnings during builds).
+    """
+    return str((COSMO_TOOLCHAIN / "bin").resolve())
 
 
 COMMANDS = {
@@ -87,40 +100,45 @@ COMMANDS = {
     },
     "make": {
         "binary": str((COSMO_TOOLCHAIN / "bin" / "make").resolve()),
-        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
         "description": (
             "GNU make build tool (vendored). Spawns compiler subprocesses, "
             "so it needs exec access to the toolchain."
         ),
         "extra_unveil_rx": _cosmo_toolchain_paths,
+        "path_prefix": _cosmo_toolchain_bin,
     },
     "cosmocc": {
         "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
-        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
         "description": (
             "Cosmopolitan C/C++ compiler (vendored toolchain). Compiles "
             "portable APE binaries for both x86_64 and aarch64."
         ),
         "extra_unveil_rx": _cosmo_toolchain_paths,
+        "path_prefix": _cosmo_toolchain_bin,
     },
     # Compiler aliases — all map to the same vendored cosmocc driver.
     "gcc": {
         "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
-        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
         "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
         "extra_unveil_rx": _cosmo_toolchain_paths,
+        "path_prefix": _cosmo_toolchain_bin,
     },
     "cc": {
         "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
-        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
         "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
         "extra_unveil_rx": _cosmo_toolchain_paths,
+        "path_prefix": _cosmo_toolchain_bin,
     },
     "clang": {
         "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
-        "promises": "stdio rpath wpath cpath proc prot_exec",
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
         "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
         "extra_unveil_rx": _cosmo_toolchain_paths,
+        "path_prefix": _cosmo_toolchain_bin,
     },
     "python3": {
         "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),
@@ -454,6 +472,17 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
 
     if unveil_env:
         env = {**os.environ, **unveil_env}
+
+    # Optionally prepend a directory to PATH (e.g. so build commands resolve a
+    # busybox `mv` from the vendored toolchain instead of GNU /usr/bin/mv).
+    path_prefix = cfg.get("path_prefix")
+    if path_prefix:
+        prefix = path_prefix() if callable(path_prefix) else path_prefix
+        if prefix:
+            base = env if env is not None else dict(os.environ)
+            cur = base.get("PATH", "")
+            base["PATH"] = f"{prefix}:{cur}" if cur else prefix
+            env = base
 
     # Narrow the TOCTOU window for local binaries: re-verify the resolved
     # path is still an executable contained within the work dir right before

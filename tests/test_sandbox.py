@@ -345,13 +345,14 @@ class GitConfigPathsTest(unittest.TestCase):
 class CosmoToolchainPathsTest(unittest.TestCase):
     def test_paths_resolved(self) -> None:
         paths = server._cosmo_toolchain_paths()
-        # toolchain tree + APE loader
-        self.assertEqual(len(paths), 2)
+        # toolchain tree + busybox binary + APE loader
+        self.assertEqual(len(paths), 3)
         for p in paths:
             self.assertTrue(Path(p).is_absolute())
             self.assertEqual(str(Path(p).resolve()), p)
-        # first path must be the vendored toolchain root
+        # first path must be the vendored toolchain root; busybox must be present
         self.assertEqual(Path(paths[0]), server.COSMO_TOOLCHAIN.resolve())
+        self.assertEqual(Path(paths[1]), server.BUSYBOX_BIN.resolve())
 
     def test_cosmocc_configured_with_local_toolchain(self) -> None:
         cfg = server.COMMANDS["cosmocc"]
