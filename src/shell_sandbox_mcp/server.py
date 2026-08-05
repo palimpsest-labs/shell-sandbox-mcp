@@ -9,6 +9,7 @@ Tools:
 import os
 import shlex
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -333,63 +334,92 @@ def _validate_cwd(resolved: Path, raw: str) -> Optional[str]:
 # Command chaining
 # ---------------------------------------------------------------------------
 
-def _split_command(command: str) -> list[tuple[Optional[str], str]]:
-    """Split a command string on top-level `;`, `&&`, and `||` operators.
+def _split_command(command: str) -> list[tuple[Optional[str], list[str]]]:
+    """Split a command string into a chain of pipe-connected pipelines.
 
-    Operators nested inside single or double quotes are preserved as literal
-    text of the segment (they are not shell operators). Returns a list of
-    ``(operator, segment)`` pairs where ``operator`` is None for the first
-    segment and ``';'``, ``'&&'``, or ``'||'`` for each subsequent one.
-    Leading/trailing whitespace is stripped from each segment; empty segments
-    are dropped.
+    A pipeline is a list of segments joined by a single top-level `|` (pipe),
+    where each segment's stdout feeds the next segment's stdin. Pipelines are
+    joined by top-level `;`, `&&`, or `||` operators. Operators nested inside
+    single or double quotes are preserved as literal text of the segment (they
+    are not shell operators).
+
+    Returns a list of ``(operator, pipeline)`` pairs where ``operator`` is
+    None for the first pipeline and ``';'``, ``'&&'``, or ``'||'`` for each
+    subsequent one. Each ``pipeline`` is a list of pipe-separated segment
+    strings. Leading/trailing whitespace is stripped from each segment; empty
+    segments are dropped.
+
+    Raises ``ValueError`` if an unsupported operator is used at the top level:
+    a bare ``&`` (not part of ``&&``), since backgrounding is not supported.
+    Operators nested inside quotes are treated as literal text and never raise.
     """
-    segments: list[tuple[Optional[str], str]] = []
+    pipelines: list[tuple[Optional[str], list[str]]] = []
+    current_pipeline: list[str] = []
+    current_seg: list[str] = []
     i, n = 0, len(command)
-    current: list[str] = []
     quote: Optional[str] = None
     prev_op: Optional[str] = None
 
-    def flush() -> None:
-        nonlocal prev_op
-        text = "".join(current).strip()
+    def flush_segment() -> None:
+        text = "".join(current_seg).strip()
         if text:
-            segments.append((prev_op, text))
-        current.clear()
+            current_pipeline.append(text)
+        current_seg.clear()
+
+    def flush_pipeline() -> None:
+        nonlocal prev_op
+        flush_segment()
+        if current_pipeline:
+            pipelines.append((prev_op, current_pipeline[:]))
+        del current_pipeline[:]
         prev_op = None
 
     while i < n:
         c = command[i]
         if quote is not None:
-            current.append(c)
+            current_seg.append(c)
             if c == quote:
                 quote = None
             i += 1
             continue
         if c in ("'", '"'):
             quote = c
-            current.append(c)
+            current_seg.append(c)
             i += 1
             continue
         if c == ";":
-            flush()
+            flush_pipeline()
             prev_op = ";"
             i += 1
             continue
         if c == "&" and i + 1 < n and command[i + 1] == "&":
-            flush()
+            flush_pipeline()
             prev_op = "&&"
             i += 2
             continue
+        if c == "&":
+            # A bare '&' would be a backgrounding operator in a real shell,
+            # which we don't support. Reject it explicitly rather than silently
+            # passing it through as a literal argument.
+            raise ValueError(
+                "Unsupported '&' operator (backgrounding is not supported). "
+                "Use '&&' for AND or ';' to separate commands."
+            )
         if c == "|" and i + 1 < n and command[i + 1] == "|":
-            flush()
+            flush_pipeline()
             prev_op = "||"
             i += 2
             continue
-        current.append(c)
+        if c == "|":
+            # single pipe — end the current segment within the pipeline
+            flush_segment()
+            i += 1
+            continue
+        current_seg.append(c)
         i += 1
 
-    flush()
-    return segments
+    flush_pipeline()
+    return pipelines
 
 
 # ---------------------------------------------------------------------------
@@ -397,27 +427,30 @@ def _split_command(command: str) -> list[tuple[Optional[str], str]]:
 # ---------------------------------------------------------------------------
 
 
-def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
-    """Run a single operator-free command segment in the sandbox.
+def _build_invocation(
+    command: str,
+    work_dir: Path,
+) -> tuple[str, list[str], Optional[dict], dict]:
+    """Parse, resolve, and build the sandbox invocation for one segment.
 
-    Returns ``(returncode, output_string)``. ``returncode`` is 0 on success and
-    non-zero on failure, an error, or an invalid/denied command, so callers can
-    apply ``&&``/``||`` short-circuit semantics. ``output_string`` is the
-    formatted output, or ``""`` when the segment produced nothing to report.
+    Returns ``(binary, sandbox_args, env, cfg)`` on success. ``env`` is
+    ``None`` when no env overrides are needed. On failure, returns a tuple
+    whose first element is the error message and whose remaining elements are
+    ``None``: ``(error_msg, None, None, None)``. An empty command returns
+    ``(None, None, None, None)``.
     """
-    # Parse command into args
     try:
         args = shlex.split(command)
     except ValueError as e:
-        return 1, f"Invalid command syntax: {e}"
+        return f"Invalid command syntax: {e}", None, None, None
 
     if not args:
-        return 0, ""
+        return None, None, None, None
 
     # Resolve and validate against the allowlist (or a local binary under cwd)
     binary, final_args, cfg = _resolve_command(args, work_dir)
     if binary is None:
-        return 1, final_args  # error message
+        return final_args, None, None, None  # error message
 
     # Build sandbox invocation via the exec wrapper (bypasses posix_spawn APE issue)
     # Prepend per-command args (e.g. python3's "-S") before the user's args.
@@ -433,7 +466,7 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
     # Extra unveil paths via env vars the sandbox honors:
     #   SANDBOX_UNVEIL_R  — read-only (e.g. git config dotfiles under $HOME)
     #   SANDBOX_UNVEIL_RW — read-write (optional)
-    env = None
+    env: Optional[dict] = None
     unveil_env: dict[str, str] = {}
     extra_unveil = cfg.get("extra_unveil")
     if extra_unveil:
@@ -464,7 +497,7 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
         try:
             site_base.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            return 1, f"Error creating python site dir {site_base}: {e}"
+            return f"Error creating python site dir {site_base}: {e}", None, None, None
         site_packages = site_base / "lib" / "python3.12" / "site-packages"
         site_packages.mkdir(parents=True, exist_ok=True)
         unveil_env["PYTHONUSERBASE"] = str(site_base)
@@ -483,6 +516,23 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
             cur = base.get("PATH", "")
             base["PATH"] = f"{prefix}:{cur}" if cur else prefix
             env = base
+
+    return binary, sandbox_args, env, cfg
+
+
+def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
+    """Run a single operator-free command segment in the sandbox.
+
+    Returns ``(returncode, output_string)``. ``returncode`` is 0 on success and
+    non-zero on failure, an error, or an invalid/denied command, so callers can
+    apply ``&&``/``||`` short-circuit semantics. ``output_string`` is the
+    formatted output, or ``""`` when the segment produced nothing to report.
+    """
+    binary, sandbox_args, env, cfg = _build_invocation(command, work_dir)
+    if sandbox_args is None:
+        if binary is None:
+            return 0, ""  # empty command
+        return 1, binary  # error message
 
     # Narrow the TOCTOU window for local binaries: re-verify the resolved
     # path is still an executable contained within the work dir right before
@@ -527,6 +577,133 @@ def _run_segment(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
         return 1, f"Error running command: {e}"
 
 
+def _run_pipeline(
+    segments: list[str],
+    work_dir: Path,
+    timeout: int,
+) -> tuple[int, str]:
+    """Run a pipe-connected sequence of segments concurrently in the sandbox.
+
+    Each segment's stdout is connected to the next segment's stdin, so data
+    flows through the pipeline as in a real shell pipe. Every segment is still
+    run through its own pledge sandbox and checked against the allowlist
+    independently.
+
+    Returns ``(returncode, output_string)``. ``returncode`` is the exit code of
+    the *last* segment (shell default; no pipefail). Intermediate segments'
+    stdout is consumed by the next stage; their stderr, plus the last stage's
+    stdout and stderr, are surfaced in ``output_string``.
+    """
+    invocations: list[tuple[list[str], Optional[dict]]] = []
+    for seg in segments:
+        binary, sandbox_args, env, cfg = _build_invocation(seg, work_dir)
+        if sandbox_args is None:
+            if binary is None:
+                continue  # empty segment inside a pipeline
+            return 1, binary  # error message
+        if cfg.get("is_local_binary") and not _binary_still_contained(binary, work_dir):
+            return 1, f"Local binary no longer valid inside working directory: {binary}"
+        invocations.append((sandbox_args, env))
+
+    if not invocations:
+        return 0, ""
+
+    # Launch every stage, chaining each one's stdout into the next one's stdin.
+    procs: list[subprocess.Popen] = []
+    prev: Optional[subprocess.Popen] = None
+    for sandbox_args, env in invocations:
+        p = subprocess.Popen(
+            sandbox_args,
+            stdin=prev.stdout if prev is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(work_dir),
+            env=env,
+        )
+        if prev is not None:
+            prev.stdout.close()  # parent no longer holds the read end
+        procs.append(p)
+        prev = p
+
+    # Drain the stderr of every stage but the last on a thread, so a chatty
+    # producer can't deadlock on a full stderr pipe. The last stage's stdout is
+    # the pipeline's output and its stderr is read by communicate().
+    last = procs[-1]
+    stderr_bufs: dict[int, bytes] = {}
+    bufs_lock = threading.Lock()
+
+    def _drain_stderr(i: int, p: subprocess.Popen) -> None:
+        data = p.stderr.read()
+        p.stderr.close()  # intermediate pipes aren't closed by communicate()
+        with bufs_lock:
+            stderr_bufs[i] = data
+
+    threads: list[threading.Thread] = []
+    for i, p in enumerate(procs[:-1]):
+        t = threading.Thread(target=_drain_stderr, args=(i, p), daemon=True)
+        t.start()
+        threads.append(t)
+
+    timed_out = False
+    try:
+        stdout_bytes, last_stderr = last.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+
+    # Reap every process that is still running. This is essential: the last
+    # stage may finish while an upstream stage (e.g. a chatty producer) keeps
+    # running, and we must close its stderr write-end so its drain thread gets
+    # EOF and completes — otherwise the thread stays alive while we read
+    # `stderr_bufs` below (a race), and the child becomes a zombie.
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+    for p in procs:
+        p.wait()
+
+    # Now that every process is dead and its pipe fds are closed, the drain
+    # threads are guaranteed to finish (their read() returns EOF).
+    for t in threads:
+        t.join(timeout=1)
+
+    if timed_out:
+        # communicate() timed out and left the last stage's pipes open; close
+        # them so we don't leak fds or trip ResourceWarning.
+        for f in (last.stdout, last.stderr):
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
+        return 1, f"Pipeline timed out after {timeout}s"
+
+    rc = last.returncode
+    with bufs_lock:
+        intermediate_err = b"\n".join(stderr_bufs.values())
+    combined_err = (intermediate_err + b"\n" + last_stderr).strip()
+
+    stdout = stdout_bytes[:MAX_OUTPUT].decode("utf-8", errors="replace")
+    stderr_out = combined_err[:MAX_OUTPUT].decode("utf-8", errors="replace")
+
+    output = []
+    if rc != 0:
+        output.append(f"Exit code: {rc}")
+    if stdout:
+        output.append(stdout.rstrip())
+    if stderr_out:
+        output.append(f"[stderr]\n{stderr_out.rstrip()}")
+
+    if len(stdout_bytes) > MAX_OUTPUT:
+        output.append(f"\n[output truncated at {MAX_OUTPUT} bytes]")
+    if len(combined_err) > MAX_OUTPUT:
+        output.append(f"\n[stderr truncated at {MAX_OUTPUT} bytes]")
+
+    return rc, "\n".join(output)
+
+
 @mcp.tool()
 def shell_run(
     command: str,
@@ -538,14 +715,17 @@ def shell_run(
     Commands are executed via the pledge-wrapped sandbox binary with
     restricted system call promises. Only allowlisted commands can run.
 
-    Command chaining with `;`, `&&`, and `||` is supported: the command string
-    is split on those operators and each segment is run through the sandbox and
-    checked against the allowlist independently. `&&` runs its segment only if
-    the previous one succeeded; `||` only if it failed; `;` always runs. Pipes
-    (`|`) and redirects (`>`, `>>`) are not supported.
+    Pipes (`|`) are supported: the command string is split on top-level `|`
+    into pipeline stages, and each stage's stdout is fed to the next stage's
+    stdin, exactly as in a real shell pipe. Pipelines can be chained with `;`,
+    `&&`, and `||`; every stage/segment is run through its own sandbox and
+    checked against the allowlist independently. `&&` runs its pipeline only if
+    the previous one succeeded; `||` only if it failed; `;` always runs.
+    Redirects (`>`, `>>`) and backgrounding (`&`) are not supported.
 
     Args:
-        command: The command to run (e.g., "git status", "cd build && make test")
+        command: The command to run (e.g., "git status", "ls | grep foo",
+            "cd build && make test")
         cwd:     Working directory (must be within allowed paths)
         timeout: Timeout in seconds (default 30, max 300)
     """
@@ -563,33 +743,41 @@ def shell_run(
     if err:
         return err
 
-    # Split into allowlist-checked segments on ; / && / ||
-    segments = _split_command(command)
-    if not segments:
+    # Split into allowlist-checked pipelines on ; / && / ||, with each pipeline
+    # being a list of `|`-separated stages.
+    try:
+        pipelines = _split_command(command)
+    except ValueError as e:
+        return str(e)
+    if not pipelines:
         return "Empty command."
 
     # Single-command fast path — preserves the exact prior behaviour.
-    if len(segments) == 1 and segments[0][0] is None:
-        _rc, out = _run_segment(segments[0][1], work_dir, timeout)
+    if len(pipelines) == 1 and pipelines[0][0] is None and len(pipelines[0][1]) == 1:
+        _rc, out = _run_segment(pipelines[0][1][0], work_dir, timeout)
         return out if out else "(no output)"
 
-    # Multi-segment chain: run each segment through the sandbox, applying
-    # `&&` / `||` short-circuit semantics based on the previous segment's exit
-    # code. Segments are independent processes (no shared shell variables), but
-    # they share the same cwd, so file-based state persists across segments.
+    # Multi-pipeline chain: run each pipeline through the sandbox, applying
+    # `&&` / `||` short-circuit semantics based on the previous pipeline's exit
+    # code. Pipelines are independent processes (no shared shell variables), but
+    # they share the same cwd, so file-based state persists across stages.
     outputs: list[str] = []
     prev_rc = 0
     ran_any = False
 
-    for op, segment in segments:
+    for op, stages in pipelines:
+        joined = " | ".join(stages)
         if op == "&&" and ran_any and prev_rc != 0:
-            outputs.append(f"(skipped: previous command exited {prev_rc}) — {segment}")
+            outputs.append(f"(skipped: previous command exited {prev_rc}) — {joined}")
             continue
         if op == "||" and ran_any and prev_rc == 0:
-            outputs.append("(skipped: previous command succeeded) — " + segment)
+            outputs.append("(skipped: previous command succeeded) — " + joined)
             continue
 
-        rc, out = _run_segment(segment, work_dir, timeout)
+        if len(stages) == 1:
+            rc, out = _run_segment(stages[0], work_dir, timeout)
+        else:
+            rc, out = _run_pipeline(stages, work_dir, timeout)
         prev_rc = rc
         ran_any = True
         if out:
@@ -618,9 +806,11 @@ def shell_list() -> str:
     lines.append("    the working directory are rejected.")
     lines.append("")
     lines.append("Command chaining: ';', '&&', and '||' are supported. Each")
-    lines.append("    segment is run through the sandbox and checked against the")
+    lines.append("    pipeline is run through the sandbox and checked against the")
     lines.append("    allowlist independently. '&&' runs only after success, '||'")
-    lines.append("    only after failure, ';' always. No pipes ('|') or redirects.")
+    lines.append("    only after failure, ';' always. Pipes ('|') are supported:")
+    lines.append("    each stage's stdout feeds the next stage's stdin. Redirects")
+    lines.append("    ('>', '>>') and backgrounding ('&') are not supported.")
     lines.append("")
     lines.append(f"Sandbox binary: {SANDBOX_BIN.resolve()}")
     lines.append(f"Allowed directories: {', '.join(DEFAULT_ALLOWED_DIRS)}")

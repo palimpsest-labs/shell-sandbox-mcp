@@ -190,47 +190,47 @@ class SplitCommandTest(unittest.TestCase):
     def test_no_operator_single_segment(self) -> None:
         self.assertEqual(
             server._split_command("ls -la"),
-            [(None, "ls -la")],
+            [(None, ["ls -la"])],
         )
 
     def test_semicolon_splits(self) -> None:
         self.assertEqual(
             server._split_command("echo hi; echo bye"),
-            [(None, "echo hi"), (";", "echo bye")],
+            [(None, ["echo hi"]), (";", ["echo bye"])],
         )
 
     def test_and_and_splits(self) -> None:
         self.assertEqual(
             server._split_command("make && make test"),
-            [(None, "make"), ("&&", "make test")],
+            [(None, ["make"]), ("&&", ["make test"])],
         )
 
     def test_or_or_splits(self) -> None:
         self.assertEqual(
             server._split_command("false || echo fallback"),
-            [(None, "false"), ("||", "echo fallback")],
+            [(None, ["false"]), ("||", ["echo fallback"])],
         )
 
     def test_mixed_operators(self) -> None:
         self.assertEqual(
             server._split_command("a && b; c || d"),
-            [(None, "a"), ("&&", "b"), (";", "c"), ("||", "d")],
+            [(None, ["a"]), ("&&", ["b"]), (";", ["c"]), ("||", ["d"])],
         )
 
     def test_operator_inside_quotes_preserved(self) -> None:
         self.assertEqual(
             server._split_command('echo "a; b"'),
-            [(None, 'echo "a; b"')],
+            [(None, ['echo "a; b"'])],
         )
         self.assertEqual(
             server._split_command("printf 'a && b'; ls"),
-            [(None, "printf 'a && b'"), (";", "ls")],
+            [(None, ["printf 'a && b'"]), (";", ["ls"])],
         )
 
     def test_whitespace_and_empty_segments_dropped(self) -> None:
         self.assertEqual(
             server._split_command("  a   ;;  b  "),
-            [(None, "a"), (";", "b")],
+            [(None, ["a"]), (";", ["b"])],
         )
 
     def test_empty_command(self) -> None:
@@ -240,11 +240,78 @@ class SplitCommandTest(unittest.TestCase):
     def test_only_operator_is_empty(self) -> None:
         self.assertEqual(server._split_command(";"), [])
 
-    def test_single_pipe_is_not_split(self) -> None:
-        # A lone '|' is not a supported chaining operator, so it stays literal.
+    def test_single_pipe_splits_into_stages(self) -> None:
         self.assertEqual(
             server._split_command("ls | wc"),
-            [(None, "ls | wc")],
+            [(None, ["ls", "wc"])],
+        )
+
+    def test_multi_stage_pipeline(self) -> None:
+        self.assertEqual(
+            server._split_command("a | b | c"),
+            [(None, ["a", "b", "c"])],
+        )
+
+    def test_pipe_inside_quotes_preserved(self) -> None:
+        self.assertEqual(
+            server._split_command('echo "a|b" | wc'),
+            [(None, ['echo "a|b"', "wc"])],
+        )
+        self.assertEqual(
+            server._split_command("printf 'a | b'"),
+            [(None, ["printf 'a | b'"])],
+        )
+
+    def test_pipe_distinguished_from_or_or(self) -> None:
+        # '||' is the chaining OR operator, not a pipe
+        self.assertEqual(
+            server._split_command("false || echo fallback | wc"),
+            [(None, ["false"]), ("||", ["echo fallback", "wc"])],
+        )
+
+    def test_pipe_and_chain_mix(self) -> None:
+        self.assertEqual(
+            server._split_command("a | b && c | d ; e"),
+            [
+                (None, ["a", "b"]),
+                ("&&", ["c", "d"]),
+                (";", ["e"]),
+            ],
+        )
+
+    def test_pipe_at_start_drops_empty_lead(self) -> None:
+        self.assertEqual(
+            server._split_command("| ls"),
+            [(None, ["ls"])],
+        )
+
+    def test_pipe_at_end_drops_empty_tail(self) -> None:
+        self.assertEqual(
+            server._split_command("ls |"),
+            [(None, ["ls"])],
+        )
+
+    def test_triple_pipe_treated_as_or_or_plus_empty_stage(self) -> None:
+        # 'a ||| b' parses as 'a || b' (the middle empty stage is dropped).
+        self.assertEqual(
+            server._split_command("a ||| b"),
+            [(None, ["a"]), ("||", ["b"])],
+        )
+
+    def test_bare_ampersand_rejected(self) -> None:
+        for cmd in ("echo hi & ls", "a && b & c", "a & b"):
+            with self.assertRaises(ValueError):
+                server._split_command(cmd)
+
+    def test_ampersand_inside_quotes_preserved(self) -> None:
+        # '&' inside quotes is literal text, not a rejected operator.
+        self.assertEqual(
+            server._split_command('echo "a & b"'),
+            [(None, ['echo "a & b"'])],
+        )
+        self.assertEqual(
+            server._split_command("printf 'x & y'"),
+            [(None, ["printf 'x & y'"])],
         )
 
 
@@ -320,6 +387,203 @@ class ShellRunChainingTest(unittest.TestCase):
         self._stub({"notallowed": 1, "b": 0})
         out = self._run("notallowed && b")
         self.assertEqual(self.calls, ["notallowed"])
+
+
+# ---------------------------------------------------------------------------
+# shell_run pipeline orchestration
+# ---------------------------------------------------------------------------
+
+
+class ShellRunPipelineTest(unittest.TestCase):
+    """Exercise how `shell_run` routes pipe pipelines to `_run_pipeline`,
+    and applies `&&`/`||` short-circuit to a pipeline's exit code, by stubbing
+    both `_run_segment` and `_run_pipeline`."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.allowed = Path(tempfile.gettempdir()) / ("sandbox-pipe-" + os.urandom(4).hex())
+        self.allowed.mkdir()
+        self._orig_segment = server._run_segment
+        self._orig_pipeline = server._run_pipeline
+        self.segment_calls: list[str] = []
+        self.pipeline_calls: list[list[str]] = []
+
+    def tearDown(self) -> None:
+        import shutil
+
+        server._run_segment = self._orig_segment
+        server._run_pipeline = self._orig_pipeline
+        shutil.rmtree(self.allowed, ignore_errors=True)
+        self._tmp.cleanup()
+
+    def _stub(
+        self,
+        pipeline_rc: dict[tuple[str, ...], int] | None = None,
+        segment_rc: dict[str, int] | None = None,
+    ) -> None:
+        pipeline_rc = pipeline_rc or {}
+        segment_rc = segment_rc or {}
+
+        def fake_pipeline(stages: list[str], work_dir, timeout):
+            self.pipeline_calls.append(stages)
+            rc = pipeline_rc.get(tuple(stages), 0)
+            return rc, f"pipe:{'|'.join(stages)}" if rc == 0 else f"err-pipe:{'|'.join(stages)}"
+
+        def fake_segment(command: str, work_dir, timeout):
+            self.segment_calls.append(command)
+            rc = segment_rc.get(command, 0)
+            return rc, f"out:{command}" if rc == 0 else f"err:{command}"
+
+        server._run_pipeline = fake_pipeline
+        server._run_segment = fake_segment
+
+    def _run(self, command: str) -> str:
+        return server.shell_run(command, cwd=str(self.allowed))
+
+    def test_two_stage_pipe_routes_to_pipeline(self) -> None:
+        self._stub()
+        out = self._run("ls | wc")
+        self.assertEqual(self.pipeline_calls, [["ls", "wc"]])
+        self.assertEqual(self.segment_calls, [])
+        self.assertIn("pipe:ls|wc", out)
+
+    def test_three_stage_pipe(self) -> None:
+        self._stub()
+        self._run("a | b | c")
+        self.assertEqual(self.pipeline_calls, [["a", "b", "c"]])
+
+    def test_single_stage_uses_segment(self) -> None:
+        self._stub()
+        self._run("ls")
+        self.assertEqual(self.segment_calls, ["ls"])
+        self.assertEqual(self.pipeline_calls, [])
+
+    def test_andand_skips_pipeline_after_failure(self) -> None:
+        self._stub(pipeline_rc={("a", "b"): 1}, segment_rc={"c": 0})
+        out = self._run("a | b && c")
+        self.assertEqual(self.pipeline_calls, [["a", "b"]])
+        self.assertEqual(self.segment_calls, [])
+        self.assertIn("skipped", out)
+        self.assertNotIn("out:c", out)
+
+    def test_andand_runs_after_pipeline_success(self) -> None:
+        self._stub(pipeline_rc={("a", "b"): 0}, segment_rc={"c": 0})
+        out = self._run("a | b && c")
+        self.assertEqual(self.pipeline_calls, [["a", "b"]])
+        self.assertEqual(self.segment_calls, ["c"])
+        self.assertIn("out:c", out)
+
+    def test_oror_runs_after_pipeline_failure(self) -> None:
+        self._stub(pipeline_rc={("a", "b"): 1}, segment_rc={"c": 0})
+        self._run("a | b || c")
+        self.assertEqual(self.pipeline_calls, [["a", "b"]])
+        self.assertEqual(self.segment_calls, ["c"])
+
+    def test_oror_skips_after_pipeline_success(self) -> None:
+        self._stub(pipeline_rc={("a", "b"): 0}, segment_rc={"c": 0})
+        out = self._run("a | b || c")
+        self.assertEqual(self.pipeline_calls, [["a", "b"]])
+        self.assertEqual(self.segment_calls, [])
+        self.assertIn("skipped", out)
+
+    def test_pipeline_resolution_failure_short_circuits_andand(self) -> None:
+        # A denied command inside a pipeline surfaces as rc 1 from _run_pipeline.
+        self._stub(pipeline_rc={("nope", "b"): 1}, segment_rc={"c": 0})
+        out = self._run("nope | b && c")
+        self.assertEqual(self.pipeline_calls, [["nope", "b"]])
+        self.assertEqual(self.segment_calls, [])
+        self.assertIn("skipped", out)
+
+    def test_bare_ampersand_returns_error_message(self) -> None:
+        out = self._run("echo hi & ls")
+        self.assertIn("Unsupported '&' operator", out)
+        # nothing should have been executed
+        self.assertEqual(self.pipeline_calls, [])
+        self.assertEqual(self.segment_calls, [])
+
+
+# ---------------------------------------------------------------------------
+# _run_pipeline real-subprocess orchestration
+# ---------------------------------------------------------------------------
+
+
+class RunPipelineIntegrationTest(unittest.TestCase):
+    """Drive `_run_pipeline` with real subprocesses to exercise the Popen
+    chaining, stderr-draining threads, reaping, and timeout paths. The sandbox
+    wrapper is bypassed by stubbing `_build_invocation` to emit plain system
+    commands, so the orchestration logic is what's under test."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.work_dir = Path(self._tmp.name)
+        self._orig_build = server._build_invocation
+
+    def tearDown(self) -> None:
+        server._build_invocation = self._orig_build
+        self._tmp.cleanup()
+
+    def _fake_build(self, mapping: dict[str, tuple]):
+        def fake(command: str, work_dir):
+            return mapping.get(command, (None, None, None, None))
+
+        server._build_invocation = fake
+
+    def test_real_two_stage_pipe(self) -> None:
+        self._fake_build({
+            "producer": ("/bin/echo", ["/bin/echo", "hello"], None, {}),
+            "consumer": ("/usr/bin/wc", ["/usr/bin/wc", "-c"], None, {}),
+        })
+        rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 10)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "6")  # "hello\n" is 6 bytes
+
+    def test_upstream_keeps_running_is_reaped(self) -> None:
+        # The last stage (head) exits immediately, but the producer loops
+        # writing to stderr forever. The orchestration must kill+reap the
+        # upstream stage and still return promptly without hanging or racing
+        # on the stderr buffer.
+        self._fake_build({
+            "producer": (
+                "/bin/sh",
+                ["/bin/sh", "-c", "echo out; while true; do echo err >&2; done"],
+                None,
+                {},
+            ),
+            "consumer": ("/usr/bin/head", ["/usr/bin/head", "-n1"], None, {}),
+        })
+        rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 10)
+        self.assertEqual(rc, 0)
+        self.assertIn("out", out)
+        self.assertIn("[stderr]", out)
+
+    def test_pipeline_timeout_kills_stages(self) -> None:
+        # A last stage that never exits must be killed and reported as a
+        # timeout rather than hanging the tool.
+        self._fake_build({
+            "producer": ("/bin/echo", ["/bin/echo", "hi"], None, {}),
+            "consumer": (
+                "/bin/sh",
+                ["/bin/sh", "-c", "while true; do :; done"],
+                None,
+                {},
+            ),
+        })
+        rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 1)
+        self.assertEqual(rc, 1)
+        self.assertIn("timed out", out)
+
+    def test_three_stage_real_pipe(self) -> None:
+        import os as _os
+
+        grep = "/usr/bin/grep" if _os.path.exists("/usr/bin/grep") else "/bin/grep"
+        self._fake_build({
+            "a": ("/bin/echo", ["/bin/echo", "one\ntwo\nthree"], None, {}),
+            "b": (grep, [grep, "two"], None, {}),
+            "c": ("/usr/bin/wc", ["/usr/bin/wc", "-l"], None, {}),
+        })
+        rc, out = server._run_pipeline(["a", "b", "c"], self.work_dir, 10)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "1")
 
 
 # ---------------------------------------------------------------------------
