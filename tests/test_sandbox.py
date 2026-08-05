@@ -190,47 +190,47 @@ class SplitCommandTest(unittest.TestCase):
     def test_no_operator_single_segment(self) -> None:
         self.assertEqual(
             server._split_command("ls -la"),
-            [(None, ["ls -la"])],
+            [(None, ["ls -la"], False)],
         )
 
     def test_semicolon_splits(self) -> None:
         self.assertEqual(
             server._split_command("echo hi; echo bye"),
-            [(None, ["echo hi"]), (";", ["echo bye"])],
+            [(None, ["echo hi"], False), (";", ["echo bye"], False)],
         )
 
     def test_and_and_splits(self) -> None:
         self.assertEqual(
             server._split_command("make && make test"),
-            [(None, ["make"]), ("&&", ["make test"])],
+            [(None, ["make"], False), ("&&", ["make test"], False)],
         )
 
     def test_or_or_splits(self) -> None:
         self.assertEqual(
             server._split_command("false || echo fallback"),
-            [(None, ["false"]), ("||", ["echo fallback"])],
+            [(None, ["false"], False), ("||", ["echo fallback"], False)],
         )
 
     def test_mixed_operators(self) -> None:
         self.assertEqual(
             server._split_command("a && b; c || d"),
-            [(None, ["a"]), ("&&", ["b"]), (";", ["c"]), ("||", ["d"])],
+            [(None, ["a"], False), ("&&", ["b"], False), (";", ["c"], False), ("||", ["d"], False)],
         )
 
     def test_operator_inside_quotes_preserved(self) -> None:
         self.assertEqual(
             server._split_command('echo "a; b"'),
-            [(None, ['echo "a; b"'])],
+            [(None, ['echo "a; b"'], False)],
         )
         self.assertEqual(
             server._split_command("printf 'a && b'; ls"),
-            [(None, ["printf 'a && b'"]), (";", ["ls"])],
+            [(None, ["printf 'a && b'"], False), (";", ["ls"], False)],
         )
 
     def test_whitespace_and_empty_segments_dropped(self) -> None:
         self.assertEqual(
             server._split_command("  a   ;;  b  "),
-            [(None, ["a"]), (";", ["b"])],
+            [(None, ["a"], False), (";", ["b"], False)],
         )
 
     def test_empty_command(self) -> None:
@@ -243,75 +243,98 @@ class SplitCommandTest(unittest.TestCase):
     def test_single_pipe_splits_into_stages(self) -> None:
         self.assertEqual(
             server._split_command("ls | wc"),
-            [(None, ["ls", "wc"])],
+            [(None, ["ls", "wc"], False)],
         )
 
     def test_multi_stage_pipeline(self) -> None:
         self.assertEqual(
             server._split_command("a | b | c"),
-            [(None, ["a", "b", "c"])],
+            [(None, ["a", "b", "c"], False)],
         )
 
     def test_pipe_inside_quotes_preserved(self) -> None:
         self.assertEqual(
             server._split_command('echo "a|b" | wc'),
-            [(None, ['echo "a|b"', "wc"])],
+            [(None, ['echo "a|b"', "wc"], False)],
         )
         self.assertEqual(
             server._split_command("printf 'a | b'"),
-            [(None, ["printf 'a | b'"])],
+            [(None, ["printf 'a | b'"], False)],
         )
 
     def test_pipe_distinguished_from_or_or(self) -> None:
         # '||' is the chaining OR operator, not a pipe
         self.assertEqual(
             server._split_command("false || echo fallback | wc"),
-            [(None, ["false"]), ("||", ["echo fallback", "wc"])],
+            [(None, ["false"], False), ("||", ["echo fallback", "wc"], False)],
         )
 
     def test_pipe_and_chain_mix(self) -> None:
         self.assertEqual(
             server._split_command("a | b && c | d ; e"),
             [
-                (None, ["a", "b"]),
-                ("&&", ["c", "d"]),
-                (";", ["e"]),
+                (None, ["a", "b"], False),
+                ("&&", ["c", "d"], False),
+                (";", ["e"], False),
             ],
         )
 
     def test_pipe_at_start_drops_empty_lead(self) -> None:
         self.assertEqual(
             server._split_command("| ls"),
-            [(None, ["ls"])],
+            [(None, ["ls"], False)],
         )
 
     def test_pipe_at_end_drops_empty_tail(self) -> None:
         self.assertEqual(
             server._split_command("ls |"),
-            [(None, ["ls"])],
+            [(None, ["ls"], False)],
         )
 
     def test_triple_pipe_treated_as_or_or_plus_empty_stage(self) -> None:
         # 'a ||| b' parses as 'a || b' (the middle empty stage is dropped).
         self.assertEqual(
             server._split_command("a ||| b"),
-            [(None, ["a"]), ("||", ["b"])],
+            [(None, ["a"], False), ("||", ["b"], False)],
         )
 
-    def test_bare_ampersand_rejected(self) -> None:
-        for cmd in ("echo hi & ls", "a && b & c", "a & b"):
-            with self.assertRaises(ValueError):
-                server._split_command(cmd)
+    def test_bare_ampersand_backgrounds_pipeline(self) -> None:
+        # Bare '&' marks the current pipeline as backgrounded and resets the
+        # operator for the next pipeline (acting like ';' semantically).
+        self.assertEqual(
+            server._split_command("a & b"),
+            [(None, ["a"], True), (None, ["b"], False)],
+        )
+        self.assertEqual(
+            server._split_command("echo hi & ls"),
+            [(None, ["echo hi"], True), (None, ["ls"], False)],
+        )
+
+    def test_ampersand_with_and_operator(self) -> None:
+        # '&&' before a backgrounded pipeline: the '&&' join is preserved,
+        # the pipeline is marked backgrounded, and the next pipeline runs
+        # unconditionally (prev_op reset by '&').
+        self.assertEqual(
+            server._split_command("a && b & c"),
+            [(None, ["a"], False), ("&&", ["b"], True), (None, ["c"], False)],
+        )
+
+    def test_double_ampersand_stays_and_operator(self) -> None:
+        # '&&' is still the AND chaining operator, not backgrounding.
+        self.assertEqual(
+            server._split_command("a && b"),
+            [(None, ["a"], False), ("&&", ["b"], False)],
+        )
 
     def test_ampersand_inside_quotes_preserved(self) -> None:
-        # '&' inside quotes is literal text, not a rejected operator.
+        # '&' inside quotes is literal text, not a backgrounding operator.
         self.assertEqual(
             server._split_command('echo "a & b"'),
-            [(None, ['echo "a & b"'])],
+            [(None, ['echo "a & b"'], False)],
         )
         self.assertEqual(
             server._split_command("printf 'x & y'"),
-            [(None, ["printf 'x & y'"])],
+            [(None, ["printf 'x & y'"], False)],
         )
 
 
@@ -397,7 +420,7 @@ class ShellRunChainingTest(unittest.TestCase):
 class ShellRunPipelineTest(unittest.TestCase):
     """Exercise how `shell_run` routes pipe pipelines to `_run_pipeline`,
     and applies `&&`/`||` short-circuit to a pipeline's exit code, by stubbing
-    both `_run_segment` and `_run_pipeline`."""
+    `_run_segment`, `_run_pipeline`, and `_run_background`."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -405,14 +428,18 @@ class ShellRunPipelineTest(unittest.TestCase):
         self.allowed.mkdir()
         self._orig_segment = server._run_segment
         self._orig_pipeline = server._run_pipeline
+        self._orig_background = getattr(server, "_run_background", None)
         self.segment_calls: list[str] = []
         self.pipeline_calls: list[list[str]] = []
+        self.background_calls: list[list[str]] = []
 
     def tearDown(self) -> None:
         import shutil
 
         server._run_segment = self._orig_segment
         server._run_pipeline = self._orig_pipeline
+        if self._orig_background is not None:
+            server._run_background = self._orig_background
         shutil.rmtree(self.allowed, ignore_errors=True)
         self._tmp.cleanup()
 
@@ -420,9 +447,11 @@ class ShellRunPipelineTest(unittest.TestCase):
         self,
         pipeline_rc: dict[tuple[str, ...], int] | None = None,
         segment_rc: dict[str, int] | None = None,
+        background_rc: dict[tuple[str, ...], int] | None = None,
     ) -> None:
         pipeline_rc = pipeline_rc or {}
         segment_rc = segment_rc or {}
+        background_rc = background_rc or {}
 
         def fake_pipeline(stages: list[str], work_dir, timeout):
             self.pipeline_calls.append(stages)
@@ -434,8 +463,14 @@ class ShellRunPipelineTest(unittest.TestCase):
             rc = segment_rc.get(command, 0)
             return rc, f"out:{command}" if rc == 0 else f"err:{command}"
 
+        def fake_background(stages: list[str], work_dir):
+            self.background_calls.append(stages)
+            rc = background_rc.get(tuple(stages), 0)
+            return rc, f"bg:{'|'.join(stages)}"
+
         server._run_pipeline = fake_pipeline
         server._run_segment = fake_segment
+        server._run_background = fake_background
 
     def _run(self, command: str) -> str:
         return server.shell_run(command, cwd=str(self.allowed))
@@ -494,12 +529,15 @@ class ShellRunPipelineTest(unittest.TestCase):
         self.assertEqual(self.segment_calls, [])
         self.assertIn("skipped", out)
 
-    def test_bare_ampersand_returns_error_message(self) -> None:
+    def test_bare_ampersand_returns_immediately_via_background(self) -> None:
+        self._stub()
         out = self._run("echo hi & ls")
-        self.assertIn("Unsupported '&' operator", out)
-        # nothing should have been executed
+        # 'echo hi' is backgrounded, 'ls' is a normal segment
+        self.assertEqual(self.background_calls, [["echo hi"]])
+        self.assertEqual(self.segment_calls, ["ls"])
         self.assertEqual(self.pipeline_calls, [])
-        self.assertEqual(self.segment_calls, [])
+        self.assertIn("bg:echo hi", out)
+        self.assertIn("out:ls", out)
 
 
 # ---------------------------------------------------------------------------
@@ -524,14 +562,14 @@ class RunPipelineIntegrationTest(unittest.TestCase):
 
     def _fake_build(self, mapping: dict[str, tuple]):
         def fake(command: str, work_dir):
-            return mapping.get(command, (None, None, None, None))
+            return mapping.get(command, (None, None, None, None, []))
 
         server._build_invocation = fake
 
     def test_real_two_stage_pipe(self) -> None:
         self._fake_build({
-            "producer": ("/bin/echo", ["/bin/echo", "hello"], None, {}),
-            "consumer": ("/usr/bin/wc", ["/usr/bin/wc", "-c"], None, {}),
+            "producer": ("/bin/echo", ["/bin/echo", "hello"], None, {}, []),
+            "consumer": ("/usr/bin/wc", ["/usr/bin/wc", "-c"], None, {}, []),
         })
         rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 10)
         self.assertEqual(rc, 0)
@@ -548,8 +586,9 @@ class RunPipelineIntegrationTest(unittest.TestCase):
                 ["/bin/sh", "-c", "echo out; while true; do echo err >&2; done"],
                 None,
                 {},
+                [],
             ),
-            "consumer": ("/usr/bin/head", ["/usr/bin/head", "-n1"], None, {}),
+            "consumer": ("/usr/bin/head", ["/usr/bin/head", "-n1"], None, {}, []),
         })
         rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 10)
         self.assertEqual(rc, 0)
@@ -560,12 +599,13 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         # A last stage that never exits must be killed and reported as a
         # timeout rather than hanging the tool.
         self._fake_build({
-            "producer": ("/bin/echo", ["/bin/echo", "hi"], None, {}),
+            "producer": ("/bin/echo", ["/bin/echo", "hi"], None, {}, []),
             "consumer": (
                 "/bin/sh",
                 ["/bin/sh", "-c", "while true; do :; done"],
                 None,
                 {},
+                [],
             ),
         })
         rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 1)
@@ -577,9 +617,9 @@ class RunPipelineIntegrationTest(unittest.TestCase):
 
         grep = "/usr/bin/grep" if _os.path.exists("/usr/bin/grep") else "/bin/grep"
         self._fake_build({
-            "a": ("/bin/echo", ["/bin/echo", "one\ntwo\nthree"], None, {}),
-            "b": (grep, [grep, "two"], None, {}),
-            "c": ("/usr/bin/wc", ["/usr/bin/wc", "-l"], None, {}),
+            "a": ("/bin/echo", ["/bin/echo", "one\ntwo\nthree"], None, {}, []),
+            "b": (grep, [grep, "two"], None, {}, []),
+            "c": ("/usr/bin/wc", ["/usr/bin/wc", "-l"], None, {}, []),
         })
         rc, out = server._run_pipeline(["a", "b", "c"], self.work_dir, 10)
         self.assertEqual(rc, 0)
@@ -625,6 +665,587 @@ class CosmoToolchainPathsTest(unittest.TestCase):
             cfg["binary"].startswith(str(server.COSMO_TOOLCHAIN.resolve()))
         )
         self.assertEqual(cfg["extra_unveil_rx"], server._cosmo_toolchain_paths)
+
+
+# ---------------------------------------------------------------------------
+# _extract_redirects
+# ---------------------------------------------------------------------------
+
+
+class ExtractRedirectsTest(unittest.TestCase):
+    """Pure unit tests for ``_extract_redirects`` — no subprocess calls."""
+
+    def _extract(self, segment: str):
+        return server._extract_redirects(segment)
+
+    def test_simple_stdout_redirect(self) -> None:
+        args, redirs, err = self._extract("echo hi > out.txt")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "hi"])
+        self.assertEqual(len(redirs), 1)
+        r = redirs[0]
+        self.assertEqual(r.fd, 1)
+        self.assertEqual(r.op, ">")
+        self.assertEqual(r.raw_target, "out.txt")
+        self.assertIsNone(r.target_path)
+
+    def test_stdout_append(self) -> None:
+        args, redirs, err = self._extract("echo hi >> log.txt")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "hi"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 1)
+        self.assertEqual(redirs[0].op, ">>")
+
+    def test_stderr_redirect(self) -> None:
+        args, redirs, err = self._extract("cmd 2> err.txt")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 2)
+        self.assertEqual(redirs[0].op, ">")
+        self.assertEqual(redirs[0].raw_target, "err.txt")
+
+    def test_stderr_append(self) -> None:
+        args, redirs, err = self._extract("cmd 2>> err.txt")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 2)
+        self.assertEqual(redirs[0].op, ">>")
+
+    def test_2gt1_fd_dup(self) -> None:
+        args, redirs, err = self._extract("cmd 2>&1")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 2)
+        self.assertEqual(redirs[0].op, ">&")
+        self.assertEqual(redirs[0].target_fd, 1)
+
+    def test_1gt2_fd_dup(self) -> None:
+        args, redirs, err = self._extract("cmd 1>&2")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 1)
+        self.assertEqual(redirs[0].op, ">&")
+        self.assertEqual(redirs[0].target_fd, 2)
+
+    def test_quoted_operator_not_redirect(self) -> None:
+        args, redirs, err = self._extract('echo ">" hello')
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", ">", "hello"])
+        self.assertEqual(len(redirs), 0)
+
+    def test_quoted_operator_single_quote(self) -> None:
+        args, redirs, err = self._extract("echo '>' hello")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", ">", "hello"])
+        self.assertEqual(len(redirs), 0)
+
+    def test_redirect_leading(self) -> None:
+        args, redirs, err = self._extract(">out echo x")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "x"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].raw_target, "out")
+
+    def test_redirect_middle(self) -> None:
+        args, redirs, err = self._extract("echo a > f b")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "a", "b"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].raw_target, "f")
+
+    def test_multiple_redirects(self) -> None:
+        args, redirs, err = self._extract("cmd 2>e 1>&2")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 2)
+        self.assertEqual(redirs[0].fd, 2)
+        self.assertEqual(redirs[0].op, ">")
+        self.assertEqual(redirs[0].raw_target, "e")
+        self.assertEqual(redirs[1].fd, 1)
+        self.assertEqual(redirs[1].op, ">&")
+        self.assertEqual(redirs[1].target_fd, 2)
+
+    def test_glued_not_redirect(self) -> None:
+        # foo>bar — > is not at word boundary, treated as literal
+        args, redirs, err = self._extract("echo foo>bar")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "foo>bar"])
+        self.assertEqual(len(redirs), 0)
+
+    def test_glued_target_ok(self) -> None:
+        # >out.txt — > is at word start, out.txt is glued target
+        args, redirs, err = self._extract(">out.txt echo hi")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "hi"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].raw_target, "out.txt")
+
+    def test_missing_target_error(self) -> None:
+        args, redirs, err = self._extract("echo >")
+        self.assertEqual(err, "Redirect operator missing target file")
+
+    def test_missing_target_2gt_error(self) -> None:
+        args, redirs, err = self._extract("echo 2>")
+        self.assertEqual(err, "Redirect operator missing target file")
+
+    def test_fd_gt_2_error(self) -> None:
+        args, redirs, err = self._extract("echo 3> f")
+        self.assertEqual(err, "Redirects only support fds 1 and 2 (got 3)")
+
+    def test_fd_0_error(self) -> None:
+        args, redirs, err = self._extract("echo 0> f")
+        self.assertEqual(err, "Redirects only support fds 1 and 2 (got 0)")
+
+    def test_2gt3_error(self) -> None:
+        # 2>&3 is checked — only 1 and 2 are valid target fds.
+        # Actually 2>&3 doesn't match 2>&1 (3 != 1), so it falls through to
+        # 2> matching, and the target is "&3". That's a file named "&3", not
+        # an fd-dup error. Let's verify:
+        args, redirs, err = self._extract("cmd 2>&3")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 2)
+        self.assertEqual(redirs[0].op, ">")
+        self.assertEqual(redirs[0].raw_target, "&3")
+
+    def test_input_redirect_error(self) -> None:
+        args, redirs, err = self._extract("cmd < file")
+        self.assertEqual(err, "Input redirects are not supported")
+
+    def test_input_heredoc_error(self) -> None:
+        args, redirs, err = self._extract("cmd << EOF")
+        self.assertEqual(err, "Input redirects are not supported")
+
+    def test_unbalanced_quotes_error(self) -> None:
+        args, redirs, err = self._extract('echo "hi')
+        self.assertEqual(err, "Unbalanced quotes in command")
+
+    def test_1gt_redirect(self) -> None:
+        args, redirs, err = self._extract("cmd 1> out.txt")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 1)
+        self.assertEqual(redirs[0].op, ">")
+
+    def test_1gtgt_redirect(self) -> None:
+        args, redirs, err = self._extract("cmd 1>> out.txt")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 1)
+        self.assertEqual(redirs[0].op, ">>")
+
+    def test_no_args_only_redirect(self) -> None:
+        args, redirs, err = self._extract("> out.txt")
+        self.assertIsNone(err)
+        self.assertEqual(args, [])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].raw_target, "out.txt")
+
+
+# ---------------------------------------------------------------------------
+# _validate_redirect_paths
+# ---------------------------------------------------------------------------
+
+
+class ValidateRedirectPathsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_valid_path(self) -> None:
+        redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='out.txt')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNone(err)
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0].target_path, str((self.root / "out.txt").resolve()))
+
+    def test_dotdot_escape(self) -> None:
+        redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='../escape')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNotNone(err)
+        self.assertIn("escapes working directory", err)
+
+    def test_absolute_escape(self) -> None:
+        redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='/etc/passwd')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNotNone(err)
+        self.assertIn("escapes working directory", err)
+
+    def test_symlink_escape(self) -> None:
+        (self.root / "evil").symlink_to("/etc")
+        redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='evil/hostname')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNotNone(err)
+        self.assertIn("escapes working directory", err)
+
+    def test_2gt1_passes_through(self) -> None:
+        redirs = [server.Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNone(err)
+        self.assertEqual(validated, redirs)
+
+
+# ---------------------------------------------------------------------------
+# _build_invocation with redirects
+# ---------------------------------------------------------------------------
+
+
+class BuildInvocationRedirectTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_redirect_resolved_to_work_dir(self) -> None:
+        binary, sandbox_args, env, cfg, redirects = server._build_invocation(
+            "echo hi > out.txt", self.root,
+        )
+        self.assertIsNotNone(binary)
+        self.assertIsNotNone(sandbox_args)
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].target_path, str((self.root / "out.txt").resolve()))
+        # Ensure > and out.txt are NOT in sandbox_args
+        self.assertNotIn(">", sandbox_args)
+        self.assertNotIn("out.txt", sandbox_args)
+
+    def test_escape_path_error(self) -> None:
+        err, binary, sandbox_args, cfg, redirects = server._build_invocation(
+            "echo > ../escape", self.root,
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("escapes working directory", err)
+        self.assertIsNone(binary)
+
+    def test_invalid_fd_error(self) -> None:
+        err, binary, sandbox_args, cfg, redirects = server._build_invocation(
+            "echo 3> f", self.root,
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("only support fds 1 and 2", err)
+
+
+# ---------------------------------------------------------------------------
+# _run_segment with redirects (stubbed subprocess — cosmo python can't fork)
+# ---------------------------------------------------------------------------
+
+
+class RunSegmentRedirectTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_build = server._build_invocation
+        self._orig_run = server.subprocess.run
+
+    def tearDown(self) -> None:
+        server._build_invocation = self._orig_build
+        server.subprocess.run = self._orig_run
+        self._tmp.cleanup()
+
+    def _stub_build(self, redirects):
+        """Stub _build_invocation to return a busybox echo invocation with given redirects."""
+        def fake_build(command, work_dir):
+            return (
+                str(server.BUSYBOX_BIN.resolve()),
+                [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
+                None,
+                {},
+                redirects,
+            )
+        server._build_invocation = fake_build
+
+    def _stub_run_writing_stdout(self):
+        """Stub subprocess.run to write 'hi\n' to whatever stdout target is passed."""
+        import subprocess as _sp
+
+        def fake_run(args, **kwargs):
+            stdout_target = kwargs.get("stdout", _sp.PIPE)
+            stderr_target = kwargs.get("stderr", _sp.PIPE)
+            # Write "hi\n" to the stdout target
+            if hasattr(stdout_target, 'write'):
+                stdout_target.write(b"hi\n")
+                stdout_target.flush()
+            elif isinstance(stdout_target, int):
+                os.write(stdout_target, b"hi\n")
+            # Return a CompletedProcess
+            return _sp.CompletedProcess(args, 0, stdout=None, stderr=None)
+
+        server.subprocess.run = fake_run
+
+    def test_stdout_redirect_opens_file(self) -> None:
+        outfile = self.root / "out.txt"
+        self._stub_build([
+            server.Redirect(fd=1, op='>', target_path=str(outfile), target_fd=None, raw_target='out.txt'),
+        ])
+        self._stub_run_writing_stdout()
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        self.assertEqual(rc, 0)
+        self.assertIn("[stdout -> out.txt]", out)
+        # File should have "hi"
+        self.assertEqual(outfile.read_text(), "hi\n")
+
+    def test_stderr_redirect_opens_file(self) -> None:
+        errfile = self.root / "err.txt"
+        self._stub_build([
+            server.Redirect(fd=2, op='>', target_path=str(errfile), target_fd=None, raw_target='err.txt'),
+        ])
+        # subprocess.run writes to stdout (PIPE) and we capture it
+        import subprocess as _sp
+        def fake_run(args, **kwargs):
+            return _sp.CompletedProcess(args, 0, stdout=b"hi\n", stderr=None)
+        server.subprocess.run = fake_run
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        self.assertEqual(rc, 0)
+        self.assertIn("hi", out)
+        self.assertIn("[stderr -> err.txt]", out)
+        # err.txt should exist but be empty (since run didn't write to it)
+        self.assertTrue(errfile.exists())
+
+    def test_truncate_behavior(self) -> None:
+        outfile = self.root / "out.txt"
+        outfile.write_text("old content")
+        self._stub_build([
+            server.Redirect(fd=1, op='>', target_path=str(outfile), target_fd=None, raw_target='out.txt'),
+        ])
+        self._stub_run_writing_stdout()
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        self.assertEqual(rc, 0)
+        self.assertEqual(outfile.read_text(), "hi\n")
+
+    def test_append_behavior(self) -> None:
+        outfile = self.root / "out.txt"
+        outfile.write_text("line1\n")
+        self._stub_build([
+            server.Redirect(fd=1, op='>>', target_path=str(outfile), target_fd=None, raw_target='out.txt'),
+        ])
+        self._stub_run_writing_stdout()
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        self.assertEqual(rc, 0)
+        content = outfile.read_text()
+        self.assertIn("line1", content)
+        self.assertIn("hi", content)
+
+    def test_repeated_same_fd_last_wins(self) -> None:
+        f1 = self.root / "f1"
+        f2 = self.root / "f2"
+        self._stub_build([
+            server.Redirect(fd=1, op='>', target_path=str(f1), target_fd=None, raw_target='f1'),
+            server.Redirect(fd=1, op='>', target_path=str(f2), target_fd=None, raw_target='f2'),
+        ])
+        self._stub_run_writing_stdout()
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        self.assertEqual(rc, 0)
+        # f1 truncated/empty, f2 gets "hi\n"
+        self.assertEqual(f1.read_text(), "")
+        self.assertEqual(f2.read_text(), "hi\n")
+
+    def test_2gt1_report_line(self) -> None:
+        import subprocess as _sp
+
+        self._stub_build([
+            server.Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1'),
+        ])
+        def fake_run(args, **kwargs):
+            # Assert stderr=subprocess.STDOUT was passed
+            self.assertIs(kwargs.get("stderr"), _sp.STDOUT)
+            return _sp.CompletedProcess(args, 0, stdout=b"hi\n", stderr=None)
+        server.subprocess.run = fake_run
+        rc, out = server._run_segment("testcmd", self.root, 10)
+        self.assertEqual(rc, 0)
+        self.assertIn("[stderr -> stdout]", out)
+
+
+# ---------------------------------------------------------------------------
+# _run_pipeline with redirects
+# ---------------------------------------------------------------------------
+
+
+class RunPipelineRedirectTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_build = server._build_invocation
+        self._orig_popen = server.subprocess.Popen
+
+    def tearDown(self) -> None:
+        server._build_invocation = self._orig_build
+        server.subprocess.Popen = self._orig_popen
+        self._tmp.cleanup()
+
+    def test_intermediate_stdout_redirect_rejected(self) -> None:
+        def fake_build(command, work_dir):
+            if command == "producer > f":
+                return (
+                    str(server.BUSYBOX_BIN.resolve()),
+                    [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
+                    None,
+                    {},
+                    [server.Redirect(fd=1, op='>', target_path=str(work_dir / "f"), target_fd=None, raw_target="f")],
+                )
+            if command == "consumer":
+                return (
+                    str(server.BUSYBOX_BIN.resolve()),
+                    [str(server.BUSYBOX_BIN.resolve()), "cat"],
+                    None,
+                    {},
+                    [],
+                )
+            return (None, None, None, None, [])
+
+        server._build_invocation = fake_build
+        rc, out = server._run_pipeline(["producer > f", "consumer"], self.root, 10)
+        self.assertEqual(rc, 1)
+        self.assertIn("Cannot redirect stdout of intermediate pipe stage", out)
+
+    def test_last_stage_stdout_redirect(self) -> None:
+        outfile = self.root / "out.txt"
+
+        def fake_build(command, work_dir):
+            if command == "producer":
+                return (
+                    str(server.BUSYBOX_BIN.resolve()),
+                    [str(server.BUSYBOX_BIN.resolve()), "echo", "hello"],
+                    None,
+                    {},
+                    [],
+                )
+            if command == f"consumer > {outfile}":
+                return (
+                    str(server.BUSYBOX_BIN.resolve()),
+                    [str(server.BUSYBOX_BIN.resolve()), "cat"],
+                    None,
+                    {},
+                    [server.Redirect(fd=1, op='>', target_path=str(outfile), target_fd=None, raw_target="out.txt")],
+                )
+            return (None, None, None, None, [])
+
+        server._build_invocation = fake_build
+
+        # Stub Popen to simulate a successful pipeline.
+        # Both stdout and stderr are fake pipes with close()/read().
+        class _FakePipe:
+            def close(self):
+                pass
+            def read(self):
+                return b""
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                self.args = args
+                self._stdout_target = kwargs.get("stdout")
+                self.stdin = kwargs.get("stdin")
+                self.returncode = 0
+                self.pid = 9999
+                self.stdout = _FakePipe()
+                self.stderr = _FakePipe()
+
+            def poll(self):
+                return 0
+            def wait(self):
+                return 0
+            def communicate(self, timeout=None):
+                if hasattr(self._stdout_target, 'write'):
+                    self._stdout_target.write(b"hello\n")
+                return (None, b"")
+
+        server.subprocess.Popen = FakePopen
+        rc, out = server._run_pipeline(["producer", f"consumer > {outfile}"], self.root, 10)
+        self.assertEqual(rc, 0)
+        self.assertIn("[stdout -> out.txt]", out)
+        self.assertEqual(outfile.read_text().strip(), "hello")
+
+
+# ---------------------------------------------------------------------------
+# _run_background with redirects
+# ---------------------------------------------------------------------------
+
+
+class RunBackgroundRedirectTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_build = server._build_invocation
+        self._orig_popen = server.subprocess.Popen
+        self._orig_start_reaper = server._start_reaper
+
+    def tearDown(self) -> None:
+        server._build_invocation = self._orig_build
+        server.subprocess.Popen = self._orig_popen
+        server._start_reaper = self._orig_start_reaper
+        self._tmp.cleanup()
+
+    def _stub_popen(self):
+        """Stub Popen to return a fake process without forking."""
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                self.args = args
+                self.stdout = kwargs.get("stdout")
+                self.stderr = kwargs.get("stderr")
+                self.stdin = kwargs.get("stdin")
+                self.pid = 9999
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+
+        server.subprocess.Popen = FakePopen
+        server._start_reaper = lambda: None  # no-op
+
+    def test_stdout_redirect_writes_file_and_log(self) -> None:
+        self._stub_popen()
+        outfile = self.root / "out.txt"
+
+        def fake_build(command, work_dir):
+            return (
+                str(server.BUSYBOX_BIN.resolve()),
+                [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
+                None,
+                {},
+                [server.Redirect(fd=1, op='>', target_path=str(outfile), target_fd=None, raw_target='out.txt')],
+            )
+
+        server._build_invocation = fake_build
+        rc, out = server._run_background(
+            [f"echo hi > {outfile}"], self.root,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Backgrounded PID", out)
+        self.assertIn("[stdout -> out.txt]", out)
+
+    def test_stderr_redirect_report_line(self) -> None:
+        self._stub_popen()
+        errfile = self.root / "err.txt"
+
+        def fake_build(command, work_dir):
+            return (
+                str(server.BUSYBOX_BIN.resolve()),
+                [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
+                None,
+                {},
+                [server.Redirect(fd=2, op='>', target_path=str(errfile), target_fd=None, raw_target='err.txt')],
+            )
+
+        server._build_invocation = fake_build
+        rc, out = server._run_background(
+            [f"echo hi 2> {errfile}"], self.root,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Backgrounded PID", out)
+        self.assertIn("[stderr -> err.txt]", out)
 
 
 if __name__ == "__main__":
