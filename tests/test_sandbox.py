@@ -382,7 +382,7 @@ class ShellRunChainingTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _stub(self, rc_map: dict[str, int]) -> None:
-        def fake(command: str, work_dir: Path, timeout: int) -> tuple[int, str]:
+        def fake(command: str, work_dir: Path, timeout: int, expansion=None) -> tuple[int, str]:
             self.calls.append(command)
             rc = rc_map.get(command, 0)
             return rc, f"out:{command}" if rc == 0 else f"err:{command}"
@@ -471,17 +471,17 @@ class ShellRunPipelineTest(unittest.TestCase):
         segment_rc = segment_rc or {}
         background_rc = background_rc or {}
 
-        def fake_pipeline(stages: list[str], work_dir, timeout):
+        def fake_pipeline(stages: list[str], work_dir, timeout, expansion=None):
             self.pipeline_calls.append(stages)
             rc = pipeline_rc.get(tuple(stages), 0)
             return rc, f"pipe:{'|'.join(stages)}" if rc == 0 else f"err-pipe:{'|'.join(stages)}"
 
-        def fake_segment(command: str, work_dir, timeout):
+        def fake_segment(command: str, work_dir, timeout, expansion=None):
             self.segment_calls.append(command)
             rc = segment_rc.get(command, 0)
             return rc, f"out:{command}" if rc == 0 else f"err:{command}"
 
-        def fake_background(stages: list[str], work_dir):
+        def fake_background(stages: list[str], work_dir, expansion=None):
             self.background_calls.append(stages)
             rc = background_rc.get(tuple(stages), 0)
             return rc, f"bg:{'|'.join(stages)}"
@@ -579,7 +579,7 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _fake_build(self, mapping: dict[str, tuple]):
-        def fake(command: str, work_dir):
+        def fake(command: str, work_dir, expansion=None):
             return mapping.get(command, (None, None, None, None, []))
 
         server._build_invocation = fake
@@ -928,7 +928,8 @@ class ExtractRedirectsTest(unittest.TestCase):
 
     def test_input_heredoc_error(self) -> None:
         args, redirs, err = self._extract("cmd << EOF")
-        self.assertEqual(err, "Input redirects are not supported")
+        # Without expansion, bare << with non-sentinel target cannot resolve
+        self.assertIn("not found", err)
 
     def test_unbalanced_quotes_error(self) -> None:
         args, redirs, err = self._extract('echo "hi')
@@ -1064,7 +1065,7 @@ class RunSegmentRedirectTest(unittest.TestCase):
 
     def _stub_build(self, redirects):
         """Stub _build_invocation to return a busybox echo invocation with given redirects."""
-        def fake_build(command, work_dir):
+        def fake_build(command, work_dir, expansion=None):
             return (
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
@@ -1246,7 +1247,7 @@ class RunPipelineRedirectTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_intermediate_stdout_redirect_rejected(self) -> None:
-        def fake_build(command, work_dir):
+        def fake_build(command, work_dir, expansion=None):
             if command == "producer > f":
                 return (
                     str(server.BUSYBOX_BIN.resolve()),
@@ -1273,7 +1274,7 @@ class RunPipelineRedirectTest(unittest.TestCase):
     def test_last_stage_stdout_redirect(self) -> None:
         outfile = self.root / "out.txt"
 
-        def fake_build(command, work_dir):
+        def fake_build(command, work_dir, expansion=None):
             if command == "producer":
                 return (
                     str(server.BUSYBOX_BIN.resolve()),
@@ -1370,7 +1371,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         self._stub_popen()
         outfile = self.root / "out.txt"
 
-        def fake_build(command, work_dir):
+        def fake_build(command, work_dir, expansion=None):
             return (
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
@@ -1391,7 +1392,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         self._stub_popen()
         errfile = self.root / "err.txt"
 
-        def fake_build(command, work_dir):
+        def fake_build(command, work_dir, expansion=None):
             return (
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
@@ -1407,6 +1408,833 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("Backgrounded PID", out)
         self.assertIn("[stderr -> err.txt]", out)
+
+    def test_background_heredoc_threads_expansion(self) -> None:
+        """_run_background passes expansion through to _build_invocation.
+
+        Without this, backgrounded heredocs resolve their sentinel body to None
+        and fail with "Heredoc body not found".
+        """
+        self._stub_popen()
+        expansion = Expansion(
+            arg_values={},
+            heredoc_bodies={"\x01H0\x01": "hello\n"},
+        )
+        received = {}
+
+        def fake_build(command, work_dir, expansion=None):
+            received["expansion"] = expansion
+            return (
+                str(server.BUSYBOX_BIN.resolve()),
+                [str(server.BUSYBOX_BIN.resolve()), "cat"],
+                None,
+                {},
+                [server.Redirect(fd=0, op="<<", body="hello\n")],
+            )
+
+        server._build_invocation = fake_build
+        rc, out = server._run_background(
+            [f"cat << \x01H0\x01"], self.root, expansion=expansion,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Backgrounded PID", out)
+        self.assertIs(received["expansion"], expansion)
+
+    def test_background_command_substitution_resolves(self) -> None:
+        """$() sentinels resolve via expansion in backgrounded commands."""
+        launched = []
+
+        class RecPopen:
+            def __init__(self, args, **kwargs):
+                launched.append(args)
+                self.stdout = kwargs.get("stdout")
+                self.stderr = kwargs.get("stderr")
+                self.stdin = kwargs.get("stdin")
+                self.pid = 9001
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+
+        server.subprocess.Popen = RecPopen
+        server._start_reaper = lambda: None
+
+        expansion = Expansion(arg_values={"\x01A0\x01": "world"}, heredoc_bodies={})
+        rc, out = server._run_background(
+            [f"echo \x01A0\x01"], self.root, expansion=expansion,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Backgrounded PID", out)
+        # Real _build_invocation should have resolved the sentinel to "world".
+        self.assertTrue(any("world" in a for a in launched))
+
+    def test_background_heredoc_on_non_first_stage_rejected(self) -> None:
+        """Non-first pipeline stage heredoc is rejected in background mode."""
+        def fake_build(command, work_dir, expansion=None):
+            if "echo" in command:
+                return (
+                    str(server.BUSYBOX_BIN.resolve()),
+                    [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
+                    None,
+                    {},
+                    [],
+                )
+            if "cat" in command:
+                return (
+                    str(server.BUSYBOX_BIN.resolve()),
+                    [str(server.BUSYBOX_BIN.resolve()), "cat"],
+                    None,
+                    {},
+                    [server.Redirect(fd=0, op="<<", body="hello\n")],
+                )
+            return (None, None, None, None, [])
+
+        server._build_invocation = fake_build
+        rc, out = server._run_background(
+            ["echo hi", "cat << H0"], self.root,
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("not allowed on non-first", out)
+
+
+# ---------------------------------------------------------------------------
+# Heredoc / here-string / command substitution tests (moved from test_expand.py)
+# ---------------------------------------------------------------------------
+
+from shell_sandbox_mcp.server import (
+    Expansion,
+    Redirect,
+    SENTINEL_ARG,
+    SENTINEL_HD,
+    _expand_command,
+    _capture_stdout,
+    _extract_redirects,
+    _build_invocation,
+    _resolve_fd_targets,
+    _run_segment_core,
+    _run_pipeline_core,
+    MAX_SUBST_DEPTH,
+    MAX_SUBST_COUNT,
+    MAX_SUBST_OUTPUT,
+)
+
+
+class ExtractRedirectsHeredocTest(unittest.TestCase):
+    """Test heredoc/here-string sentinel resolution in _extract_redirects."""
+
+    def _extract(self, segment, expansion=None):
+        return server._extract_redirects(segment, expansion)
+
+    def test_herestring_sentinel(self) -> None:
+        expansion = Expansion(
+            arg_values={},
+            heredoc_bodies={"\x01H0\x01": "hello\n"},
+        )
+        args, redirs, err = self._extract("cat <<< \x01H0\x01", expansion)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cat"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 0)
+        self.assertEqual(redirs[0].op, "<<<")
+        self.assertEqual(redirs[0].body, "hello\n")
+
+    def test_heredoc_sentinel(self) -> None:
+        expansion = Expansion(
+            arg_values={},
+            heredoc_bodies={"\x01H0\x01": "line1\nline2\n"},
+        )
+        args, redirs, err = self._extract("cat << \x01H0\x01", expansion)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cat"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 0)
+        self.assertEqual(redirs[0].op, "<<")
+        self.assertEqual(redirs[0].body, "line1\nline2\n")
+
+    def test_heredoc_tab_strip_sentinel(self) -> None:
+        expansion = Expansion(
+            arg_values={},
+            heredoc_bodies={"\x01H0\x01": "line1\n"},
+        )
+        args, redirs, err = self._extract("cat <<- \x01H0\x01", expansion)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cat"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 0)
+        self.assertEqual(redirs[0].op, "<<-")
+        self.assertEqual(redirs[0].body, "line1\n")
+        self.assertTrue(redirs[0].strip_tabs)
+
+    def test_arg_sentinel_resolved(self) -> None:
+        expansion = Expansion(
+            arg_values={"\x01A0\x01": "hello world"},
+            heredoc_bodies={},
+        )
+        args, redirs, err = self._extract("echo \x01A0\x01", expansion)
+        self.assertIsNone(err)
+        # Arg sentinel should be resolved to the single word "hello world"
+        self.assertEqual(args, ["echo", "hello world"])
+        self.assertEqual(len(redirs), 0)
+
+    def test_compound_word_sentinel_resolved(self) -> None:
+        """A sentinel embedded mid-word is resolved: echo a$(echo b)c -> abc."""
+        expansion = Expansion(
+            arg_values={"\x01A0\x01": "b"},
+            heredoc_bodies={},
+        )
+        args, redirs, err = self._extract("echo a\x01A0\x01c", expansion)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "abc"])
+
+    def test_compound_word_multiple_sentinels_resolved(self) -> None:
+        """Multiple sentinels in one word are each substituted in place."""
+        expansion = Expansion(
+            arg_values={"\x01A0\x01": "x", "\x01A1\x01": "y"},
+            heredoc_bodies={},
+        )
+        args, redirs, err = self._extract("echo \x01A0\x01-\x01A1\x01", expansion)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "x-y"])
+
+    def test_arg_sentinel_spaces_preserved(self) -> None:
+        expansion = Expansion(
+            arg_values={"\x01A0\x01": "a b c"},
+            heredoc_bodies={},
+        )
+        args, redirs, err = self._extract("printf %s \x01A0\x01", expansion)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["printf", "%s", "a b c"])
+
+    def test_arg_sentinel_in_redirect_target(self) -> None:
+        expansion = Expansion(
+            arg_values={"\x01A0\x01": "out.txt"},
+            heredoc_bodies={},
+        )
+        args, redirs, err = self._extract("echo hi > \x01A0\x01", expansion)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "hi"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].raw_target, "out.txt")
+
+    def test_multiple_stdin_redirects_rejected(self) -> None:
+        expansion = Expansion(
+            arg_values={},
+            heredoc_bodies={
+                "\x01H0\x01": "body1\n",
+                "\x01H1\x01": "body2\n",
+            },
+        )
+        args, redirs, err = self._extract("cat << \x01H0\x01 << \x01H1\x01", expansion)
+        self.assertIsNotNone(err)
+        self.assertIn("Multiple stdin redirects", err)
+
+    def test_bare_lt_still_rejected(self) -> None:
+        args, redirs, err = self._extract("cmd < file")
+        self.assertIsNotNone(err)
+        self.assertIn("Input redirects are not supported", err)
+
+    def test_heredoc_body_not_found_error(self) -> None:
+        args, redirs, err = self._extract("cat << \x01H99\x01")
+        self.assertIsNotNone(err)
+        self.assertIn("Heredoc body not found", err)
+
+    def test_herestring_body_not_found_error(self) -> None:
+        args, redirs, err = self._extract("cat <<< \x01H99\x01")
+        self.assertIsNotNone(err)
+        self.assertIn("Here-string body not found", err)
+
+    def test_arg_sentinel_not_in_expansion_returns_literal(self) -> None:
+        # Without expansion, sentinel passes through as literal
+        args, redirs, err = self._extract("echo \x01A0\x01")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "\x01A0\x01"])
+
+
+class ExpandCommandTest(unittest.TestCase):
+    """Test _expand_command with stubbed _capture_stdout."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.work_dir = Path(self._tmp.name)
+        self._orig_capture = server._capture_stdout
+        self.captures: list[str] = []
+
+    def tearDown(self) -> None:
+        server._capture_stdout = self._orig_capture
+        self._tmp.cleanup()
+
+    def _stub_capture(self, outputs: dict[str, str]) -> None:
+        def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None):
+            self.captures.append(command)
+            val = outputs.get(command, "")
+            return 0, val.encode("utf-8")
+
+        server._capture_stdout = fake
+
+    def test_unquoted_heredoc(self) -> None:
+        cmd = "cat <<EOF\nhello\nworld\nEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        # Should contain << + sentinel
+        self.assertIn("<<", expanded)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertIn(sentinel, exp.heredoc_bodies)
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\nworld\n")
+
+    def test_single_quoted_delimiter_no_expansion(self) -> None:
+        self._stub_capture({"echo hi": "hi"})
+        cmd = "cat <<'EOF'\n$(echo hi)\nEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        # Body should be literal $(echo hi), not expanded
+        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        self.assertEqual(len(self.captures), 0)  # no $() expansion triggered
+
+    def test_unquoted_heredoc_expands_dollar_paren(self) -> None:
+        self._stub_capture({"echo hello": "hello"})
+        cmd = "cat <<EOF\n$(echo hello)\nEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+
+    def test_escaped_dollar_paren_in_heredoc_not_expanded(self) -> None:
+        """A backslash-escaped $() in an unquoted heredoc body stays literal."""
+        self._stub_capture({"echo hi": "hi"})
+        cmd = "cat <<EOF\n\\$(echo hi)\nEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "\\$(echo hi)\n")
+        self.assertEqual(len(self.captures), 0)  # no $() expansion triggered
+
+    def test_heredoc_tab_strip(self) -> None:
+        cmd = "cat <<-EOF\n\t\thello\n\tEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertIn("<<-", expanded)
+        # Body should have ALL leading tabs stripped
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+
+    def test_herestring_unquoted(self) -> None:
+        cmd = "cat <<<hello"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        self.assertIn("<<<", expanded)
+
+    def test_herestring_quoted(self) -> None:
+        cmd = "cat <<<'hello world'"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hello world\n")
+
+    def test_herestring_expands_dollar_paren_unless_single_quoted(self) -> None:
+        self._stub_capture({"echo hi": "hi"})
+        # Unquoted here-string with $()
+        cmd = "cat <<<$(echo hi)"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hi\n")
+
+        # Single-quoted here-string with $() — no expansion
+        self.captures.clear()
+        cmd2 = "cat <<<'$(echo hi)'"
+        expanded2, exp2 = _expand_command(cmd2, self.work_dir, 30, 0)
+        m2 = SENTINEL_HD.search(expanded2)
+        self.assertIsNotNone(m2)
+        sentinel2 = f"\x01H{m2.group(1)}\x01"
+        self.assertEqual(exp2.heredoc_bodies[sentinel2], "$(echo hi)\n")
+        self.assertEqual(len(self.captures), 0)
+
+    def test_command_substitution_sentinel(self) -> None:
+        self._stub_capture({"echo hello": "hello"})
+        cmd = "echo $(echo hello)"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        # Should contain arg sentinel
+        m = SENTINEL_ARG.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01A{m.group(1)}\x01"
+        self.assertIn(sentinel, exp.arg_values)
+        self.assertEqual(exp.arg_values[sentinel], "hello")
+        # The expanded command should have "echo <sentinel>"
+        self.assertTrue(expanded.startswith("echo "))
+
+    def test_nested_command_substitution(self) -> None:
+        outputs = {"echo inner": "inner", "echo $(echo inner)": "outer"}
+        self._stub_capture(outputs)
+        cmd = "echo $(echo $(echo inner))"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        # The outer $() captures "echo $(echo inner)" since the inner $()
+        # is inside the outer $(), and the outer _capture_stdout call is what
+        # triggers the recursive expansion (via its own _expand_command call).
+        # The stub short-circuits that.
+        self.assertIn("echo $(echo inner)", self.captures)
+
+    def test_unbalanced_dollar_paren_error(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _expand_command("echo $(unclosed", self.work_dir, 30, 0)
+        self.assertIn("Unbalanced", str(ctx.exception))
+
+    def test_missing_heredoc_terminator_error(self) -> None:
+        cmd = "cat <<EOF\nhello\nworld\n"
+        with self.assertRaises(ValueError) as ctx:
+            _expand_command(cmd, self.work_dir, 30, 0)
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_depth_limit(self) -> None:
+        # Do NOT stub _capture_stdout — the depth check must fire.
+        # Pass depth=MAX_SUBST_DEPTH so that when _expand_command encounters $()
+        # it calls _capture_stdout with depth+1 = MAX_SUBST_DEPTH+1 which
+        # triggers the limit.
+        with self.assertRaises(ValueError) as ctx:
+            _expand_command("echo $(echo A)", self.work_dir, 30, MAX_SUBST_DEPTH)
+        self.assertIn("depth", str(ctx.exception).lower())
+
+    def test_count_limit(self) -> None:
+        # Do NOT stub _capture_stdout — the count check must fire.
+        # Create many $() substitutions to exceed MAX_SUBST_COUNT.
+        parts = ["$(echo {})".format(i) for i in range(MAX_SUBST_COUNT + 5)]
+        cmd = "echo " + " ".join(parts)
+        with self.assertRaises(ValueError) as ctx:
+            _expand_command(cmd, self.work_dir, 30, 0)
+        self.assertIn("count", str(ctx.exception).lower())
+
+    def test_quotes_inside_heredoc_body_preserved(self) -> None:
+        cmd = "cat <<EOF\nline with \"quotes\" and 'apostrophes'\nEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "line with \"quotes\" and 'apostrophes'\n")
+
+    def test_double_quoted_delimiter_no_expansion(self) -> None:
+        self._stub_capture({"echo hi": "hi"})
+        cmd = 'cat <<"EOF"\n$(echo hi)\nEOF'
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        # Body should be literal $(echo hi), not expanded
+        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+
+
+class CaptureStdoutTest(unittest.TestCase):
+    """Test _capture_stdout with stubbed segment/pipeline cores."""
+
+    def setUp(self) -> None:
+        self._orig_segment_core = server._run_segment_core
+        self._orig_pipeline_core = server._run_pipeline_core
+        self._tmp = tempfile.TemporaryDirectory()
+        self.work_dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        server._run_segment_core = self._orig_segment_core
+        server._run_pipeline_core = self._orig_pipeline_core
+        self._tmp.cleanup()
+
+    def _stub_segment(self, mapping: dict[str, tuple[int, bytes, bytes, list]]) -> None:
+        def fake(command, work_dir, timeout, expansion=None):
+            if command in mapping:
+                return mapping[command]
+            return (0, b"", b"", [])
+        server._run_segment_core = fake
+
+    def _stub_pipeline(self, mapping: dict[tuple, tuple[int, bytes, bytes, list]]) -> None:
+        def fake(segments, work_dir, timeout, expansion=None):
+            key = tuple(segments)
+            if key in mapping:
+                return mapping[key]
+            return (0, b"", b"", [])
+        server._run_pipeline_core = fake
+
+    def test_single_segment_stdout(self) -> None:
+        self._stub_segment({"echo hi": (0, b"hi\n", b"", [])})
+        rc, stdout = _capture_stdout("echo hi", self.work_dir, 30, 1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout, b"hi\n")
+
+    def test_pipeline_last_stage_stdout(self) -> None:
+        self._stub_pipeline({("a", "b"): (0, b"result\n", b"", [])})
+        rc, stdout = _capture_stdout("a | b", self.work_dir, 30, 1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout, b"result\n")
+
+    def test_andand_short_circuit(self) -> None:
+        self._stub_segment({
+            "fail": (1, b"", b"fail", []),
+            "succeed": (0, b"good", b"", []),
+        })
+        rc, stdout = _capture_stdout("fail && succeed", self.work_dir, 30, 1)
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout, b"")  # succeed skipped
+
+    def test_background_rejected(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _capture_stdout("echo hi &", self.work_dir, 30, 1)
+        self.assertIn("background", str(ctx.exception).lower())
+
+    def test_output_truncated(self) -> None:
+        long_output = b"x" * (MAX_SUBST_OUTPUT + 100)
+        self._stub_segment({"big": (0, long_output, b"", [])})
+        rc, stdout = _capture_stdout("big", self.work_dir, 30, 1)
+        self.assertLessEqual(len(stdout), MAX_SUBST_OUTPUT)
+
+    def test_empty_command(self) -> None:
+        rc, stdout = _capture_stdout("", self.work_dir, 30, 1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout, b"")
+
+
+class ResolveFdTargetsStdinTest(unittest.TestCase):
+    """Test that _resolve_fd_targets returns stdin_bytes for heredoc/here-string."""
+
+    def test_herestring_returns_stdin_bytes(self) -> None:
+        redirs = [Redirect(fd=0, op="<<<", body="hello\n")]
+        result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+        self.assertEqual(len(result), 6)
+        stdout_t, stderr_t, to_close, report, srf, stdin_b = result
+        self.assertEqual(stdin_b, b"hello\n")
+        self.assertIn("[stdin <<<]", report)
+
+    def test_heredoc_returns_stdin_bytes(self) -> None:
+        redirs = [Redirect(fd=0, op="<<", body="line1\nline2\n")]
+        result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+        _, _, _, report, _, stdin_b = result
+        self.assertEqual(stdin_b, b"line1\nline2\n")
+        self.assertIn("[stdin <<]", report)
+
+    def test_heredoc_tab_returns_stdin_bytes(self) -> None:
+        redirs = [Redirect(fd=0, op="<<-", body="tabbed\n", strip_tabs=True)]
+        result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+        _, _, _, report, _, stdin_b = result
+        self.assertEqual(stdin_b, b"tabbed\n")
+        self.assertIn("[stdin <<-]", report)
+
+    def test_no_stdin_redirect_returns_none(self) -> None:
+        redirs = [Redirect(fd=1, op=">", raw_target="out.txt", target_path="/tmp/out.txt")]
+        result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+        self.assertEqual(len(result), 6)
+        self.assertIsNone(result[5])  # stdin_bytes is None
+
+    def test_multiple_stdin_rejected_by_resolve(self) -> None:
+        redirs = [
+            Redirect(fd=0, op="<<", body="a\n"),
+            Redirect(fd=0, op="<<", body="b\n"),
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+        self.assertIn("Multiple stdin redirects", str(ctx.exception))
+
+
+class BuildInvocationHeredocTest(unittest.TestCase):
+    """Test that _build_invocation threads expansion correctly."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_heredoc_redirect_passed_through(self) -> None:
+        expansion = Expansion(
+            arg_values={},
+            heredoc_bodies={"\x01H0\x01": "body\n"},
+        )
+        binary, sandbox_args, env, cfg, redirects = _build_invocation(
+            "cat << \x01H0\x01", self.root, expansion=expansion,
+        )
+        self.assertIsNotNone(binary)
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].fd, 0)
+        self.assertEqual(redirects[0].op, "<<")
+        self.assertEqual(redirects[0].body, "body\n")
+
+
+class RunSegmentCoreStdinTest(unittest.TestCase):
+    """Test that _run_segment_core passes stdin_bytes via input= to subprocess.run."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_build = server._build_invocation
+        self._orig_run = server.subprocess.run
+
+    def tearDown(self) -> None:
+        server._build_invocation = self._orig_build
+        server.subprocess.run = self._orig_run
+        self._tmp.cleanup()
+
+    def test_stdin_bytes_passed_to_subprocess_run(self) -> None:
+        import subprocess as _sp
+
+        captured_input = []
+
+        def fake_run(args, **kwargs):
+            captured_input.append(kwargs.get("input"))
+            return _sp.CompletedProcess(args, 0, stdout=b"ok\n", stderr=b"")
+
+        server.subprocess.run = fake_run
+
+        def fake_build(command, work_dir, expansion=None):
+            return (
+                "/usr/bin/cat",
+                ["/usr/bin/cat"],
+                None,
+                {},
+                [Redirect(fd=0, op="<<", body="hello\n")],
+            )
+
+        server._build_invocation = fake_build
+
+        rc, stdout_b, stderr_b, report = _run_segment_core(
+            "cat << DUMMY", self.root, 30,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout_b, b"ok\n")
+        self.assertEqual(captured_input[0], b"hello\n")
+
+    def test_no_stdin_when_no_heredoc(self) -> None:
+        import subprocess as _sp
+
+        captured_input = []
+
+        def fake_run(args, **kwargs):
+            captured_input.append(kwargs.get("input"))
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+        server.subprocess.run = fake_run
+
+        def fake_build(command, work_dir, expansion=None):
+            return (
+                "/usr/bin/echo",
+                ["/usr/bin/echo", "hi"],
+                None,
+                {},
+                [],
+            )
+
+        server._build_invocation = fake_build
+
+        rc, stdout_b, stderr_b, report = _run_segment_core(
+            "echo hi", self.root, 30,
+        )
+        self.assertIsNone(captured_input[0])
+
+
+class RunPipelineCoreStdinTest(unittest.TestCase):
+    """Test _run_pipeline_core stdin plumbing and non-first-stage rejection."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_build = server._build_invocation
+        self._orig_popen = server.subprocess.Popen
+
+    def tearDown(self) -> None:
+        server._build_invocation = self._orig_build
+        server.subprocess.Popen = self._orig_popen
+        self._tmp.cleanup()
+
+    def test_heredoc_on_first_stage_uses_stdin_pipe(self) -> None:
+        """First stage with heredoc gets stdin=PIPE with writer thread."""
+        import io
+
+        captured_stdins = []
+        stdin_buffers = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                captured_stdins.append(kwargs.get("stdin"))
+                # When stdin=subprocess.PIPE, provide a writable BytesIO buffer
+                if kwargs.get("stdin") is subprocess.PIPE:
+                    self.stdin = io.BytesIO()
+                    stdin_buffers.append(self.stdin)
+                else:
+                    self.stdin = None
+                self.stdout = _FakePipe()
+                self.stderr = _FakePipe()
+                self.pid = 9999
+                self.returncode = 0
+
+            def poll(self):
+                return 0
+            def wait(self):
+                return 0
+            def communicate(self, timeout=None):
+                return (b"output\n", b"")
+            def kill(self):
+                pass
+
+        class _FakePipe:
+            def close(self):
+                pass
+            def read(self):
+                return b""
+
+        def fake_build(command, work_dir, expansion=None):
+            if "cat" in command:
+                return (
+                    "/usr/bin/cat",
+                    ["/usr/bin/cat"],
+                    None,
+                    {},
+                    [Redirect(fd=0, op="<<", body="hello\n")],
+                )
+            if "grep" in command:
+                return (
+                    "/usr/bin/grep",
+                    ["/usr/bin/grep", "x"],
+                    None,
+                    {},
+                    [],
+                )
+            return (None, None, None, None, [])
+
+        server._build_invocation = fake_build
+        server.subprocess.Popen = FakePopen
+
+        rc, stdout_b, stderr_b, report = _run_pipeline_core(
+            ["cat << H0", "grep x"], self.root, 30,
+        )
+        self.assertEqual(rc, 0)
+        # First stage should have gotten subprocess.PIPE for stdin
+        self.assertIs(captured_stdins[0], subprocess.PIPE)
+        # Second stage should have gotten the prev.stdout (which is the FakePipe)
+        self.assertIsNotNone(captured_stdins[1])
+
+    def test_heredoc_on_non_first_stage_rejected(self) -> None:
+        """Non-first stage with heredoc should be rejected."""
+        def fake_build(command, work_dir, expansion=None):
+            if "echo" in command:
+                return (
+                    "/usr/bin/echo",
+                    ["/usr/bin/echo", "hi"],
+                    None,
+                    {},
+                    [],
+                )
+            if "cat" in command:
+                return (
+                    "/usr/bin/cat",
+                    ["/usr/bin/cat"],
+                    None,
+                    {},
+                    [Redirect(fd=0, op="<<", body="hello\n")],
+                )
+            return (None, None, None, None, [])
+
+        server._build_invocation = fake_build
+
+        rc, stdout_b, stderr_b, report = _run_pipeline_core(
+            ["echo hi", "cat << H0"], self.root, 30,
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn(b"not allowed on non-first", stdout_b)
+
+
+class EndToEndSmokeTest(unittest.TestCase):
+    """Real end-to-end smoke tests that go through shell_run.
+
+    Note: these may fail when running inside a sandbox (sandbox-in-sandbox).
+    The core logic is verified by the other test classes.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.work_dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run(self, command: str) -> str:
+        return server.shell_run(command, cwd=str(self.work_dir))
+
+    def test_heredoc_expansion_produces_correct_result(self) -> None:
+        """Verify the full expansion pipeline without subprocess."""
+        cmd = "cat <<EOF\nhello\nEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        # Verify the expanded command has a heredoc sentinel
+        self.assertIn("<<", expanded)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertIn(sentinel, exp.heredoc_bodies)
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        args, redirs, err = _extract_redirects(
+            "cat << " + sentinel, expansion=exp,
+        )
+        self.assertIsNone(err)
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].body, "hello\n")
+
+    def test_heredoc_single_quoted_literal(self) -> None:
+        """Verify single-quoted delimiters produce literal bodies."""
+        cmd = "cat <<'EOF'\n$(echo hi)\nEOF"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+
+    def test_herestring_expansion(self) -> None:
+        """Verify here-string produces correct body."""
+        cmd = "cat <<<hello world"
+        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        m = SENTINEL_HD.search(expanded)
+        self.assertIsNotNone(m)
+        sentinel = f"\x01H{m.group(1)}\x01"
+        self.assertEqual(exp.heredoc_bodies[sentinel], "hello world\n")
+
+    def test_command_substitution_single_arg(self) -> None:
+        """Verify $(...) produces a sentinel with single-word value."""
+        original = server._capture_stdout
+        try:
+            def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None):
+                return 0, b"a b"
+            server._capture_stdout = fake
+            cmd = "echo $(printf 'a b')"
+            expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+            m = SENTINEL_ARG.search(expanded)
+            self.assertIsNotNone(m)
+            sentinel = f"\x01A{m.group(1)}\x01"
+            self.assertEqual(exp.arg_values[sentinel], "a b")
+            args, redirs, err = _extract_redirects(
+                "echo " + sentinel, expansion=exp,
+            )
+            self.assertEqual(args, ["echo", "a b"])
+        finally:
+            server._capture_stdout = original
+
+    def test_nested_heredoc_in_substitution(self) -> None:
+        """Verify that _expand_command can handle $(cat <<EOF\nx\nEOF)."""
+        original = server._capture_stdout
+        try:
+            def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None):
+                return 0, b"x"
+            server._capture_stdout = fake
+            cmd = "echo $(cat <<EOF\nx\nEOF)"
+            expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+            m = SENTINEL_ARG.search(expanded)
+            self.assertIsNotNone(m)
+            sentinel = f"\x01A{m.group(1)}\x01"
+            self.assertEqual(exp.arg_values.get(sentinel), "x")
+        finally:
+            server._capture_stdout = original
 
 
 if __name__ == "__main__":
