@@ -911,6 +911,11 @@ def _build_invocation(
     # path, so git uses the staged copy rather than ~/.gitconfig directly.
     if cfg.get("is_git"):
         unveil_env["GIT_CONFIG_GLOBAL"] = _stage_git_global_config()
+        # git-lfs (a Go binary spawned by git as the LFS filter) needs the
+        # waitid syscall, which no cosmocc pledge token permits. Skip pledge
+        # for git only; unveil (which confines FS to work_dir + /tmp + system
+        # rx + read-only config/cred paths) remains the security boundary.
+        unveil_env["SANDBOX_NO_PLEDGE"] = "1"
 
     if unveil_env:
         env = {**os.environ, **unveil_env}

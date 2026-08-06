@@ -9,5 +9,9 @@ COSMOCC = bin/cosmo-toolchain/bin/cosmocc
 bin/sandbox: vendor/sandbox.c
 	$(COSMOCC) -O2 -o bin/sandbox vendor/sandbox.c
 
+# Note: `bin/sandbox` is intentionally NOT removed by `clean`. It is a
+# tracked binary (Git LFS) that bin/run-sandbox execs to run every sandboxed
+# command — deleting it would break the sandbox tool entirely. `clean` only
+# removes the cross-build intermediates cosmocc leaves behind.
 clean:
-	rm -f bin/sandbox bin/sandbox.aarch64.elf bin/sandbox.com.dbg
+	rm -f bin/sandbox.aarch64.elf bin/sandbox.com.dbg

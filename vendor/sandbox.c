@@ -13,6 +13,10 @@
  * SANDBOX_UNVEIL_RX — extra paths to unveil read-execute (e.g. a vendored
  * compiler toolchain and the Cosmopolitan APE loader) so build tools can
  * exec their subprocesses.
+ * SANDBOX_NO_PLEDGE — if set, skip the pledge() call entirely (unveil still
+ * confines the filesystem). Used only for the git command, whose git-lfs
+ * subprocess (a Go binary) needs the waitid syscall, which no cosmocc pledge
+ * token permits. Unveil remains the security boundary.
  *
  * Compile with cosmocc for a portable static binary:
  *   cosmocc -o sandbox sandbox.c
@@ -141,18 +145,24 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Apply the pledge — always include exec so we can execvp() */
-    char full_promises[512];
-    int wrote = snprintf(full_promises, sizeof(full_promises), "%s exec", promises);
-    if (wrote < 0 || (size_t)wrote >= sizeof(full_promises)) {
-        fprintf(stderr, "sandbox: promise string too long (%d chars, max %zu)\n",
-                wrote, sizeof(full_promises) - 1);
-        return 1;
-    }
-    if (pledge(full_promises, NULL) != 0) {
-        fprintf(stderr, "sandbox: pledge('%s') failed: %s\n",
-                full_promises, strerror(errno));
-        return 1;
+    /* Apply the pledge — always include exec so we can execvp().
+       When SANDBOX_NO_PLEDGE is set, skip pledge entirely. This is used only
+       for git, whose git-lfs subprocess (a Go binary) needs the waitid syscall
+       that no cosmocc pledge token permits. Unveil (above) still confines the
+       filesystem, which remains the security boundary. */
+    if (getenv("SANDBOX_NO_PLEDGE") == NULL) {
+        char full_promises[512];
+        int wrote = snprintf(full_promises, sizeof(full_promises), "%s exec", promises);
+        if (wrote < 0 || (size_t)wrote >= sizeof(full_promises)) {
+            fprintf(stderr, "sandbox: promise string too long (%d chars, max %zu)\n",
+                    wrote, sizeof(full_promises) - 1);
+            return 1;
+        }
+        if (pledge(full_promises, NULL) != 0) {
+            fprintf(stderr, "sandbox: pledge('%s') failed: %s\n",
+                    full_promises, strerror(errno));
+            return 1;
+        }
     }
 
     /* Exec the command */
