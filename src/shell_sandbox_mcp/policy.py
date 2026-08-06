@@ -178,27 +178,43 @@ COMMANDS = {
         "extra_unveil_rx": _cosmo_toolchain_paths,
         "path_prefix": _cosmo_toolchain_bin,
     },
-    # Compiler aliases — all map to the same vendored cosmocc driver.
     "gcc": {
-        "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
+        "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-gcc.br_real").resolve()),
         "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
-        "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
-        "extra_unveil_rx": _cosmo_toolchain_paths,
-        "path_prefix": _cosmo_toolchain_bin,
+        "description": (
+            "x86_64 musl cross C compiler (vendored Bootlin toolchain). "
+            "Produces statically-linked musl binaries for x86_64. Uses the "
+            ".br_real driver directly (the buildroot toolchain-wrapper "
+            "symlink breaks under the sandbox because argv[0] is resolved). "
+            "Use `cosmocc` for Cosmopolitan APE builds."
+        ),
+        "extra_unveil_rx": _musl_toolchain_paths,
+        "path_prefix": _musl_toolchain_bin,
     },
     "cc": {
-        "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
+        "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-cc.br_real").resolve()),
         "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
-        "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
-        "extra_unveil_rx": _cosmo_toolchain_paths,
-        "path_prefix": _cosmo_toolchain_bin,
+        "description": (
+            "x86_64 musl cross C compiler (vendored Bootlin toolchain). "
+            "Produces statically-linked musl binaries for x86_64. Uses the "
+            ".br_real driver directly (the buildroot toolchain-wrapper "
+            "symlink breaks under the sandbox because argv[0] is resolved). "
+            "Use `cosmocc` for Cosmopolitan APE builds."
+        ),
+        "extra_unveil_rx": _musl_toolchain_paths,
+        "path_prefix": _musl_toolchain_bin,
     },
     "clang": {
-        "binary": str((COSMO_TOOLCHAIN / "bin" / "cosmocc").resolve()),
+        "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-gcc.br_real").resolve()),
         "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
-        "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
-        "extra_unveil_rx": _cosmo_toolchain_paths,
-        "path_prefix": _cosmo_toolchain_bin,
+        "description": (
+            "Maps to the x86_64 musl cross C compiler (vendored Bootlin "
+            "toolchain); no clang ships with the musl toolchain, so `clang` "
+            "invokes the musl gcc driver to produce statically-linked musl "
+            "binaries. Use `cosmocc` for Cosmopolitan APE builds."
+        ),
+        "extra_unveil_rx": _musl_toolchain_paths,
+        "path_prefix": _musl_toolchain_bin,
     },
     "musl-gcc": {
         "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-gcc.br_real").resolve()),

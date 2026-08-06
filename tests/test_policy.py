@@ -110,6 +110,10 @@ class MuslToolchainPathsTest(unittest.TestCase):
             "musl-cc": "x86_64-buildroot-linux-musl-cc.br_real",
             "musl-ld": "x86_64-buildroot-linux-musl-ld",
             "musl-ar": "x86_64-buildroot-linux-musl-ar",
+            # generic compiler names now resolve to the musl toolchain too
+            "gcc": "x86_64-buildroot-linux-musl-gcc.br_real",
+            "cc": "x86_64-buildroot-linux-musl-cc.br_real",
+            "clang": "x86_64-buildroot-linux-musl-gcc.br_real",
         }
         for cmd, name in expected.items():
             cfg = server.COMMANDS[cmd]
