@@ -87,8 +87,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Unveil: restrict filesystem to working dir, binary paths, and /tmp */
-    if (unveil(unveil_dir, "rwc") != 0) {
+    /* Unveil: restrict filesystem to working dir, binary paths, and /tmp.
+       The working dir is unveiled with execute (rwcx) so that build tools
+       like make can spawn project-local binaries under the tree as
+       subprocesses; the top-level command alone gets an explicit rx below. */
+    if (unveil(unveil_dir, "rwcx") != 0) {
         fprintf(stderr, "sandbox: unveil('%s', 'rwc') failed: %s\n",
                 unveil_dir, strerror(errno));
         return 1;

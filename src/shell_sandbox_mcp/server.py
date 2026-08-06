@@ -240,7 +240,13 @@ COMMANDS = {
     },
     "python3": {
         "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),
-        "promises": "stdio rpath wpath cpath inet dns recvfd",
+        # fattr/chown: pip must set file mtimes (utime) and ownership when
+        # unpacking wheels/sdists during `pip install` — without them package
+        # extraction fails with "Operation not permitted" at tarfile.utime.
+        # proc/prot_exec: let python spawn subprocesses (needed by the unit
+        # test suite's real-subprocess integration tests, and by build tools
+        # that shell out to python).
+        "promises": "stdio rpath wpath cpath inet dns recvfd fattr chown proc prot_exec",
         "description": (
             "Python 3 interpreter (Cosmopolitan static build). Runs with "
             "-S so PYTHONPATH (a sandbox-local site dir inside the cwd) "
