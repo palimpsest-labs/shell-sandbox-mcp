@@ -691,8 +691,14 @@ def _build_ast(
             else:
                 break
 
-    def _split_word_parts(raw: str) -> list[WordPart]:
-        """Split a raw word token value into WordParts with quote stripping."""
+    def _split_word_parts(raw: str, next_arg_id: Optional[list[int]] = None) -> list[WordPart]:
+        """Split a raw word token value into WordParts with quote stripping.
+
+        When *next_arg_id* is provided (a single-element list), ``$(...)``
+        inside double-quoted spans is detected and emitted as a SUBST
+        ``WordPart`` with an assigned sentinel ID.  Single-quoted spans
+        stay fully literal regardless.
+        """
         parts: list[WordPart] = []
         i, n2 = 0, len(raw)
 
@@ -715,6 +721,7 @@ def _build_ast(
         while i < n2:
             c = raw[i]
             if c == "'":
+                # Single quote — fully literal, no $() expansion
                 flush()
                 current_raw.append(c)
                 i += 1
@@ -732,6 +739,7 @@ def _build_ast(
                 i += 1
                 while i < n2 and raw[i] != '"':
                     ch = raw[i]
+                    # Handle backslash escapes inside double quotes
                     if ch == '\\' and i + 1 < n2:
                         nxt = raw[i + 1]
                         if nxt in ('"', '$', '\\'):
@@ -747,6 +755,44 @@ def _build_ast(
                             current_raw.append('\\')
                             current_raw.append(nxt)
                             i += 2
+                    # Detect $( ... ) inside double quotes
+                    elif (ch == '$' and i + 1 < n2 and raw[i + 1] == '('
+                          and next_arg_id is not None):
+                        # Check for $(( arithmetic (reject)
+                        if i + 2 < n2 and raw[i + 2] == '(':
+                            raise ParseError(
+                                "Arithmetic expansion $((...)) is not supported"
+                            )
+                        flush()
+                        # Find matching ')' with paren + quote tracking
+                        j = i + 2
+                        paren_depth = 1
+                        inner_q: Optional[str] = None
+                        while j < n2 and paren_depth > 0:
+                            c2 = raw[j]
+                            if inner_q is not None:
+                                if c2 == inner_q:
+                                    inner_q = None
+                            elif c2 in ("'", '"'):
+                                inner_q = c2
+                            elif c2 == '(':
+                                paren_depth += 1
+                            elif c2 == ')':
+                                paren_depth -= 1
+                            j += 1
+                        if paren_depth != 0:
+                            raise ValueError("Unbalanced $( ... )")
+                        inner_text = raw[i + 2 : j - 1]
+                        raw_subst = raw[i:j]  # "$(inner)"
+                        aid = next_arg_id[0]
+                        next_arg_id[0] += 1
+                        sentinel = f"\x01A{aid}\x01"
+                        wp = WordPart(
+                            text=sentinel, raw=raw_subst,
+                            is_sentinel=True, is_quoted=True,
+                        )
+                        parts.append(wp)
+                        i = j
                     else:
                         current_text.append(ch)
                         current_raw.append(ch)
@@ -882,7 +928,9 @@ def _build_ast(
                 if ws_seen and current_parts:
                     _flush_word()
                 _consume()
-                parts = _split_word_parts(t.value)
+                nid = [next_arg_id]
+                parts = _split_word_parts(t.value, nid)
+                next_arg_id = nid[0]
                 current_parts.extend(parts)
                 continue
 
@@ -900,7 +948,7 @@ def _build_ast(
         )
 
     def _build_redirect_spec(tok: Token) -> Optional[RedirectSpec]:
-        nonlocal pos, next_hd_id
+        nonlocal pos, next_hd_id, next_arg_id
 
         kind = tok.kind
 
@@ -954,7 +1002,9 @@ def _build_ast(
             )
 
         _consume()
-        target_parts = _split_word_parts(target_tok.value)
+        nid = [next_arg_id]
+        target_parts = _split_word_parts(target_tok.value, nid)
+        next_arg_id = nid[0]
 
         # Resolve $(...) sentinels in the target word
         resolved_parts: list[WordPart] = []
@@ -1609,8 +1659,9 @@ def parse_command(
     while i < n:
         c = command[i]
 
-        # ---- inside a quote: copy verbatim, but handle \" in double quotes ----
+        # ---- inside a quote ----
         if quote is not None:
+            # Double-quote: handle backslash escapes
             if quote == '"' and c == '\\' and i + 1 < n:
                 nxt = command[i + 1]
                 if nxt in ('"', '$', '\\', '\n'):
@@ -1618,6 +1669,55 @@ def parse_command(
                     output.append(nxt)
                     i += 2
                     continue
+
+            # Double-quote: $( ... ) command substitution
+            if quote == '"' and c == '$' and i + 1 < n and command[i + 1] == '(':
+                # Check for $(( arithmetic
+                if i + 2 < n and command[i + 2] == '(':
+                    raise ParseError("Arithmetic expansion $((...)) is not supported")
+                # Find matching ')' with paren + quote tracking
+                j = i + 2
+                paren_depth = 1
+                inner_quote: Optional[str] = None
+                while j < n and paren_depth > 0:
+                    ch = command[j]
+                    if inner_quote is not None:
+                        if ch == inner_quote:
+                            inner_quote = None
+                    elif ch in ("'", '"'):
+                        inner_quote = ch
+                    elif ch == '(':
+                        paren_depth += 1
+                    elif ch == ')':
+                        paren_depth -= 1
+                    j += 1
+                if paren_depth != 0:
+                    raise ValueError("Unbalanced $( ... )")
+                inner = command[i + 2 : j - 1]
+
+                # Check depth/count limits before recursing
+                if depth + 1 > MAX_SUBST_DEPTH:
+                    raise ValueError(
+                        f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
+                    )
+                subst_count[0] += 1
+                if subst_count[0] > MAX_SUBST_COUNT:
+                    raise ValueError(
+                        f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
+                    )
+
+                # Recursively capture inner command output
+                rc, stdout_bytes = capture_fn(inner)
+                result = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
+                result = result[:MAX_SUBST_OUTPUT]
+                sentinel = f"\x01A{next_arg_id}\x01"
+                next_arg_id += 1
+                expansion.arg_values[sentinel] = result
+                output.append(sentinel)
+                i = j
+                continue
+
+            # Default: copy char verbatim (both single and double quotes)
             output.append(c)
             if c == quote:
                 quote = None

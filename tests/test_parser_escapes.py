@@ -172,13 +172,14 @@ class BackslashEscapeTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ArithmeticInQuotesTest(unittest.TestCase):
-    """$(( inside double quotes is literal, rejected only when unquoted."""
+    """$(( inside double quotes is now rejected (since $( is active inside "...")."""
 
-    def test_arithmetic_inside_double_quotes_passes(self) -> None:
-        cleaned, exp, _prog = parse_command(
-            'echo "$((1+1))"', lambda i: (0, b""), None, 30, 0,
-        )
-        self.assertIn("$((1+1))", cleaned)
+    def test_arithmetic_inside_double_quotes_rejected(self) -> None:
+        with self.assertRaises(ParseError) as ctx:
+            parse_command(
+                'echo "$((1+1))"', lambda i: (0, b""), None, 30, 0,
+            )
+        self.assertIn("Arithmetic", str(ctx.exception))
 
     def test_arithmetic_inside_single_quotes_passes(self) -> None:
         cleaned, exp, _prog = parse_command(
