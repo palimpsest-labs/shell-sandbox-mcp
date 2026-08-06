@@ -146,10 +146,11 @@ int main(int argc, char *argv[]) {
     }
 
     /* Apply the pledge — always include exec so we can execvp().
-       When SANDBOX_NO_PLEDGE is set, skip pledge entirely. This is used only
-       for git, whose git-lfs subprocess (a Go binary) needs the waitid syscall
-       that no cosmocc pledge token permits. Unveil (above) still confines the
-       filesystem, which remains the security boundary. */
+       When SANDBOX_NO_PLEDGE is set, skip pledge entirely. This is a
+       per-command policy flag set by the Python side (git uses it for
+       waitid/git-lfs — a Go binary that needs syscalls no cosmocc pledge
+       token permits). Unveil (above) still confines the filesystem, which
+       remains the security boundary. */
     if (getenv("SANDBOX_NO_PLEDGE") == NULL) {
         char full_promises[512];
         int wrote = snprintf(full_promises, sizeof(full_promises), "%s exec", promises);

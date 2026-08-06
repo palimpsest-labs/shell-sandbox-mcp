@@ -21,6 +21,7 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Literal, Mapping, Optional
 
 
@@ -1639,6 +1640,11 @@ def _has_unbalanced_quotes(text: str) -> bool:
     return quote is not None
 
 
+def _expand_tilde(s: str) -> str:
+    """Shell-style tilde expansion, only for words beginning with ``~``."""
+    return str(Path(s).expanduser()) if s.startswith("~") else s
+
+
 def _extract_from_node(
     cmd: CommandNode,
     expansion: Optional[Expansion] = None,
@@ -1660,7 +1666,7 @@ def _extract_from_node(
             else:
                 resolved += p.text
         if resolved:
-            args.append(resolved)
+            args.append(_expand_tilde(resolved))
 
     for rs in cmd.redirects:
         target_text = ""
@@ -1679,9 +1685,11 @@ def _extract_from_node(
 
         # ---- validation: missing target for file redirects ----
         if rs.op in (">", ">>"):
+            target_text = _expand_tilde(target_text)
             if not target_text:
                 return [], [], "Redirect operator missing target file"
         if rs.op == "<":
+            target_text = _expand_tilde(target_text)
             if not target_text:
                 return [], [], "Input redirect missing target file"
 

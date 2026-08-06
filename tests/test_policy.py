@@ -12,6 +12,7 @@ from pathlib import Path
 from shell_sandbox_mcp import server
 from shell_sandbox_mcp.server import (
     CommandNode,
+    COMMANDS,
     EmptyInvocation,
     Expansion,
     FdPlan,
@@ -145,6 +146,33 @@ class StageGitGlobalConfigTest(unittest.TestCase):
             result.stdout.strip(),
             str((server.REPO_ROOT / "bin" / "git-cred-readonly").resolve()),
         )
+
+
+# ---------------------------------------------------------------------------
+# no_pledge per-command flag tests
+# ---------------------------------------------------------------------------
+
+
+class NoPledgeFlagTest(unittest.TestCase):
+    def test_git_has_no_pledge_flag(self) -> None:
+        cfg = COMMANDS["git"]
+        self.assertTrue(cfg.get("no_pledge"), "git must have no_pledge=True")
+
+    def test_only_git_uses_no_pledge(self) -> None:
+        no_pledge_cmds = [k for k, v in COMMANDS.items() if v.get("no_pledge")]
+        self.assertEqual(no_pledge_cmds, ["git"],
+                         f"Expected only 'git' to use no_pledge, got {no_pledge_cmds}")
+
+    def test_no_pledge_not_on_busybox_or_other_commands(self) -> None:
+        """Ensure no_pledge is NOT set on commands that don't need it."""
+        for name, cfg in COMMANDS.items():
+            if name == "git":
+                continue
+            self.assertFalse(
+                cfg.get("no_pledge", False),
+                f"{name} must NOT have no_pledge=True (security: "
+                f"no_pledge strips seccomp from a potentially dangerous command)",
+            )
 
 
 

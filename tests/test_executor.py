@@ -774,6 +774,152 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
         self.assertIn(b"not allowed on non-first", stdout_b)
 
 
+# ---------------------------------------------------------------------------
+# _build_invocation no_pledge flag tests
+# ---------------------------------------------------------------------------
+
+
+class BuildInvocationNoPledgeTest(unittest.TestCase):
+    """Test that _build_invocation sets SANDBOX_NO_PLEDGE based on the
+    no_pledge per-command policy flag."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_stage = server._stage_git_global_config
+
+    def tearDown(self) -> None:
+        server._stage_git_global_config = self._orig_stage
+        self._tmp.cleanup()
+
+    def test_build_invocation_git_sets_no_pledge_env(self) -> None:
+        """Git invocation should set SANDBOX_NO_PLEDGE=1 and GIT_CONFIG_GLOBAL."""
+        fake_config = "/tmp/fake-git-config"
+
+        def fake_stage():
+            return fake_config
+
+        server._stage_git_global_config = fake_stage
+        inv = _build_invocation("git status", self.root)
+        self.assertIsInstance(inv, Invocation)
+        self.assertIsNotNone(inv.env)
+        self.assertEqual(inv.env.get("SANDBOX_NO_PLEDGE"), "1")
+        self.assertEqual(inv.env.get("GIT_CONFIG_GLOBAL"), fake_config)
+
+    def test_build_invocation_no_pledge_flag_drives_env(self) -> None:
+        """A fake COMMANDS entry with no_pledge=True should set the env var."""
+        import copy
+        from shell_sandbox_mcp.server import _resolve_command
+
+        original_resolve = _resolve_command
+        # Synthesize a fake entry with no_pledge:True
+        fake_cfg = {
+            "binary": "/usr/bin/echo",
+            "promises": "stdio rpath",
+            "description": "test no_pledge",
+            "no_pledge": True,
+        }
+
+        def fake_resolve(args, work_dir=None):
+            if args and args[0] == "test_no_pledge_cmd":
+                return fake_cfg["binary"], args, fake_cfg
+            return original_resolve(args, work_dir)
+
+        server._resolve_command = fake_resolve
+        try:
+            inv = _build_invocation("test_no_pledge_cmd hello", self.root)
+            self.assertIsInstance(inv, Invocation)
+            self.assertIsNotNone(inv.env)
+            self.assertEqual(inv.env.get("SANDBOX_NO_PLEDGE"), "1",
+                             "no_pledge=True must set SANDBOX_NO_PLEDGE=1")
+        finally:
+            server._resolve_command = original_resolve
+
+    def test_build_invocation_without_no_pledge_flag_no_env(self) -> None:
+        """Without no_pledge flag, SANDBOX_NO_PLEDGE must be absent."""
+        import copy
+        from shell_sandbox_mcp.server import _resolve_command
+
+        original_resolve = _resolve_command
+        fake_cfg = {
+            "binary": "/usr/bin/echo",
+            "promises": "stdio rpath",
+            "description": "test without no_pledge",
+        }
+
+        def fake_resolve(args, work_dir=None):
+            if args and args[0] == "test_no_flag_cmd":
+                return fake_cfg["binary"], args, fake_cfg
+            return original_resolve(args, work_dir)
+
+        server._resolve_command = fake_resolve
+        try:
+            inv = _build_invocation("test_no_flag_cmd hello", self.root)
+            self.assertIsInstance(inv, Invocation)
+            self.assertIsNotNone(inv.env)
+            self.assertNotIn("SANDBOX_NO_PLEDGE", inv.env,
+                             "Without no_pledge, SANDBOX_NO_PLEDGE must not be set")
+        finally:
+            server._resolve_command = original_resolve
+
+    def test_build_invocation_make_does_not_set_no_pledge(self) -> None:
+        """make must NOT set SANDBOX_NO_PLEDGE (security bound)."""
+        inv = _build_invocation("make build", self.root)
+        self.assertIsInstance(inv, Invocation)
+        self.assertIsNotNone(inv.env)
+        self.assertNotIn("SANDBOX_NO_PLEDGE", inv.env,
+                         "make must NOT set SANDBOX_NO_PLEDGE")
+
+
+# ---------------------------------------------------------------------------
+# timeout builtin real-subprocess integration tests
+# ---------------------------------------------------------------------------
+
+
+class TimeoutIntegrationTest(unittest.TestCase):
+    """Drive the timeout builtin through shell_run with real subprocesses.
+
+    Stubs _build_invocation to bypass the sandbox wrapper (like
+    RunPipelineIntegrationTest) so the timeout propagation through the
+    pipeline orchestration is what's under test.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._orig_build = server._build_invocation
+
+    def tearDown(self) -> None:
+        server._build_invocation = self._orig_build
+        self._tmp.cleanup()
+
+    def _fake_build(self, mapping: dict[str, server.Invocation]):
+        def fake(command, work_dir, expansion=None):
+            # command may be a CommandNode or str
+            key = command if isinstance(command, str) else _serialize_command(command)
+            return mapping.get(key, server.EmptyInvocation())
+        server._build_invocation = fake
+
+    def test_timeout_builtin_kills_long_sleep(self) -> None:
+        """timeout 1 sleep 5 should be killed and return timeout message."""
+        self._fake_build({
+            "sleep 5": server.Invocation(
+                "/bin/sleep", ["/bin/sleep", "5"], None, {}, [],
+            ),
+        })
+        out = server.shell_run("timeout 1 sleep 5", cwd=str(self.root))
+        self.assertIn("timed out", out.lower())
+
+    def test_timeout_builtin_allows_short(self) -> None:
+        """timeout 3 ls should succeed (ls finishes quickly)."""
+        self._fake_build({
+            "ls": server.Invocation(
+                "/bin/ls", ["/bin/ls"], None, {}, [],
+            ),
+        })
+        out = server.shell_run("timeout 3 ls", cwd=str(self.root))
+        self.assertNotIn("timed out", out.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

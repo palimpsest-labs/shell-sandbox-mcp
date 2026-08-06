@@ -198,5 +198,115 @@ class ASTConsumptionTest(unittest.TestCase):
 
 
 
+class TildeExpansionTest(unittest.TestCase):
+    """Tilde expansion of command args and file-redirect targets.
+
+    Expansion happens in ``parser._extract_from_node``: command words and
+    ``>``/``>>``/``<`` redirect targets that begin with ``~`` are expanded
+    via ``Path.expanduser``.  Heredoc/here-string delimiters and ``>&`` fd
+    targets are left untouched.
+    """
+
+    def _expand(self, command: str) -> "tuple[list[str], list[Redirect], str | None]":
+        """Parse *command* and run it through ``_extract_from_node``."""
+        from shell_sandbox_mcp.parser import (
+            parse_command,
+            program_to_chain,
+            _extract_from_node,
+        )
+        cleaned, _exp, program = parse_command(
+            command, lambda i: (0, b""), Path("."), 30, 0,
+        )
+        self.assertIsNotNone(program, f"parse_command rejected: {command!r}")
+        chain = program_to_chain(program)
+        self.assertTrue(chain and chain[0][1], f"no command chain for {command!r}")
+        return _extract_from_node(chain[0][1][0], _exp)
+
+    def test_tilde_arg_alone(self) -> None:
+        args, redirects, err = self._expand("echo ~")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", str(Path.home())])
+        self.assertEqual(redirects, [])
+
+    def test_tilde_slash_arg(self) -> None:
+        args, redirects, err = self._expand("echo ~/x")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", str(Path.home() / "x")])
+        self.assertEqual(redirects, [])
+
+    def test_tilde_current_user_arg(self) -> None:
+        args, redirects, err = self._expand("echo ~arch")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", str(Path.home())])
+        self.assertEqual(redirects, [])
+
+    def test_tilde_redirect_target(self) -> None:
+        args, redirects, err = self._expand("cat < ~/x")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cat"])
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].op, "<")
+        self.assertEqual(redirects[0].raw_target, str(Path.home() / "x"))
+
+    def test_tilde_output_redirect_target(self) -> None:
+        args, redirects, err = self._expand("cmd > ~/out.txt")
+        self.assertIsNone(err)
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].op, ">")
+        self.assertEqual(redirects[0].raw_target, str(Path.home() / "out.txt"))
+
+    def test_heredoc_delimiter_not_expanded(self) -> None:
+        args, redirects, err = self._expand("cat << EOF\nbody\nEOF")
+        self.assertIsNone(err)
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].op, "<<")
+        self.assertEqual(redirects[0].body, "body\n")
+
+    def test_herestring_not_expanded(self) -> None:
+        args, redirects, err = self._expand("cmd <<< ~/x")
+        self.assertIsNone(err)
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].op, "<<<")
+        self.assertEqual(redirects[0].body, "~/x\n")
+
+    def test_fd_redirect_target_not_expanded(self) -> None:
+        from shell_sandbox_mcp.parser import (
+            CommandNode as ParserCmd,
+            RedirectSpec,
+            Word,
+            WordPart,
+            _extract_from_node,
+        )
+        # Build a >& redirect with a tilde target manually — the lexer only
+        # accepts digit fd targets for >&, so a manual node is needed.
+        cmd = ParserCmd(
+            words=(Word(parts=(WordPart(text="cmd", raw="cmd"),)),),
+            redirects=(RedirectSpec(
+                fd=2, op=">&",
+                target=Word(parts=(WordPart(text="~foo", raw="~foo"),)),
+            ),),
+        )
+        args, redirects, err = _extract_from_node(cmd)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].op, ">&")
+        self.assertEqual(redirects[0].raw_target, "~foo")
+        self.assertIsNone(redirects[0].target_fd)
+
+    def test_middle_of_word_tilde_not_expanded(self) -> None:
+        args, redirects, err = self._expand("echo foo~bar")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "foo~bar"])
+        self.assertEqual(redirects, [])
+
+    def test_tilde_not_expanded_in_redirect_middle(self) -> None:
+        args, redirects, err = self._expand("cmd > a~b")
+        self.assertIsNone(err)
+        self.assertEqual(len(redirects), 1)
+        self.assertEqual(redirects[0].op, ">")
+        self.assertEqual(redirects[0].raw_target, "a~b")
+
+
 if __name__ == "__main__":
     unittest.main()

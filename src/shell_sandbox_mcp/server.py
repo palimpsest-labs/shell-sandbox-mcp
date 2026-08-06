@@ -103,6 +103,7 @@ from .policy import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 from .builtins import (  # noqa: F401
+    _apply_timeout_builtin,
     _try_cd,
 )
 
@@ -183,6 +184,14 @@ def shell_run(
     target directory is validated against the allowed-dir containment rules
     (same as ``cwd``). Bare ``cd`` with no argument is rejected.
 
+    ``timeout N CMD…`` is a per-pipeline builtin: it overrides the timeout
+    for the current pipeline to *N* seconds (clamped to MAX_TIMEOUT=300).
+    ``timeout`` must be the first word of the first segment of a pipeline
+    (e.g. ``timeout 5 long_cmd`` or ``timeout 3 a | b``); it is rejected
+    on non-first stages and when backgrounding (``&``). The builtin is
+    implemented in pure Python and does not spawn a subprocess, so it does
+    not need a ``vfork``-capable pledge.
+
     Args:
         command: The command to run (e.g., "git status", "ls | grep foo",
             "cd build && make test")
@@ -226,16 +235,21 @@ def shell_run(
 
     # Single-command fast path — preserves the exact prior behaviour.
     if len(chains) == 1 and chains[0][0] is None and len(chains[0][1]) == 1:
+        nodes, eff_to, terr = _apply_timeout_builtin(
+            chains[0][1], expansion, chains[0][2], timeout,
+        )
+        if terr:
+            return terr
         if chains[0][2]:
-            _rc, out = _run_background(chains[0][1], work_dir, expansion=expansion)
+            _rc, out = _run_background(nodes, work_dir, expansion=expansion)
             return out if out else "(no output)"
         # cd builtin: resolve the target directory and return immediately.
-        new_dir, cd_err = _try_cd(chains[0][1][0], work_dir, expansion)
+        new_dir, cd_err = _try_cd(nodes[0], work_dir, expansion)
         if cd_err is not None:
             return cd_err
         if new_dir is not None:
             return "(no output)"
-        _rc, out = _run_segment(chains[0][1][0], work_dir, timeout,
+        _rc, out = _run_segment(nodes[0], work_dir, eff_to,
                                 expansion=expansion)
         return out if out else "(no output)"
 
@@ -255,11 +269,22 @@ def shell_run(
             outputs.append("(skipped: previous command succeeded) — " + joined)
             continue
 
+        # timeout builtin: intercept before cd/allowlist dispatch so the
+        # per-pipeline timeout override applies to the correct pipeline.
+        nodes, eff_to, terr = _apply_timeout_builtin(
+            cmd_nodes, expansion, backgrounded, timeout,
+        )
+        if terr is not None:
+            outputs.append(terr)
+            prev_rc = 1
+            ran_any = True
+            continue
+
         # cd builtin: intercept single-command non-backgrounded pipelines
         # before allowlist dispatch so the directory change applies to
         # subsequent segments of the same shell_run call.
-        if not backgrounded and len(cmd_nodes) == 1:
-            new_dir, cd_err = _try_cd(cmd_nodes[0], work_dir, expansion)
+        if not backgrounded and len(nodes) == 1:
+            new_dir, cd_err = _try_cd(nodes[0], work_dir, expansion)
             if cd_err is not None:
                 outputs.append(cd_err)
                 prev_rc = 1
@@ -272,16 +297,16 @@ def shell_run(
                 continue
 
         if backgrounded:
-            _rc, out = _run_background(cmd_nodes, work_dir, expansion=expansion)
+            _rc, out = _run_background(nodes, work_dir, expansion=expansion)
             ran_any = True
             # Leave prev_rc unchanged — backgrounded exit code is unknown.
-        elif len(cmd_nodes) == 1:
-            rc, out = _run_segment(cmd_nodes[0], work_dir, timeout,
+        elif len(nodes) == 1:
+            rc, out = _run_segment(nodes[0], work_dir, eff_to,
                                    expansion=expansion)
             prev_rc = rc
             ran_any = True
         else:
-            rc, out = _run_pipeline(cmd_nodes, work_dir, timeout,
+            rc, out = _run_pipeline(nodes, work_dir, eff_to,
                                     expansion=expansion)
             prev_rc = rc
             ran_any = True

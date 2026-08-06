@@ -130,6 +130,7 @@ COMMANDS = {
         "extra_unveil": _git_readonly_paths,      # config + cred file, READ-ONLY
         "extra_unveil_rx": _git_extra_rx_paths,   # .git/hooks + cred shim
         "is_git": True,
+        "no_pledge": True,
     },
     "cargo": {
         "binary": "cargo",
