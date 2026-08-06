@@ -56,6 +56,7 @@ from .config import (  # noqa: F401
     SANDBOX_WRAPPER,
     _ENV_ALLOWLIST,
     _base_env,
+    _cosmo_py_version,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,8 +94,10 @@ from .policy import (  # noqa: F401
     _git_credential_paths,
     _git_extra_rx_paths,
     _git_readonly_paths,
+    _maybe_venv_cfg,
     _resolve_command,
     _resolve_local_binary,
+    _resolve_venv_fallback,
     _stage_git_global_config,
 )
 

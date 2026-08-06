@@ -18,6 +18,7 @@ from .config import (
     SANDBOX_BIN,
     SANDBOX_WRAPPER,
     _base_env,
+    _cosmo_py_version,
 )
 from .parser import (
     CommandNode,
@@ -133,17 +134,51 @@ def _build_invocation(
     # Sandbox-local python site dir: create <cwd>/.py-site, expose the base
     # via PYTHONUSERBASE (so `pip install --user` lands inside the sandbox)
     # and the site-packages via PYTHONPATH (so imports resolve).
+    # Also handles venv pythons: site_dir_name is an absolute venv root path
+    # whose site-packages directory is created (the venv itself already exists).
     site_dir_name = cfg.get("site_dir_name")
     if site_dir_name:
-        site_base = work_dir / site_dir_name
-        try:
-            site_base.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            return InvocationError(f"Error creating python site dir {site_base}: {e}")
-        site_packages = site_base / "lib" / "python3.12" / "site-packages"
-        site_packages.mkdir(parents=True, exist_ok=True)
-        unveil_env["PYTHONUSERBASE"] = str(site_base)
-        unveil_env["PYTHONPATH"] = str(site_packages)
+        site_base = Path(site_dir_name)
+        if site_base.is_absolute():
+            # Venv case: site_dir_name is an absolute path to the venv root.
+            # The venv tree already exists; just ensure its site-packages dir
+            # is present so pip/imports work.
+            site_packages = site_base / "lib" / f"python{_cosmo_py_version()}" / "site-packages"
+            site_packages.mkdir(parents=True, exist_ok=True)
+            unveil_env["PYTHONUSERBASE"] = str(site_base)
+            unveil_env["PYTHONPATH"] = str(site_packages)
+        else:
+            # Relative .py-site case (existing behaviour, now with dynamic
+            # python version).
+            site_base = work_dir / site_dir_name
+            try:
+                site_base.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return InvocationError(f"Error creating python site dir {site_base}: {e}")
+            site_packages = site_base / "lib" / f"python{_cosmo_py_version()}" / "site-packages"
+            site_packages.mkdir(parents=True, exist_ok=True)
+            unveil_env["PYTHONUSERBASE"] = str(site_base)
+            unveil_env["PYTHONPATH"] = str(site_packages)
+
+        # Append extra PYTHONPATH dirs that exist inside the work tree
+        # (e.g. "src" so the project's own package is importable without
+        # an editable install).  Applied for both .py-site and venv pythons
+        # so that `import shell_sandbox_mcp` works from a venv too.
+        pythonpath_extra = cfg.get("pythonpath_extra", [])
+        if pythonpath_extra:
+            extras = []
+            for rel in pythonpath_extra:
+                cand = (work_dir / rel).resolve()
+                try:
+                    cand.relative_to(work_dir)
+                except ValueError:
+                    continue  # escapes work_dir, skip
+                if cand.is_dir():
+                    extras.append(str(cand))
+            if extras:
+                unveil_env["PYTHONPATH"] = os.pathsep.join(
+                    [unveil_env["PYTHONPATH"]] + extras
+                )
 
     # For git, stage a sandbox-global config that swaps credential.helper for
     # the read-only shim, preserving all other ~/.gitconfig settings (including

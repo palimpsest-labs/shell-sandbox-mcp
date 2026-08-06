@@ -4,7 +4,9 @@ Constants and helper functions for sandbox paths, timeout/limit defaults,
 and host-environment filtering.  No dependencies on other sandbox modules.
 """
 
+import functools
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -34,6 +36,29 @@ EXTRA_REDIRECT_ROOTS = [
 DEFAULT_TIMEOUT = 30
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 1_000_000  # 1 MB
+
+
+@functools.lru_cache(maxsize=1)
+def _cosmo_py_version() -> str:
+    """Return the Python major.minor version string for the vendored cosmo
+    python binary, e.g. ``"3.12"``.  Queried once per process and cached so
+    repeated calls are free.
+
+    Raises :class:`RuntimeError` if the cosmo python binary is missing or
+    the subprocess fails for any reason.
+    """
+    binary = REPO_ROOT / "bin" / "cosmo" / "python"
+    try:
+        out = subprocess.run(
+            [str(binary), "-S", "-c",
+             "import sys; print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to determine cosmo python version from {binary}: {exc}"
+        ) from exc
+    return out.stdout.strip()
 
 # ---------------------------------------------------------------------------
 # Environment allowlist

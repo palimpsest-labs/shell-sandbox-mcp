@@ -1,4 +1,4 @@
-.PHONY: all clean
+.PHONY: all clean sandbox-deps
 
 all: bin/sandbox
 
@@ -15,3 +15,9 @@ bin/sandbox: vendor/sandbox.c
 # removes the cross-build intermediates cosmocc leaves behind.
 clean:
 	rm -f bin/sandbox.aarch64.elf bin/sandbox.com.dbg
+
+# Install common test/development packages into the sandbox-local .py-site
+# so they are importable by the vendored cosmo python.  Uses --user so pip
+# installs into the sandbox workspace rather than the host site-packages.
+sandbox-deps:
+	python3 -m pip install --user --disable-pip-version-check pytest mcp
