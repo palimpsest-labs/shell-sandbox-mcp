@@ -471,6 +471,58 @@ def _validate_cwd(resolved: Path, raw: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# cd builtin — per-call working directory change (no subprocess)
+# ---------------------------------------------------------------------------
+
+
+def _try_cd(cmd, work_dir: Path, expansion: Optional[Expansion] = None) -> tuple[Optional[Path], Optional[str]]:
+    """Detect and execute a ``cd`` builtin without spawning a subprocess.
+
+    ``cmd`` may be a ``str`` (legacy path) or a :class:`parser.CommandNode`
+    (AST-native path).  Returns ``(new_work_dir, None)`` on success,
+    ``(None, error_msg)`` on failure, or ``(None, None)`` when the command
+    is NOT a ``cd`` (caller falls through to normal dispatch).
+    """
+    args, _redirects, _err = _extract_redirects(cmd, expansion)
+    if not args or args[0] != "cd":
+        return None, None
+
+    if len(args) == 1:
+        # Bare cd — no $HOME concept in the sandbox.
+        return None, "cd: no directory"
+
+    # A leading `--` is end-of-options. `cd -- <dir>` targets <dir>;
+    # `cd --` alone behaves like a bare cd.
+    if args[1] == "--":
+        if len(args) == 3:
+            target = args[2]
+        elif len(args) == 2:
+            return None, "cd: no directory"
+        else:
+            return None, "cd: too many arguments"
+    elif len(args) > 2:
+        return None, "cd: too many arguments"
+    else:
+        target = args[1]
+
+    try:
+        # Expand `~` against the target itself before joining with work_dir,
+        # mirroring how the initial cwd is resolved (Path(raw_cwd).expanduser()).
+        target_path = Path(target).expanduser()
+        if not target_path.is_absolute():
+            target_path = work_dir / target_path
+        new_dir = target_path.resolve()
+    except Exception:
+        return None, f"cd: invalid path: {target}"
+
+    err = _validate_cwd(new_dir, target)
+    if err is not None:
+        return None, err
+
+    return new_dir, None
+
+
+# ---------------------------------------------------------------------------
 # Command chaining
 # ---------------------------------------------------------------------------
 
@@ -1535,6 +1587,12 @@ def shell_run(
     Command substitution (``$(command ...)``) recursively executes the inner
     command and splices its stdout as a single argument word.
 
+    ``cd <dir>`` is a per-call builtin: it changes the working directory for
+    subsequent segments of the SAME call only (e.g. ``cd build && make``).
+    It does NOT persist across separate ``shell_run`` invocations. The
+    target directory is validated against the allowed-dir containment rules
+    (same as ``cwd``). Bare ``cd`` with no argument is rejected.
+
     Args:
         command: The command to run (e.g., "git status", "ls | grep foo",
             "cd build && make test")
@@ -1576,6 +1634,12 @@ def shell_run(
             if chains[0][2]:
                 _rc, out = _run_background(chains[0][1], work_dir, expansion=expansion)
                 return out if out else "(no output)"
+            # cd builtin: resolve the target directory and return immediately.
+            new_dir, cd_err = _try_cd(chains[0][1][0], work_dir, expansion)
+            if cd_err is not None:
+                return cd_err
+            if new_dir is not None:
+                return "(no output)"
             _rc, out = _run_segment(chains[0][1][0], work_dir, timeout,
                                     expansion=expansion)
             return out if out else "(no output)"
@@ -1595,6 +1659,22 @@ def shell_run(
             if op == "||" and ran_any and prev_rc == 0:
                 outputs.append("(skipped: previous command succeeded) — " + joined)
                 continue
+
+            # cd builtin: intercept single-command non-backgrounded pipelines
+            # before allowlist dispatch so the directory change applies to
+            # subsequent segments of the same shell_run call.
+            if not backgrounded and len(cmd_nodes) == 1:
+                new_dir, cd_err = _try_cd(cmd_nodes[0], work_dir, expansion)
+                if cd_err is not None:
+                    outputs.append(cd_err)
+                    prev_rc = 1
+                    ran_any = True
+                    continue
+                if new_dir is not None:
+                    work_dir = new_dir
+                    prev_rc = 0
+                    ran_any = True
+                    continue
 
             if backgrounded:
                 _rc, out = _run_background(cmd_nodes, work_dir, expansion=expansion)
@@ -1630,6 +1710,12 @@ def shell_run(
         if pipelines[0][2]:
             _rc, out = _run_background(pipelines[0][1], work_dir, expansion=expansion)
             return out if out else "(no output)"
+        # cd builtin: resolve the target directory and return immediately.
+        new_dir, cd_err = _try_cd(pipelines[0][1][0], work_dir, expansion)
+        if cd_err is not None:
+            return cd_err
+        if new_dir is not None:
+            return "(no output)"
         _rc, out = _run_segment(pipelines[0][1][0], work_dir, timeout,
                                 expansion=expansion)
         return out if out else "(no output)"
@@ -1650,6 +1736,21 @@ def shell_run(
         if op == "||" and ran_any and prev_rc == 0:
             outputs.append("(skipped: previous command succeeded) — " + joined)
             continue
+
+        # cd builtin: intercept single-command non-backgrounded pipelines
+        # before allowlist dispatch (legacy string path).
+        if not backgrounded and len(stages) == 1:
+            new_dir, cd_err = _try_cd(stages[0], work_dir, expansion)
+            if cd_err is not None:
+                outputs.append(cd_err)
+                prev_rc = 1
+                ran_any = True
+                continue
+            if new_dir is not None:
+                work_dir = new_dir
+                prev_rc = 0
+                ran_any = True
+                continue
 
         if backgrounded:
             rc, out = _run_background(stages, work_dir, expansion=expansion)
@@ -1702,6 +1803,12 @@ def shell_list() -> str:
     lines.append(f"    splices stdout as a single arg (depth {MAX_SUBST_DEPTH}, count")
     lines.append(f"    {MAX_SUBST_COUNT}, max output {MAX_SUBST_OUTPUT:,}, max body")
     lines.append(f"    {MAX_HEREDOC_BODY:,}).")
+    lines.append("")
+    lines.append("Builtins: 'cd <dir>' changes the working directory for the rest of the")
+    lines.append("    same shell_run call only (not persisted across calls). The target")
+    lines.append("    directory is validated against the same containment rules as the")
+    lines.append(f"    initial cwd ({', '.join(DEFAULT_ALLOWED_DIRS)}). Bare 'cd' with no")
+    lines.append("    argument is rejected (no $HOME concept in the sandbox).")
     lines.append("")
     lines.append(f"Sandbox binary: {SANDBOX_BIN.resolve()}")
     lines.append(f"Allowed directories: {', '.join(DEFAULT_ALLOWED_DIRS)}")
