@@ -75,6 +75,57 @@ class CosmoToolchainPathsTest(unittest.TestCase):
         self.assertEqual(cfg["extra_unveil_rx"], server._cosmo_toolchain_paths)
 
 # ---------------------------------------------------------------------------
+# _musl_toolchain_paths
+# ---------------------------------------------------------------------------
+
+
+class MuslToolchainPathsTest(unittest.TestCase):
+    def test_paths_resolved(self) -> None:
+        paths = server._musl_toolchain_paths()
+        # toolchain tree + busybox binary
+        self.assertEqual(len(paths), 2)
+        for p in paths:
+            self.assertTrue(Path(p).is_absolute())
+            self.assertEqual(str(Path(p).resolve()), p)
+        # first path must be the vendored musl toolchain root; busybox must be present
+        self.assertEqual(Path(paths[0]), server.MUSL_TOOLCHAIN.resolve())
+        self.assertEqual(Path(paths[1]), server.BUSYBOX_BIN.resolve())
+
+    def test_musl_gcc_configured_with_local_toolchain(self) -> None:
+        cfg = server.COMMANDS["musl-gcc"]
+        # binary must point inside the vendored musl toolchain
+        self.assertTrue(
+            cfg["binary"].startswith(str(server.MUSL_TOOLCHAIN.resolve()))
+        )
+        self.assertEqual(cfg["extra_unveil_rx"], server._musl_toolchain_paths)
+
+    def test_musl_toolchain_binaries_are_real_bootlin_names(self) -> None:
+        # Bootlin's buildroot toolchain uses the x86_64-buildroot-linux-musl
+        # triple. The gcc/cc drivers are the `.br_real` binaries: the public
+        # `<triple>-gcc`/`-cc` are symlinks to a `toolchain-wrapper` that
+        # breaks under the sandbox (argv[0] gets resolved to the symlink
+        # target, so it looks for the non-existent `toolchain-wrapper.br_real`).
+        expected = {
+            "musl-gcc": "x86_64-buildroot-linux-musl-gcc.br_real",
+            "musl-cc": "x86_64-buildroot-linux-musl-cc.br_real",
+            "musl-ld": "x86_64-buildroot-linux-musl-ld",
+            "musl-ar": "x86_64-buildroot-linux-musl-ar",
+        }
+        for cmd, name in expected.items():
+            cfg = server.COMMANDS[cmd]
+            self.assertTrue(
+                cfg["binary"].startswith(str(server.MUSL_TOOLCHAIN.resolve()))
+            )
+            # binary name must be the expected real Bootlin binary
+            self.assertEqual(Path(cfg["binary"]).name, name)
+            self.assertEqual(cfg["extra_unveil_rx"], server._musl_toolchain_paths)
+            # the resolved binary must actually exist
+            self.assertTrue(
+                Path(cfg["binary"]).is_file(),
+                f"{cmd} binary should exist: {cfg['binary']}",
+            )
+
+# ---------------------------------------------------------------------------
 # _git_extra_rx_paths
 # ---------------------------------------------------------------------------
 

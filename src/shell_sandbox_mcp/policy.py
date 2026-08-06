@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .config import BUSYBOX_BIN, COSMO_TOOLCHAIN, REPO_ROOT
+from .config import BUSYBOX_BIN, COSMO_TOOLCHAIN, MUSL_TOOLCHAIN, REPO_ROOT
 from .containment import _contained_path
 
 
@@ -122,6 +122,27 @@ def _cosmo_toolchain_bin() -> str:
     return str((COSMO_TOOLCHAIN / "bin").resolve())
 
 
+def _musl_toolchain_paths(work_dir: Optional[Path] = None) -> list[str]:
+    """Return the paths that must be unveiled read-execute for the vendored
+    musl cross-toolchain to run: the toolchain tree itself (its cross
+    compilers read headers/libs/specs from it) and the busybox binary (used
+    as a non-preserving `mv` by build tools).
+    """
+    return [
+        str(MUSL_TOOLCHAIN.resolve()),
+        str(BUSYBOX_BIN.resolve()),
+    ]
+
+
+def _musl_toolchain_bin() -> str:
+    """Return the vendored musl toolchain's bin directory.
+
+    Prepended to PATH for cross-compile commands so the cross tools (and the
+    busybox `mv` symlink) resolve ahead of any host equivalents.
+    """
+    return str((MUSL_TOOLCHAIN / "bin").resolve())
+
+
 COMMANDS = {
     "git": {
         "binary": "/usr/bin/git",
@@ -178,6 +199,39 @@ COMMANDS = {
         "description": "Alias for cosmocc (Cosmopolitan C/C++ compiler)",
         "extra_unveil_rx": _cosmo_toolchain_paths,
         "path_prefix": _cosmo_toolchain_bin,
+    },
+    "musl-gcc": {
+        "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-gcc.br_real").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
+        "description": (
+            "x86_64 musl cross C compiler (vendored Bootlin toolchain). "
+            "Produces statically-linked musl binaries for x86_64. Uses the "
+            ".br_real driver directly (the buildroot toolchain-wrapper "
+            "symlink breaks under the sandbox because argv[0] is resolved)."
+        ),
+        "extra_unveil_rx": _musl_toolchain_paths,
+        "path_prefix": _musl_toolchain_bin,
+    },
+    "musl-cc": {
+        "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-cc.br_real").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
+        "description": "Alias for musl-gcc (x86_64 musl cross C compiler)",
+        "extra_unveil_rx": _musl_toolchain_paths,
+        "path_prefix": _musl_toolchain_bin,
+    },
+    "musl-ld": {
+        "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-ld").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
+        "description": "x86_64 musl cross linker (vendored Bootlin toolchain)",
+        "extra_unveil_rx": _musl_toolchain_paths,
+        "path_prefix": _musl_toolchain_bin,
+    },
+    "musl-ar": {
+        "binary": str((MUSL_TOOLCHAIN / "bin" / "x86_64-buildroot-linux-musl-ar").resolve()),
+        "promises": "stdio rpath wpath cpath proc prot_exec fattr chown",
+        "description": "x86_64 musl cross archiver (vendored Bootlin toolchain)",
+        "extra_unveil_rx": _musl_toolchain_paths,
+        "path_prefix": _musl_toolchain_bin,
     },
     "python3": {
         "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),

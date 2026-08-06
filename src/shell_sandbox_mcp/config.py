@@ -21,6 +21,7 @@ SANDBOX_BIN = REPO_ROOT / "bin" / "sandbox"
 SANDBOX_WRAPPER = REPO_ROOT / "bin" / "run-sandbox"
 BUSYBOX_BIN = REPO_ROOT / "bin" / "busybox"
 COSMO_TOOLCHAIN = REPO_ROOT / "bin" / "cosmo-toolchain"
+MUSL_TOOLCHAIN = REPO_ROOT / "bin" / "musl-toolchain"
 DEFAULT_ALLOWED_DIRS = [
     str(Path.home() / "projects"),
     "/tmp",
