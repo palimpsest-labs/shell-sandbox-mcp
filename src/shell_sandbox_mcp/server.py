@@ -29,7 +29,7 @@ from mcp.server.fastmcp import FastMCP
 class Redirect:
     """A parsed shell redirect operator extracted from a command segment."""
     fd: int                                  # 0 (stdin), 1 (stdout), or 2 (stderr)
-    op: Literal[">", ">>", ">&", "<<", "<<<", "<<-"]
+    op: Literal[">", ">>", ">&", "<", "<<", "<<<", "<<-"]
     target_path: Optional[str] = None        # resolved absolute path (None for ">&")
     target_fd: Optional[int] = None          # source fd for ">&" (1 or 2); else None
     raw_target: Optional[str] = None         # user-typed target (for messages)
@@ -50,6 +50,9 @@ DEFAULT_ALLOWED_DIRS = [
     str(Path.home() / "projects"),
     "/tmp",
 ]
+# Redirect targets may live inside the working directory OR under these extra
+# roots (e.g. /tmp). Used by _validate_redirect_paths.
+EXTRA_REDIRECT_ROOTS = [Path("/tmp").resolve()]
 DEFAULT_TIMEOUT = 30
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 1_000_000  # 1 MB
@@ -394,6 +397,27 @@ def _contained_path(cmd_name: str, work_dir: Path) -> Optional[Path]:
     except (ValueError, OSError):
         return None
     return candidate
+
+
+def _contained_in_any(target: str, roots: list[Path]) -> Optional[Path]:
+    """Resolve target against the first root that contains it; else None.
+
+    The first root (the working directory) is tried first for all targets.
+    Extra roots (e.g. /tmp) are only consulted for absolute targets — a
+    *relative* target is always relative to the working directory, so if it
+    escapes the work dir it must not be re-interpreted against another root
+    (that would let a work-dir symlink escape by "resolving" under /tmp).
+    """
+    cand = _contained_path(target, roots[0])
+    if cand is not None:
+        return cand
+    if not Path(target).expanduser().is_absolute():
+        return None
+    for root in roots[1:]:
+        cand = _contained_path(target, root)
+        if cand is not None:
+            return cand
+    return None
 
 
 def _binary_still_contained(binary: str, work_dir: Path) -> bool:
@@ -776,7 +800,15 @@ def _extract_redirects(
             redirects.append(Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target=t))
             continue
         if rem.startswith('<'):
-            return [], [], "Input redirects are not supported"
+            i += 1
+            t = _read_redirect_target()
+            if t is None:
+                return [], [], "Input redirect missing target file"
+            for r in redirects:
+                if r.fd == 0:
+                    return [], [], "Multiple stdin redirects in one segment"
+            redirects.append(Redirect(fd=0, op='<', target_path=None, target_fd=None, raw_target=t))
+            continue
 
         # -- digit + >  patterns that aren't the allowed 1> / 2> → error --
         if len(rem) >= 2 and rem[0].isdigit() and rem[1] == '>':
@@ -799,19 +831,20 @@ def _validate_redirect_paths(
 ) -> tuple[list[Redirect], Optional[str]]:
     """Resolve and validate the paths in a list of redirects.
 
-    For each ``>`` / ``>>`` redirect, resolves ``raw_target`` against
-    ``work_dir`` via :func:`_contained_path`.  Returns the updated list
-    (with ``target_path`` populated) or ``([], error_msg)`` if a target
-    escapes the working directory.  ``>&`` redirects pass through unchanged.
+    For each ``>`` / ``>>`` / ``<`` redirect, resolves ``raw_target`` against
+    ``work_dir`` (or an extra redirect root such as /tmp) via
+    :func:`_contained_in_any`.  Returns the updated list (with ``target_path``
+    populated) or ``([], error_msg)`` if a target escapes all allowed roots.
+    ``>&`` redirects pass through unchanged.
     """
     from dataclasses import replace
 
     validated: list[Redirect] = []
     for r in redirects:
-        if r.op in (">", ">>"):
-            cand = _contained_path(r.raw_target, work_dir)
+        if r.op in (">", ">>", "<"):
+            cand = _contained_in_any(r.raw_target, [work_dir, *EXTRA_REDIRECT_ROOTS])
             if cand is None:
-                return [], f"Redirect target escapes working directory: {r.raw_target}"
+                return [], f"Redirect target escapes allowed roots: {r.raw_target}"
             validated.append(replace(r, target_path=str(cand)))
         else:
             validated.append(r)
@@ -944,11 +977,13 @@ def _resolve_fd_targets(
     """Apply redirects in order (last-wins per fd) and return fd targets.
 
     Returns ``(stdout_target, stderr_target, files_to_close, report_lines,
-    shared_pipe_read_fd, stdin_bytes)`` where ``shared_pipe_read_fd`` is
-    ``None`` unless a ``1>&2`` (or ``2>&1`` when ``snapshot_2gt1``) redirect
-    forced creation of a shared pipe (when the source fd is
-    ``subprocess.PIPE``).  ``stdin_bytes`` is ``None`` unless a heredoc/
-    here-string redirect was provided.
+    shared_pipe_read_fd, stdin_bytes, stdin_file)`` where
+    ``shared_pipe_read_fd`` is ``None`` unless a ``1>&2`` (or ``2>&1`` when
+    ``snapshot_2gt1``) redirect forced creation of a shared pipe (when the
+    source fd is ``subprocess.PIPE``).  ``stdin_bytes`` is ``None`` unless a
+    heredoc/here-string redirect was provided; ``stdin_file`` is ``None``
+    unless a ``< file`` input redirect was provided (an open binary file
+    object).
 
     ``snapshot_2gt1=False`` is used for intermediate pipeline stages, where
     a ``2>&1`` must merge stderr into the existing stdout pipe (so a later
@@ -961,12 +996,25 @@ def _resolve_fd_targets(
     report_lines: list[str] = []
     shared_pipe_read_fd = None
     stdin_bytes: Optional[bytes] = None
+    stdin_file: Optional[object] = None
 
     for r in redirects:
-        if r.op in ("<<", "<<-", "<<<"):
+        if r.op == "<":
+            if stdin_file is not None or stdin_bytes is not None:
+                raise ValueError("Multiple stdin redirects in one segment")
+            try:
+                fd = os.open(r.target_path, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                raise ValueError(f"Input redirect file not found: {r.raw_target}")
+            except OSError as e:
+                raise ValueError(f"Cannot open input redirect {r.raw_target}: {e}")
+            stdin_file = os.fdopen(fd, "rb")
+            files_to_close.append(stdin_file)
+            report_lines.append(f"[stdin <- {r.raw_target}]")
+        elif r.op in ("<<", "<<-", "<<<"):
             # Heredoc / here-string: only one stdin redirect per segment
             # (already enforced in _extract_redirects).
-            if stdin_bytes is not None:
+            if stdin_bytes is not None or stdin_file is not None:
                 raise ValueError("Multiple stdin redirects in one segment")
             stdin_bytes = (r.body or "").encode("utf-8")
             if r.op == "<<<":
@@ -1034,7 +1082,7 @@ def _resolve_fd_targets(
 
     return (
         stdout_target, stderr_target, files_to_close, report_lines,
-        shared_pipe_read_fd, stdin_bytes,
+        shared_pipe_read_fd, stdin_bytes, stdin_file,
     )
 
 
@@ -1064,7 +1112,7 @@ def _run_segment_core(
         return 1, msg.encode("utf-8", errors="replace"), b"", []
 
     try:
-        stdout_t, stderr_t, to_close, report, shared_read_fd, stdin_bytes = (
+        stdout_t, stderr_t, to_close, report, shared_read_fd, stdin_bytes, stdin_file = (
             _resolve_fd_targets(
                 redirects, subprocess.PIPE, subprocess.PIPE,
             )
@@ -1076,15 +1124,12 @@ def _run_segment_core(
         to_close.append(shared_read_fd)
 
     try:
-        result = subprocess.run(
-            sandbox_args,
-            stdout=stdout_t,
-            stderr=stderr_t,
-            input=stdin_bytes,
-            timeout=timeout,
-            cwd=str(work_dir),
-            env=env,
-        )
+        run_kwargs = dict(stdout=stdout_t, stderr=stderr_t, timeout=timeout, cwd=str(work_dir), env=env)
+        if stdin_file is not None:
+            run_kwargs["stdin"] = stdin_file
+        elif stdin_bytes is not None:
+            run_kwargs["input"] = stdin_bytes
+        result = subprocess.run(sandbox_args, **run_kwargs)
 
         stdout_bytes = result.stdout if result.stdout is not None else b""
         stderr_bytes = result.stderr if result.stderr is not None else b""
@@ -1179,13 +1224,13 @@ def _run_pipeline_core(
         if cfg.get("is_local_binary") and not _binary_still_contained(binary, work_dir):
             msg = f"Local binary no longer valid inside working directory: {binary}"
             return 1, msg.encode(), b"", []
-        # Reject heredoc/here-string on non-first pipeline stages
+        # Reject heredoc/here-string/input-redirect on non-first pipeline stages
         if i > 0:
             for r in redirects:
                 if r.fd == 0:
                     return 1, (
-                        f"heredoc/here-string not allowed on non-first "
-                        f"pipeline stage: {seg}"
+                        f"heredoc/here-string/input-redirect not allowed on "
+                        f"non-first pipeline stage: {seg}"
                     ).encode(), b"", []
         invocations.append((sandbox_args, env, redirects))
 
@@ -1208,10 +1253,11 @@ def _run_pipeline_core(
     all_report: list[list[str]] = []
     last_shared_read_fd = None
     first_stdin_bytes: Optional[bytes] = None
+    first_stdin_file: Optional[object] = None
     try:
         for i, (_sa, _env, redirects) in enumerate(invocations):
             is_last = i == len(invocations) - 1
-            st, et, tc, rpt, srf, stdin_b = _resolve_fd_targets(
+            st, et, tc, rpt, srf, stdin_b, stdin_f = _resolve_fd_targets(
                 redirects, subprocess.PIPE, subprocess.PIPE,
                 snapshot_2gt1=is_last,
             )
@@ -1221,8 +1267,11 @@ def _run_pipeline_core(
             all_report.append(rpt)
             if is_last:
                 last_shared_read_fd = srf
-            if i == 0 and stdin_b is not None:
-                first_stdin_bytes = stdin_b
+            if i == 0:
+                if stdin_b is not None:
+                    first_stdin_bytes = stdin_b
+                if stdin_f is not None:
+                    first_stdin_file = stdin_f
     except (OSError, ValueError) as e:
         for fh in all_to_close:
             try:
@@ -1240,6 +1289,8 @@ def _run_pipeline_core(
             # Determine stdin for this stage
             if prev is not None:
                 stage_stdin = prev.stdout
+            elif i == 0 and first_stdin_file is not None:
+                stage_stdin = first_stdin_file
             elif i == 0 and first_stdin_bytes is not None:
                 stage_stdin = subprocess.PIPE
             else:
@@ -1895,14 +1946,14 @@ def _run_background(
             return 1, binary  # error message
         if cfg.get("is_local_binary") and not _binary_still_contained(binary, work_dir):
             return 1, f"Local binary no longer valid inside working directory: {binary}"
-        # Reject heredoc/here-string on non-first pipeline stages (matches
-        # _run_pipeline_core).
+        # Reject heredoc/here-string/input-redirect on non-first pipeline stages
+        # (matches _run_pipeline_core).
         if i > 0:
             for r in redirects:
                 if r.fd == 0:
                     return 1, (
-                        f"heredoc/here-string not allowed on non-first "
-                        f"pipeline stage: {seg}"
+                        f"heredoc/here-string/input-redirect not allowed on "
+                        f"non-first pipeline stage: {seg}"
                     )
         invocations.append((sandbox_args, env, redirects))
 
@@ -1932,12 +1983,13 @@ def _run_background(
     all_report: list[list[str]] = []
     log_opened = False
     log_fh = None
+    first_stdin_file: Optional[object] = None
     try:
         for i, (_sa, _env, redirects) in enumerate(invocations):
             is_last = i == len(invocations) - 1
             def_stdout = LOG_SENTINEL if is_last else subprocess.PIPE
             def_stderr = LOG_SENTINEL if is_last else subprocess.PIPE
-            st, et, tc, rpt, _srf, _stdin_b = _resolve_fd_targets(
+            st, et, tc, rpt, _srf, _stdin_b, stdin_f = _resolve_fd_targets(
                 redirects, def_stdout, def_stderr, snapshot_2gt1=is_last,
             )
             if is_last:
@@ -1956,6 +2008,8 @@ def _run_background(
             stderr_targets.append(et)
             all_to_close.extend(tc)
             all_report.append(rpt)
+            if i == 0 and stdin_f is not None:
+                first_stdin_file = stdin_f
     except OSError as e:
         for fh in all_to_close:
             try:
@@ -1968,9 +2022,15 @@ def _run_background(
     prev: Optional[subprocess.Popen] = None
     try:
         for i, (sandbox_args, env, _redirects) in enumerate(invocations):
+            if prev is not None:
+                stage_stdin = prev.stdout
+            elif i == 0 and first_stdin_file is not None:
+                stage_stdin = first_stdin_file
+            else:
+                stage_stdin = None
             p = subprocess.Popen(
                 sandbox_args,
-                stdin=prev.stdout if prev is not None else None,
+                stdin=stage_stdin,
                 stdout=stdout_targets[i],
                 stderr=stderr_targets[i],
                 cwd=str(work_dir),
@@ -2051,13 +2111,14 @@ def shell_run(
     runs (like `;`). `&&`/`||` short-circuit is still honoured before a
     backgrounded pipeline is launched.
 
-    Redirects (``>``, ``>>``, ``2>``, ``2>>``, ``2>&1``, ``1>&2``) are supported
-    per command segment. Redirect targets must stay inside the working
-    directory. Quoted operators (``echo ">"``) are treated as literal
-    arguments, not redirects. Only output redirects are supported; input
-    redirects (``<``, ``<<``) are rejected. Redirecting stdout of an
-    intermediate pipe stage is rejected (stderr redirects and ``2>&1`` are
-    allowed on intermediate stages).
+    Redirects (``>``, ``>>``, ``2>``, ``2>>``, ``2>&1``, ``1>&2``, ``<``) are
+    supported per command segment. Redirect targets must stay inside the
+    working directory or under /tmp. Quoted operators (``echo ">"``) are
+    treated as literal arguments, not redirects. Output redirects and input
+    redirects (``< file``) are supported; heredocs (``<<``, ``<<-``, ``<<<``)
+    feed stdin. Redirect targets must stay inside the working directory or
+    under /tmp. Redirecting stdout of an intermediate pipe stage is rejected
+    (stderr redirects and ``2>&1`` are allowed on intermediate stages).
 
     Heredocs (``<<EOF``, ``<<'EOF'``, ``<<-EOF``) and here-strings
     (``<<<'literal'``) feed literal text to the command's stdin.
@@ -2168,8 +2229,9 @@ def shell_list() -> str:
     lines.append("    only after failure, ';' always. '&' backgrounds a pipeline")
     lines.append("    and returns immediately with the PID and log path. Pipes ('|')")
     lines.append("    are supported: each stage's stdout feeds the next stage's stdin.")
-    lines.append("    Redirects (>, >>, 2>, 2>>, 2>&1, 1>&2) are supported per segment;")
-    lines.append("    targets must stay inside the working directory. Quoted operators")
+    lines.append("    Redirects (>, >>, 2>, 2>>, 2>&1, 1>&2, <) are supported per")
+    lines.append("    segment; < reads from a file. Targets must stay inside the")
+    lines.append("    working directory or under /tmp. Quoted operators")
     lines.append("    are not treated as redirects. Heredocs (<<, <<-, <<') and")
     lines.append("    here-strings (<<<) feed stdin; command substitution ($(...))")
     lines.append(f"    splices stdout as a single arg (depth {MAX_SUBST_DEPTH}, count")

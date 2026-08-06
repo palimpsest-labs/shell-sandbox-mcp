@@ -924,7 +924,41 @@ class ExtractRedirectsTest(unittest.TestCase):
 
     def test_input_redirect_error(self) -> None:
         args, redirs, err = self._extract("cmd < file")
-        self.assertEqual(err, "Input redirects are not supported")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 0)
+        self.assertEqual(redirs[0].op, "<")
+        self.assertEqual(redirs[0].raw_target, "file")
+
+    def test_input_redirect_glued(self) -> None:
+        args, redirs, err = self._extract("cmd <file")
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 0)
+        self.assertEqual(redirs[0].op, "<")
+        self.assertEqual(redirs[0].raw_target, "file")
+
+    def test_input_redirect_missing_target(self) -> None:
+        args, redirs, err = self._extract("cmd <")
+        self.assertEqual(err, "Input redirect missing target file")
+
+    def test_input_redirect_then_heredoc_rejected(self) -> None:
+        expansion = Expansion(arg_values={}, heredoc_bodies={"\x01H0\x01": "body\n"})
+        args, redirs, err = server._extract_redirects(
+            "cmd < file << \x01H0\x01", expansion=expansion,
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("Multiple stdin redirects", err)
+
+    def test_heredoc_then_input_rejected(self) -> None:
+        expansion = Expansion(arg_values={}, heredoc_bodies={"\x01H0\x01": "body\n"})
+        args, redirs, err = server._extract_redirects(
+            "cmd << \x01H0\x01 < file", expansion=expansion,
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("Multiple stdin redirects", err)
 
     def test_input_heredoc_error(self) -> None:
         args, redirs, err = self._extract("cmd << EOF")
@@ -983,26 +1017,57 @@ class ValidateRedirectPathsTest(unittest.TestCase):
         redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='../escape')]
         validated, err = server._validate_redirect_paths(redirs, self.root)
         self.assertIsNotNone(err)
-        self.assertIn("escapes working directory", err)
+        self.assertIn("escapes allowed roots", err)
 
     def test_absolute_escape(self) -> None:
         redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='/etc/passwd')]
         validated, err = server._validate_redirect_paths(redirs, self.root)
         self.assertIsNotNone(err)
-        self.assertIn("escapes working directory", err)
+        self.assertIn("escapes allowed roots", err)
 
     def test_symlink_escape(self) -> None:
         (self.root / "evil").symlink_to("/etc")
         redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='evil/hostname')]
         validated, err = server._validate_redirect_paths(redirs, self.root)
         self.assertIsNotNone(err)
-        self.assertIn("escapes working directory", err)
+        self.assertIn("escapes allowed roots", err)
 
     def test_2gt1_passes_through(self) -> None:
         redirs = [server.Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1')]
         validated, err = server._validate_redirect_paths(redirs, self.root)
         self.assertIsNone(err)
         self.assertEqual(validated, redirs)
+
+    def test_input_redirect_in_workdir(self) -> None:
+        (self.root / "in.txt").write_text("data\n")
+        redirs = [server.Redirect(fd=0, op='<', target_path=None, target_fd=None, raw_target='in.txt')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNone(err)
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0].target_path, str((self.root / "in.txt").resolve()))
+
+    def test_input_redirect_under_tmp(self) -> None:
+        redirs = [server.Redirect(fd=0, op='<', target_path=None, target_fd=None, raw_target='/tmp/input-redir-test')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNone(err)
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0].target_path, str(Path("/tmp/input-redir-test").resolve()))
+
+    def test_input_redirect_symlink_escape(self) -> None:
+        # A symlink under /tmp pointing outside /tmp must be rejected.
+        link = Path("/tmp/input-redir-symlink-test")
+        try:
+            link.symlink_to("/etc/passwd")
+            redirs = [server.Redirect(fd=0, op='<', target_path=None, target_fd=None, raw_target=str(link))]
+            validated, err = server._validate_redirect_paths(redirs, self.root)
+            self.assertIsNotNone(err)
+            self.assertIn("escapes allowed roots", err)
+        finally:
+            if link.exists() or link.is_symlink():
+                try:
+                    link.unlink()
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1035,7 +1100,7 @@ class BuildInvocationRedirectTest(unittest.TestCase):
             "echo > ../escape", self.root,
         )
         self.assertIsNotNone(err)
-        self.assertIn("escapes working directory", err)
+        self.assertIn("escapes allowed roots", err)
         self.assertIsNone(binary)
 
     def test_invalid_fd_error(self) -> None:
@@ -1498,6 +1563,48 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("not allowed on non-first", out)
 
+    def test_background_input_redirect_sets_first_stdin(self) -> None:
+        """First-stage < file passes the file object as stdin= on the first Popen."""
+        infile = self.root / "in.txt"
+        infile.write_text("data\n")
+        captured_stdins = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                captured_stdins.append(kwargs.get("stdin"))
+                self.stdout = kwargs.get("stdout")
+                self.stderr = kwargs.get("stderr")
+                self.stdin = kwargs.get("stdin")
+                self.pid = 9999
+
+            def poll(self):
+                return 0
+            def wait(self):
+                return 0
+
+        server.subprocess.Popen = FakePopen
+        server._start_reaper = lambda: None
+
+        def fake_build(command, work_dir, expansion=None):
+            return (
+                str(server.BUSYBOX_BIN.resolve()),
+                [str(server.BUSYBOX_BIN.resolve()), "cat"],
+                None,
+                {},
+                [server.Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile))],
+            )
+
+        server._build_invocation = fake_build
+        rc, out = server._run_background(
+            [f"cat < {infile}"], self.root,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Backgrounded PID", out)
+        # The first (only) stage's stdin must be the open file object.
+        self.assertIsNot(captured_stdins[0], subprocess.PIPE)
+        self.assertIsNotNone(captured_stdins[0])
+        self.assertIn(f"[stdin <- {infile}]", out)
+
 
 # ---------------------------------------------------------------------------
 # Heredoc / here-string / command substitution tests (moved from test_expand.py)
@@ -1632,8 +1739,12 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
 
     def test_bare_lt_still_rejected(self) -> None:
         args, redirs, err = self._extract("cmd < file")
-        self.assertIsNotNone(err)
-        self.assertIn("Input redirects are not supported", err)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["cmd"])
+        self.assertEqual(len(redirs), 1)
+        self.assertEqual(redirs[0].fd, 0)
+        self.assertEqual(redirs[0].op, "<")
+        self.assertEqual(redirs[0].raw_target, "file")
 
     def test_heredoc_body_not_found_error(self) -> None:
         args, redirs, err = self._extract("cat << \x01H99\x01")
@@ -1905,30 +2016,33 @@ class ResolveFdTargetsStdinTest(unittest.TestCase):
     def test_herestring_returns_stdin_bytes(self) -> None:
         redirs = [Redirect(fd=0, op="<<<", body="hello\n")]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        self.assertEqual(len(result), 6)
-        stdout_t, stderr_t, to_close, report, srf, stdin_b = result
+        self.assertEqual(len(result), 7)
+        stdout_t, stderr_t, to_close, report, srf, stdin_b, stdin_f = result
         self.assertEqual(stdin_b, b"hello\n")
+        self.assertIsNone(stdin_f)
         self.assertIn("[stdin <<<]", report)
 
     def test_heredoc_returns_stdin_bytes(self) -> None:
         redirs = [Redirect(fd=0, op="<<", body="line1\nline2\n")]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        _, _, _, report, _, stdin_b = result
+        _, _, _, report, _, stdin_b, stdin_f = result
         self.assertEqual(stdin_b, b"line1\nline2\n")
+        self.assertIsNone(stdin_f)
         self.assertIn("[stdin <<]", report)
 
     def test_heredoc_tab_returns_stdin_bytes(self) -> None:
         redirs = [Redirect(fd=0, op="<<-", body="tabbed\n", strip_tabs=True)]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        _, _, _, report, _, stdin_b = result
+        _, _, _, report, _, stdin_b, _ = result
         self.assertEqual(stdin_b, b"tabbed\n")
         self.assertIn("[stdin <<-]", report)
 
     def test_no_stdin_redirect_returns_none(self) -> None:
         redirs = [Redirect(fd=1, op=">", raw_target="out.txt", target_path="/tmp/out.txt")]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        self.assertEqual(len(result), 6)
+        self.assertEqual(len(result), 7)
         self.assertIsNone(result[5])  # stdin_bytes is None
+        self.assertIsNone(result[6])  # stdin_file is None
 
     def test_multiple_stdin_rejected_by_resolve(self) -> None:
         redirs = [
@@ -1938,6 +2052,40 @@ class ResolveFdTargetsStdinTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
         self.assertIn("Multiple stdin redirects", str(ctx.exception))
+
+    def test_input_redirect_returns_stdin_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            infile = Path(tmp) / "in.txt"
+            infile.write_text("data\n")
+            redirs = [Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile))]
+            result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+            self.assertEqual(len(result), 7)
+            stdout_t, stderr_t, to_close, report, srf, stdin_b, stdin_f = result
+            self.assertIsNone(stdin_b)
+            self.assertIsNotNone(stdin_f)
+            self.assertIn(f"[stdin <- {infile}]", report)
+            self.assertIn(stdin_f, to_close)
+            # Sanity: the file object actually reads the file content.
+            self.assertEqual(stdin_f.read(), b"data\n")
+            stdin_f.close()
+
+    def test_input_redirect_missing_file_raises(self) -> None:
+        redirs = [Redirect(fd=0, op="<", raw_target="nope.txt", target_path="/nonexistent/nope.txt")]
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+        self.assertIn("Input redirect file not found", str(ctx.exception))
+
+    def test_input_redirect_conflicts_with_heredoc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            infile = Path(tmp) / "in.txt"
+            infile.write_text("x\n")
+            redirs = [
+                Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile)),
+                Redirect(fd=0, op="<<", body="x\n"),
+            ]
+            with self.assertRaises(ValueError) as ctx:
+                _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
+            self.assertIn("Multiple stdin redirects", str(ctx.exception))
 
 
 class BuildInvocationHeredocTest(unittest.TestCase):
@@ -2034,6 +2182,41 @@ class RunSegmentCoreStdinTest(unittest.TestCase):
             "echo hi", self.root, 30,
         )
         self.assertIsNone(captured_input[0])
+
+    def test_input_redirect_passes_stdin_file_not_input(self) -> None:
+        import subprocess as _sp
+
+        infile = self.root / "in.txt"
+        infile.write_text("data\n")
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["input"] = kwargs.get("input")
+            captured["stdin"] = kwargs.get("stdin")
+            return _sp.CompletedProcess(args, 0, stdout=b"ok\n", stderr=b"")
+
+        server.subprocess.run = fake_run
+
+        def fake_build(command, work_dir, expansion=None):
+            return (
+                "/usr/bin/cat",
+                ["/usr/bin/cat"],
+                None,
+                {},
+                [Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile))],
+            )
+
+        server._build_invocation = fake_build
+
+        rc, stdout_b, stderr_b, report = _run_segment_core(
+            f"cat < {infile}", self.root, 30,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(stdout_b, b"ok\n")
+        # Input redirect must go via stdin=<file>, NOT input=<bytes>.
+        self.assertIsNone(captured.get("input"))
+        self.assertIsNotNone(captured.get("stdin"))
+        self.assertIn(f"[stdin <- {infile}]", report)
 
 
 class RunPipelineCoreStdinTest(unittest.TestCase):
@@ -2142,6 +2325,99 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
 
         rc, stdout_b, stderr_b, report = _run_pipeline_core(
             ["echo hi", "cat << H0"], self.root, 30,
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn(b"not allowed on non-first", stdout_b)
+
+    def test_input_redirect_on_first_stage_passes_file_stdin(self) -> None:
+        """First-stage < file passes the file object as stdin= (not PIPE)."""
+        infile = self.root / "in.txt"
+        infile.write_text("data\n")
+
+        captured_stdins = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                captured_stdins.append(kwargs.get("stdin"))
+                self.stdin = None
+                self.stdout = _FakePipe()
+                self.stderr = _FakePipe()
+                self.pid = 9999
+                self.returncode = 0
+
+            def poll(self):
+                return 0
+            def wait(self):
+                return 0
+            def communicate(self, timeout=None):
+                return (b"output\n", b"")
+            def kill(self):
+                pass
+
+        class _FakePipe:
+            def close(self):
+                pass
+            def read(self):
+                return b""
+
+        def fake_build(command, work_dir, expansion=None):
+            if "cat" in command:
+                return (
+                    "/usr/bin/cat",
+                    ["/usr/bin/cat"],
+                    None,
+                    {},
+                    [Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile))],
+                )
+            if "grep" in command:
+                return (
+                    "/usr/bin/grep",
+                    ["/usr/bin/grep", "x"],
+                    None,
+                    {},
+                    [],
+                )
+            return (None, None, None, None, [])
+
+        server._build_invocation = fake_build
+        server.subprocess.Popen = FakePopen
+
+        rc, stdout_b, stderr_b, report = _run_pipeline_core(
+            [f"cat < {infile}", "grep x"], self.root, 30,
+        )
+        self.assertEqual(rc, 0)
+        # First stage stdin must be the open file object, not a pipe.
+        self.assertIsNot(captured_stdins[0], subprocess.PIPE)
+        self.assertIsNotNone(captured_stdins[0])
+        # The returned report is the LAST stage's; the first stage's stdin
+        # report line must still have been produced internally (checked by
+        # the file-object stdin above).
+
+    def test_input_redirect_on_non_first_stage_rejected(self) -> None:
+        """< file on a non-first stage is rejected like a heredoc."""
+        def fake_build(command, work_dir, expansion=None):
+            if "echo" in command:
+                return (
+                    "/usr/bin/echo",
+                    ["/usr/bin/echo", "hi"],
+                    None,
+                    {},
+                    [],
+                )
+            if "cat" in command:
+                return (
+                    "/usr/bin/cat",
+                    ["/usr/bin/cat"],
+                    None,
+                    {},
+                    [Redirect(fd=0, op="<", raw_target="in.txt", target_path="/tmp/in.txt")],
+                )
+            return (None, None, None, None, [])
+
+        server._build_invocation = fake_build
+
+        rc, stdout_b, stderr_b, report = _run_pipeline_core(
+            ["echo hi", "cat < in.txt"], self.root, 30,
         )
         self.assertEqual(rc, 1)
         self.assertIn(b"not allowed on non-first", stdout_b)
