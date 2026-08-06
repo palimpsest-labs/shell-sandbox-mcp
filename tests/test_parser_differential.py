@@ -547,11 +547,18 @@ class DifferentialExpandCommandTest(unittest.TestCase):
         self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
 
 
+@unittest.skip("tautological post-A1: both string and AST paths now route through _build_ast")
 class DifferentialASTParityTest(unittest.TestCase):
     """Every extract_redirects test runs through BOTH the string path and
     the AST path, asserting identical (args, redirects, err).  This catches
     regressions like the 2>&1x silent-backgrounding bug (BLOCKER) where the
-    lexer/parser diverged from the string path."""
+    lexer/parser diverged from the string path.
+
+    Post-A1: both paths now project through ``_build_ast``, making the
+    cross-validation tautological.  The projection is still covered by
+    ``DifferentialSplitCommandTest``, ``DifferentialExtractRedirectsTest``,
+    and the primary suite in ``test_sandbox.py``.
+    """
 
     # ------------------------------------------------------------------
     # helpers

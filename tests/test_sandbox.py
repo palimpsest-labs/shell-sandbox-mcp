@@ -1980,14 +1980,18 @@ class CaptureStdoutTest(unittest.TestCase):
 
     def _stub_segment(self, mapping: dict[str, tuple[int, bytes, bytes, list]]) -> None:
         def fake(command, work_dir, timeout, expansion=None):
-            if command in mapping:
-                return mapping[command]
+            key = command if isinstance(command, str) else server._serialize_command(command)
+            if key in mapping:
+                return mapping[key]
             return (0, b"", b"", [])
         server._run_segment_core = fake
 
     def _stub_pipeline(self, mapping: dict[tuple, tuple[int, bytes, bytes, list]]) -> None:
         def fake(segments, work_dir, timeout, expansion=None):
-            key = tuple(segments)
+            key = tuple(
+                s if isinstance(s, str) else server._serialize_command(s)
+                for s in segments
+            )
             if key in mapping:
                 return mapping[key]
             return (0, b"", b"", [])

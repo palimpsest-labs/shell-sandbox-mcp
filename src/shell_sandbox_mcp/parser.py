@@ -143,7 +143,15 @@ class WordPart:
         return self.is_sentinel and "\x01H" in self.text
 
     def serialized(self) -> str:
-        """Return the text for use in serialize_program."""
+        """Return the text for use in serialize_program (sentinel form)."""
+        if self.is_sentinel:
+            return self.text
+        return self.raw if self.raw else self.text
+
+    def display_serialized(self) -> str:
+        """Return the human-readable form for error/display output."""
+        if self.is_sentinel:
+            return self.raw
         return self.raw if self.raw else self.text
 
 
@@ -159,6 +167,9 @@ class Word:
     def serialized(self) -> str:
         return "".join(p.serialized() for p in self.parts)
 
+    def display_serialized(self) -> str:
+        return "".join(p.display_serialized() for p in self.parts)
+
 
 @dataclass(frozen=True)
 class RedirectSpec:
@@ -168,6 +179,7 @@ class RedirectSpec:
     target: Word               # the target word (may be a sentinel)
     strip_tabs: bool = False
     raw_operator: str = ""     # e.g. "2>&1" or "1>&2" or ">" or ">>"
+    glued_target: bool = False # True when target was adjacent to operator (e.g. 2>err)
 
 
 @dataclass(frozen=True)
@@ -213,11 +225,12 @@ class Lexer:
     ``ParseError`` immediately, but only when appearing *outside* quotes.
     """
 
-    def __init__(self, command: str):
+    def __init__(self, command: str, *, replay_mode: bool = False):
         self._cmd = command
         self._n = len(command)
         self._pos = 0
         self._tokens: list[Token] = []
+        self._replay_mode = replay_mode
 
     def tokenize(self) -> list[Token]:
         """Run the lexer and return the token list."""
@@ -468,7 +481,8 @@ class Lexer:
                 # double quote: read until closing ", handle escapes
                 dq_start = i
                 i += 1
-                while i < self._n and self._cmd[i] != '"':
+                paren_depth = 0  # track $(...) nesting inside dq
+                while i < self._n:
                     ch = self._cmd[i]
                     if ch == '\\' and i + 1 < self._n:
                         nxt = self._cmd[i + 1]
@@ -478,6 +492,14 @@ class Lexer:
                             i += 2  # line continuation
                         else:
                             i += 2  # \X stays literal inside double quotes
+                    elif ch == '$' and i + 1 < self._n and self._cmd[i + 1] == '(':
+                        paren_depth += 1
+                        i += 1  # skip $
+                    elif ch == ')' and paren_depth > 0:
+                        paren_depth -= 1
+                        i += 1
+                    elif ch == '"' and paren_depth == 0:
+                        break  # closing quote (not inside $())
                     else:
                         i += 1
                 if i < self._n:
@@ -578,6 +600,7 @@ class Lexer:
         # read the target word (quote-aware, stop at newline)
         chars: list[str] = []
         quote: Optional[str] = None
+        quoted_delim = False
         while self._pos < self._n:
             c = self._cmd[self._pos]
             if quote is not None:
@@ -586,6 +609,8 @@ class Lexer:
                     quote = None
                 self._pos += 1
             elif c in ("'", '"'):
+                if c == "'":
+                    quoted_delim = True  # single-quoted word → literal
                 quote = c
                 chars.append(c)
                 self._pos += 1
@@ -599,6 +624,7 @@ class Lexer:
         self._tokens.append(Token(
             TokenKind.R_HERESTRING, '<<<', start,
             fd=0, body=raw_target,
+            quoted_delim=quoted_delim,
         ))
 
     # ------------------------------------------------------------------
@@ -617,6 +643,7 @@ class Lexer:
             self._pos += 1
 
         # read delimiter (quote-aware, backslash-aware)
+        delim_start = self._pos  # saved for sentinel-shortcut rewind
         delim_chars: list[str] = []
         dq: Optional[str] = None
         quoted = False
@@ -646,6 +673,24 @@ class Lexer:
 
         raw_delim = "".join(delim_chars)
         delimiter = _strip_quotes(raw_delim)
+
+        # --- sentinel-delimiter shortcut ---
+        # When the delimiter is a sentinel (e.g. \x01H0\x01) the body has
+        # already been extracted and stored in the Expansion side table.
+        # Rewind so the sentinel text is re-lexed as a plain WORD token,
+        # allowing _build_redirect_spec to detect and reuse the original ID.
+        # ONLY in replay mode — in populate mode a literal \x01H<N>\x01
+        # delimiter is a real user-typed delimiter whose body must be
+        # collected normally.
+        if self._replay_mode and SENTINEL_HD.fullmatch(delimiter):
+            self._tokens.append(Token(
+                TokenKind.R_HEREDOC_STRIP if strip_tabs else TokenKind.R_HEREDOC,
+                op_text, start, fd=0,
+                quoted_delim=quoted, strip_tabs=strip_tabs,
+                body=None,
+            ))
+            self._pos = delim_start  # rewind so sentinel is re-lexed as WORD
+            return
 
         # Skip to end of current line
         while self._pos < self._n and self._cmd[self._pos] != '\n':
@@ -700,24 +745,110 @@ class Lexer:
 
 
 # ---------------------------------------------------------------------------
+# _detect_sentinels_in_text — split plain text into WordParts with sentinel
+#   detection (needed for replay-mode AST construction from cleaned segments)
+# ---------------------------------------------------------------------------
+
+
+def _detect_sentinels_in_text(text: str) -> list[WordPart]:
+    """Split *text* into WordParts, marking ``\\x01A<N>\\x01`` and
+    ``\\x01H<N>\\x01`` patterns as ``is_sentinel=True`` so that the
+    downstream :func:`_extract_from_node` can resolve them from the
+    :class:`Expansion` side table."""
+    parts: list[WordPart] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        m_arg = SENTINEL_ARG.match(text, i)
+        m_hd = SENTINEL_HD.match(text, i)
+        if m_arg:
+            sentinel = m_arg.group(0)
+            parts.append(WordPart(text=sentinel, raw=sentinel, is_sentinel=True))
+            i = m_arg.end()
+        elif m_hd:
+            sentinel = m_hd.group(0)
+            parts.append(WordPart(text=sentinel, raw=sentinel, is_sentinel=True))
+            i = m_hd.end()
+        else:
+            j = i
+            while j < n and text[j] != '\x01':
+                j += 1
+            if j > i:
+                chunk = text[i:j]
+                parts.append(WordPart(text=chunk, raw=chunk))
+            elif j < n:
+                # At \x01 but not a valid sentinel — treat as literal byte
+                parts.append(WordPart(text='\x01', raw='\x01'))
+                j += 1
+            i = j
+    return parts
+
+
+# ---------------------------------------------------------------------------
 # AST builder — builds AST from tokens + pre-populated expansion
 # ---------------------------------------------------------------------------
 
 def _build_ast(
     tokens: list[Token],
     expansion: Expansion,
+    *,
+    capture_fn=None,
+    env=None,
+    depth: int = 0,
+    subst_count=None,
+    deadline=None,
 ) -> ProgramNode:
-    """Build an AST from the token stream using the already-populated expansion.
+    """Build an AST from the token stream.
 
-    The expansion table is pre-populated by the char-by-char scanner in
-    ``parse_command``.  This function assigns matching sentinel IDs by
-    walking tokens in the same left-to-right order as the scanner, so
-    arg sentinel IDs and heredoc sentinel IDs match the expansion keys.
+    Two modes:
+
+    - **replay mode** (*capture_fn* is None): assigns sentinel IDs in
+      left-to-right token order, expecting *expansion* to already be
+      pre-populated by the char-by-char scanner.  (Today's behaviour.)
+
+    - **populate mode** (*capture_fn* is not None): performs ``$()``
+      capture, ``$VAR``/``${VAR}`` expansion, and heredoc/here-string
+      body resolution itself and stores the results directly into
+      *expansion*.
     """
     pos = 0
     n = len(tokens)
     next_arg_id = 0
     next_hd_id = 0
+
+    if subst_count is None:
+        subst_count = [0]
+
+    def _emit_arg_sentinel(raw_src: str, name: str, *, is_subst: bool) -> str:
+        """Assign the next arg-sentinel ID and, in populate mode, resolve the value.
+
+        *raw_src* is the source text span (for SUBST the inner text, for
+        VARREF the ``$VAR``/``${VAR}`` text).  *name* is the lookup key:
+        the inner text for ``$(…)`` or the bare variable name for ``$VAR``.
+        """
+        nonlocal next_arg_id
+        sentinel = f"\x01A{next_arg_id}\x01"
+        next_arg_id += 1
+
+        if capture_fn is not None:                      # populate mode
+            if is_subst:
+                if depth + 1 > MAX_SUBST_DEPTH:
+                    raise ValueError(
+                        f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
+                    )
+                subst_count[0] += 1
+                if subst_count[0] > MAX_SUBST_COUNT:
+                    raise ValueError(
+                        f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
+                    )
+                _rc, stdout_bytes = capture_fn(name)
+                value: str = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
+                value = value[:MAX_SUBST_OUTPUT]
+            else:
+                value = env.get(name, "") if env else ""
+            expansion.arg_values[sentinel] = value
+
+        return sentinel
 
     def _peek() -> Optional[Token]:
         if pos < n:
@@ -740,20 +871,25 @@ def _build_ast(
             else:
                 break
 
-    def _split_word_parts(raw: str, next_arg_id: Optional[list[int]] = None) -> list[WordPart]:
+    def _split_word_parts(raw: str) -> list[WordPart]:
         """Split a raw word token value into WordParts with quote stripping.
 
-        When *next_arg_id* is provided (a single-element list), ``$(...)``
-        inside double-quoted spans is detected and emitted as a SUBST
-        ``WordPart`` with an assigned sentinel ID.  Single-quoted spans
-        stay fully literal regardless.
+        ``$(...)``, ``$VAR``, and ``${VAR}`` inside double-quoted spans are
+        detected and emitted as sentinel ``WordPart`` entries via
+        :func:`_emit_arg_sentinel`.  Single-quoted spans stay fully literal.
         """
         parts: list[WordPart] = []
         i, n2 = 0, len(raw)
 
-        # Quick path: no quotes and no $ (no sentinels needed)
+        # Quick path: no quotes and no $ (no substitution sentinels needed).
+        # But sentinel patterns (\x01A<N>\x01, \x01H<N>\x01) may appear in
+        # cleaned segments that have already been through expansion.
+        # Only detect them in replay mode (capture_fn is None).
         if '"' not in raw and "'" not in raw and '$' not in raw:
-            parts.append(WordPart(text=raw, raw=raw))
+            if '\x01' in raw and capture_fn is None:
+                parts.extend(_detect_sentinels_in_text(raw))
+            else:
+                parts.append(WordPart(text=raw, raw=raw))
             return parts
 
         current_text: list[str] = []
@@ -805,8 +941,7 @@ def _build_ast(
                             current_raw.append(nxt)
                             i += 2
                     # Detect $( ... ) inside double quotes
-                    elif (ch == '$' and i + 1 < n2 and raw[i + 1] == '('
-                          and next_arg_id is not None):
+                    elif ch == '$' and i + 1 < n2 and raw[i + 1] == '(':
                         # Check for $(( arithmetic (reject)
                         if i + 2 < n2 and raw[i + 2] == '(':
                             raise ParseError(
@@ -833,9 +968,7 @@ def _build_ast(
                             raise ValueError("Unbalanced $( ... )")
                         inner_text = raw[i + 2 : j - 1]
                         raw_subst = raw[i:j]  # "$(inner)"
-                        aid = next_arg_id[0]
-                        next_arg_id[0] += 1
-                        sentinel = f"\x01A{aid}\x01"
+                        sentinel = _emit_arg_sentinel(inner_text, inner_text, is_subst=True)
                         wp = WordPart(
                             text=sentinel, raw=raw_subst,
                             is_sentinel=True, is_quoted=True,
@@ -843,17 +976,15 @@ def _build_ast(
                         parts.append(wp)
                         i = j
                     # Detect $VAR / ${VAR} inside double quotes
-                    elif (ch == '$' and i + 1 < n2 and next_arg_id is not None
-                          and raw[i + 1] != '('):
+                    elif ch == '$' and raw[i + 1] != '(':
                         nxt2 = raw[i + 1]
                         if nxt2 == '{' and _BRACED_VAR_RE.match(raw[i:]):
                             flush()
                             m = _BRACED_VAR_RE.match(raw[i:])
                             assert m is not None
                             raw_subst = m.group(0)
-                            aid = next_arg_id[0]
-                            next_arg_id[0] += 1
-                            sentinel = f"\x01A{aid}\x01"
+                            var_name = raw_subst[2:-1]  # strip ${ and }
+                            sentinel = _emit_arg_sentinel(raw_subst, var_name, is_subst=False)
                             wp = WordPart(
                                 text=sentinel, raw=raw_subst,
                                 is_sentinel=True, is_quoted=True,
@@ -866,9 +997,7 @@ def _build_ast(
                             assert m is not None
                             var_name = m.group(0)
                             raw_subst = raw[i:i + 1 + len(var_name)]
-                            aid = next_arg_id[0]
-                            next_arg_id[0] += 1
-                            sentinel = f"\x01A{aid}\x01"
+                            sentinel = _emit_arg_sentinel(raw_subst, var_name, is_subst=False)
                             wp = WordPart(
                                 text=sentinel, raw=raw_subst,
                                 is_sentinel=True, is_quoted=True,
@@ -880,6 +1009,31 @@ def _build_ast(
                             current_raw.append(ch)
                             i += 1
                     else:
+                        # Check for sentinel patterns inside double quotes
+                        # ONLY in replay mode (capture_fn is None).
+                        if ch == '\x01' and capture_fn is None:
+                            m_arg = SENTINEL_ARG.match(raw, i)
+                            m_hd = SENTINEL_HD.match(raw, i)
+                            if m_arg:
+                                flush()
+                                raw_match = m_arg.group(0)
+                                wp = WordPart(
+                                    text=raw_match, raw=raw_match,
+                                    is_sentinel=True, is_quoted=True,
+                                )
+                                parts.append(wp)
+                                i = m_arg.end()
+                                continue
+                            elif m_hd:
+                                flush()
+                                raw_match = m_hd.group(0)
+                                wp = WordPart(
+                                    text=raw_match, raw=raw_match,
+                                    is_sentinel=True, is_quoted=True,
+                                )
+                                parts.append(wp)
+                                i = m_hd.end()
+                                continue
                         current_text.append(ch)
                         current_raw.append(ch)
                         i += 1
@@ -896,6 +1050,17 @@ def _build_ast(
                 current_raw.append('$')
                 i += 2
                 continue
+
+            # Check for sentinel patterns in unquoted text
+            # ONLY in replay mode (capture_fn is None).
+            if c == '\x01' and capture_fn is None:
+                m_arg = SENTINEL_ARG.match(raw, i)
+                m_hd = SENTINEL_HD.match(raw, i)
+                if m_arg or m_hd:
+                    flush()
+                    parts.extend(_detect_sentinels_in_text(raw[i:]))
+                    i = n2  # consumed everything
+                    continue
 
             current_text.append(c)
             current_raw.append(c)
@@ -964,7 +1129,7 @@ def _build_ast(
         return PipelineNode(commands=tuple(commands))
 
     def _parse_command() -> Optional[CommandNode]:
-        nonlocal pos, next_arg_id, next_hd_id
+        nonlocal pos
         words: list[Word] = []
         redirects: list[RedirectSpec] = []
         current_parts: list[WordPart] = []
@@ -1000,9 +1165,8 @@ def _build_ast(
             if kind == TokenKind.SUBST:
                 if ws_seen and current_parts:
                     _flush_word()
-                _consume()
-                sentinel = f"\x01A{next_arg_id}\x01"
-                next_arg_id += 1
+                tok = _consume()
+                sentinel = _emit_arg_sentinel(tok.value, tok.value, is_subst=True)
                 wp = WordPart(text=sentinel, raw=sentinel, is_sentinel=True)
                 current_parts.append(wp)
                 continue
@@ -1011,9 +1175,8 @@ def _build_ast(
             if kind == TokenKind.VARREF:
                 if ws_seen and current_parts:
                     _flush_word()
-                _consume()
-                sentinel = f"\x01A{next_arg_id}\x01"
-                next_arg_id += 1
+                tok = _consume()
+                sentinel = _emit_arg_sentinel("$" + tok.value, tok.value, is_subst=False)
                 wp = WordPart(text=sentinel, raw=sentinel, is_sentinel=True)
                 current_parts.append(wp)
                 continue
@@ -1034,10 +1197,8 @@ def _build_ast(
             if kind == TokenKind.WORD:
                 if ws_seen and current_parts:
                     _flush_word()
-                _consume()
-                nid = [next_arg_id]
-                parts = _split_word_parts(t.value, nid)
-                next_arg_id = nid[0]
+                tok = _consume()
+                parts = _split_word_parts(tok.value)
                 current_parts.extend(parts)
                 continue
 
@@ -1055,7 +1216,7 @@ def _build_ast(
         )
 
     def _build_redirect_spec(tok: Token) -> Optional[RedirectSpec]:
-        nonlocal pos, next_hd_id, next_arg_id
+        nonlocal pos, next_hd_id
 
         kind = tok.kind
 
@@ -1072,10 +1233,66 @@ def _build_ast(
         # heredoc / here-string
         if kind in (TokenKind.R_HEREDOC, TokenKind.R_HEREDOC_STRIP,
                      TokenKind.R_HERESTRING):
-            sentinel = f"\x01H{next_hd_id}\x01"
-            next_hd_id += 1
+            # ---------- sentinel-ID reuse (replay mode) ----------
+            # When processing a cleaned segment that already contains
+            # sentinel keys (e.g. \x01H0\x01), reuse the original ID
+            # so the Expansion lookup in _extract_from_node matches.
+            sentinel: Optional[str] = None
+            if kind in (TokenKind.R_HEREDOC, TokenKind.R_HEREDOC_STRIP):
+                if tok.body is None:
+                    # Sentinel shortcut from _lex_heredoc: the next WORD
+                    # token carries the original sentinel text.
+                    _skip_ws()
+                    tgt = _peek()
+                    if tgt is not None and tgt.kind == TokenKind.WORD:
+                        tgt_text = tgt.value
+                        if SENTINEL_HD.fullmatch(tgt_text):
+                            _consume()
+                            sentinel = tgt_text
+            else:  # R_HERESTRING
+                # _lex_herestring stores the target word in tok.body.
+                raw_target = tok.body or ""
+                target = _strip_quotes(raw_target)
+                if target and SENTINEL_HD.fullmatch(target):
+                    sentinel = target
+                elif not target:
+                    # Empty target (e.g. "cmd <<<" with nothing after) —
+                    # create an empty-target RedirectSpec so validation
+                    # produces "Here-string missing target".
+                    return RedirectSpec(
+                        fd=tok.fd, op="<<<",
+                        target=Word(parts=()),
+                        raw_operator=tok.value,
+                    )
+
+            if sentinel is not None:
+                # Reuse — advance next_hd_id past this ID to avoid collisions
+                m = SENTINEL_HD.match(sentinel)
+                assert m is not None
+                hd_id = int(m.group(1))
+                if hd_id >= next_hd_id:
+                    next_hd_id = hd_id + 1
+            else:
+                sentinel = f"\x01H{next_hd_id}\x01"
+                next_hd_id += 1
+
             wp = WordPart(text=sentinel, raw=sentinel, is_sentinel=True)
             target_word = Word(parts=(wp,))
+
+            # ---------- populate mode: compute body ----------
+            if capture_fn is not None:
+                if kind in (TokenKind.R_HEREDOC, TokenKind.R_HEREDOC_STRIP):
+                    body: Optional[str] = tok.body
+                    if body and not tok.quoted_delim:
+                        body = _expand_subst_in_text(body, capture_fn, env=env)
+                    body = body[:MAX_HEREDOC_BODY] if body else ""
+                    expansion.heredoc_bodies[sentinel] = body
+                else:  # R_HERESTRING
+                    body_word = _strip_quotes(tok.body) if tok.body else ""
+                    if body_word and not tok.quoted_delim:
+                        body_word = _expand_subst_in_text(body_word, capture_fn, env=env)
+                    body = (body_word + "\n")[:MAX_HEREDOC_BODY]
+                    expansion.heredoc_bodies[sentinel] = body
 
             op_map = {
                 TokenKind.R_HEREDOC: "<<",
@@ -1098,8 +1315,11 @@ def _build_ast(
         }
         op_str: Literal[">", ">>", "<"] = op_map[kind]  # type: ignore[assignment]
 
-        # Read the target word
+        # Read the target word — detect glued target (no whitespace between
+        # operator and target, e.g. "2>err").
+        saved_pos = pos
         _skip_ws()
+        glued = (pos == saved_pos)  # no WS tokens consumed → glued
         target_tok = _peek()
         if target_tok is None or target_tok.kind != TokenKind.WORD:
             return RedirectSpec(
@@ -1109,9 +1329,8 @@ def _build_ast(
             )
 
         _consume()
-        nid = [next_arg_id]
-        target_parts = _split_word_parts(target_tok.value, nid)
-        next_arg_id = nid[0]
+        target_parts = _split_word_parts(target_tok.value)
+        target_word = Word(parts=tuple(target_parts))
 
         # Resolve $(...) sentinels in the target word
         resolved_parts: list[WordPart] = []
@@ -1124,6 +1343,7 @@ def _build_ast(
             fd=tok.fd, op=op_str,
             target=target_word,
             raw_operator=tok.value,
+            glued_target=glued,
         )
 
     # Parse the program
@@ -1164,15 +1384,36 @@ def serialize_program(program: ProgramNode) -> str:
 
 
 def _serialize_pipeline(pipeline: PipelineNode) -> str:
-    cmd_strs = [_serialize_command(cmd) for cmd in pipeline.commands]
+    """Serialize a pipeline using sentinel form for use in serialize_program."""
+
+    def _ser_cmd(cmd: CommandNode) -> str:
+        output: list[str] = []
+        for w in cmd.words:
+            s = w.serialized()
+            if s:
+                output.append(s)
+        for rs in cmd.redirects:
+            if rs.op == ">&":
+                output.append(rs.raw_operator if rs.raw_operator else ">&")
+            elif rs.op in ("<<", "<<-", "<<<"):
+                op = rs.raw_operator if rs.raw_operator else rs.op
+                output.append(op + " " + rs.target.serialized())
+            else:
+                op = rs.raw_operator if rs.raw_operator else rs.op
+                sep = "" if rs.glued_target else " "
+                output.append(op + sep + rs.target.serialized())
+        return " ".join(output)
+
+    cmd_strs = [_ser_cmd(cmd) for cmd in pipeline.commands]
     return " | ".join(s for s in cmd_strs if s)
 
 
 def _serialize_command(cmd: CommandNode) -> str:
+    """Return a human-readable display string for *cmd*."""
     output: list[str] = []
 
     for w in cmd.words:
-        s = w.serialized()
+        s = w.display_serialized()
         if s:
             output.append(s)
 
@@ -1181,10 +1422,11 @@ def _serialize_command(cmd: CommandNode) -> str:
             output.append(rs.raw_operator if rs.raw_operator else ">&")
         elif rs.op in ("<<", "<<-", "<<<"):
             op = rs.raw_operator if rs.raw_operator else rs.op
-            output.append(op + " " + rs.target.serialized())
+            output.append(op + " " + rs.target.display_serialized())
         else:
             op = rs.raw_operator if rs.raw_operator else rs.op
-            output.append(op + " " + rs.target.serialized())
+            sep = "" if rs.glued_target else " "
+            output.append(op + sep + rs.target.display_serialized())
 
     return " ".join(output)
 
@@ -1196,90 +1438,20 @@ def _serialize_command(cmd: CommandNode) -> str:
 def split_legacy(command: str) -> list[tuple[Optional[str], list[str], bool]]:
     """Split a command string into a chain of pipe-connected pipelines.
 
-    Re-implements the exact behaviour of the original ``_split_command``
-    function.  Lenient: ``;;``, ``|||``, leading ``|``, trailing ``|``,
-    lone ``;`` produce empty segments that are dropped.
+    AST-projected: lexes *command*, builds an AST in replay mode, and
+    projects each :class:`CommandNode` to its display form via
+    :func:`_serialize_command`.  Preserves empty-drop semantics.
 
     Returns a list of ``(operator, pipeline, backgrounded)`` triples.
     """
-    pipelines: list[tuple[Optional[str], list[str], bool]] = []
-    current_pipeline: list[str] = []
-    current_seg: list[str] = []
-    i, n = 0, len(command)
-    quote: Optional[str] = None
-    prev_op: Optional[str] = None
-
-    def flush_segment() -> None:
-        text = "".join(current_seg).strip()
-        if text:
-            current_pipeline.append(text)
-        current_seg.clear()
-
-    def flush_pipeline(backgrounded: bool = False) -> None:
-        nonlocal prev_op
-        flush_segment()
-        if current_pipeline:
-            pipelines.append((prev_op, current_pipeline[:], backgrounded))
-        del current_pipeline[:]
-        prev_op = None
-
-    while i < n:
-        c = command[i]
-        if quote is not None:
-            # Handle backslash escapes inside double quotes
-            if quote == '"' and c == '\\' and i + 1 < n:
-                nxt = command[i + 1]
-                if nxt in ('"', '$', '\\', '\n'):
-                    current_seg.append(c)
-                    current_seg.append(nxt)
-                    i += 2
-                    continue
-            current_seg.append(c)
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-        if c in ("'", '"'):
-            quote = c
-            current_seg.append(c)
-            i += 1
-            continue
-        if c == ";":
-            flush_pipeline()
-            prev_op = ";"
-            i += 1
-            continue
-        if c == "&" and i + 1 < n and command[i + 1] == "&":
-            flush_pipeline()
-            prev_op = "&&"
-            i += 2
-            continue
-        if c == "&" and i > 0 and command[i - 1] == ">" and i + 1 < n and command[i + 1].isdigit():
-            # fd-dup redirect like `2>&1` / `1>&2`: the `&` here is part of a
-            # redirect operator, not a backgrounding operator.
-            current_seg.append(c)
-            i += 1
-            continue
-        if c == "&":
-            # Bare '&' backgrounding
-            flush_pipeline(backgrounded=True)
-            i += 1
-            continue
-        if c == "|" and i + 1 < n and command[i + 1] == "|":
-            flush_pipeline()
-            prev_op = "||"
-            i += 2
-            continue
-        if c == "|":
-            # single pipe — end the current segment within the pipeline
-            flush_segment()
-            i += 1
-            continue
-        current_seg.append(c)
-        i += 1
-
-    flush_pipeline()
-    return pipelines
+    tokens = Lexer(command, replay_mode=True).tokenize()
+    program = _build_ast(tokens, Expansion())  # replay mode
+    chains = program_to_chain(program)
+    result: list[tuple[Optional[str], list[str], bool]] = []
+    for op, cmd_nodes, bg in chains:
+        segs = [_serialize_command(cmd) for cmd in cmd_nodes]
+        result.append((op, segs, bg))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1489,7 @@ def program_to_chain(
 
 
 def cmd_to_display(cmd: CommandNode) -> str:
-    """Return a display-friendly string for *cmd* using the serialized form."""
+    """Return a human-readable display string for *cmd*."""
     return _serialize_command(cmd)
 
 
@@ -1417,224 +1589,54 @@ def _extract_from_string(
     segment: str,
     expansion: Optional[Expansion] = None,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
-    """Legacy path: lex a string segment inline.  Reproduces the exact
-    behaviour of the original ``_extract_redirects``."""
-    args: list[str] = []
-    redirects: list[Redirect] = []
-    i = 0
-    n = len(segment)
+    """AST-projected path: lex *segment* and route through the AST.
 
-    def _resolve_word(w: str) -> str:
-        if not expansion:
-            return w
-        def _replace(m: re.Match) -> str:
-            key = f"\x01A{m.group(1)}\x01"
-            val = expansion.arg_values.get(key)
-            return val if val is not None else m.group(0)
-        return SENTINEL_ARG.sub(_replace, w)
+    Builds an AST from the segment in replay mode (assigning sentinel IDs
+    but resolving from *expansion*), then delegates to
+    :func:`_extract_from_node`.  This replaces the hand-rolled char-by-char
+    scanner but preserves every validation and error string exactly.
+    """
+    # Detect unbalanced quotes — the lexer is lenient, so pre-check.
+    if _has_unbalanced_quotes(segment):
+        return [], [], "Unbalanced quotes in command"
 
-    def _resolve_heredoc_body(token: str, kind: str = "heredoc") -> Optional[str]:
-        if not expansion:
-            return None
-        m = SENTINEL_HD.fullmatch(token)
-        if not m:
-            return None
-        key = f"\x01H{m.group(1)}\x01"
-        return expansion.heredoc_bodies.get(key)
+    try:
+        tokens = Lexer(segment, replay_mode=True).tokenize()
+    except (ParseError, ValueError) as e:
+        return [], [], str(e)
 
-    def _read_word() -> Optional[str]:
-        nonlocal i
-        chars: list[str] = []
-        quote: Optional[str] = None
-        while i < n:
-            c = segment[i]
-            if quote is not None:
-                # Handle backslash escapes inside double quotes
-                if quote == '"' and c == '\\' and i + 1 < n:
-                    nxt = segment[i + 1]
-                    if nxt in ('"', '$', '\\'):
-                        # escaped char: skip backslash, keep the escaped char
-                        chars.append(nxt)
-                        i += 2
-                        continue
-                    elif nxt == '\n':
-                        # line continuation: skip backslash and newline
-                        i += 2
-                        continue
-                if c == quote:
-                    quote = None
-                    i += 1
-                    continue
-                chars.append(c)
-                i += 1
-            # Backslash outside quotes: escape next character
-            elif c == '\\' and i + 1 < n:
-                chars.append(segment[i + 1])
-                i += 2
-            elif c in ("'", '"'):
-                quote = c
-                i += 1
-            elif c in (' ', '\t'):
-                break
-            else:
-                chars.append(c)
-                i += 1
-        if quote is not None:
-            return None
-        return ''.join(chars)
+    exp = expansion if expansion is not None else Expansion()
+    try:
+        program = _build_ast(tokens, exp)  # replay mode (no capture_fn)
+    except (ParseError, ValueError) as e:
+        return [], [], str(e)
 
-    def _read_redirect_target() -> Optional[str]:
-        nonlocal i
-        if i < n and segment[i] not in (' ', '\t'):
-            target = _read_word()
-            return _resolve_word(target) if target is not None else None
-        while i < n and segment[i] in (' ', '\t'):
-            i += 1
-        if i >= n:
-            return None
-        target = _read_word()
-        return _resolve_word(target) if target is not None else None
+    chain = program_to_chain(program)
+    if not chain or not chain[0][1]:
+        return [], [], None
 
+    return _extract_from_node(chain[0][1][0], expansion)
+
+
+def _has_unbalanced_quotes(text: str) -> bool:
+    """Return True if *text* has an unclosed single or double quote."""
+    quote: Optional[str] = None
+    i, n = 0, len(text)
     while i < n:
-        while i < n and segment[i] in (' ', '\t'):
+        c = text[i]
+        if quote is not None:
+            if quote == '"' and c == '\\' and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
             i += 1
-        if i >= n:
-            break
-
-        rem = segment[i:]
-
-        # -- 4-char fd-dup: 2>&1 --
-        if rem.startswith('2>&1') and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_')):
-            i += 4
-            redirects.append(Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1'))
-            continue
-        if rem.startswith('1>&2') and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_')):
-            i += 4
-            redirects.append(Redirect(fd=1, op='>&', target_path=None, target_fd=2, raw_target='2'))
-            continue
-
-        # -- 4-char fd-dup for disallowed target fds --
-        if (len(rem) >= 4 and rem[0].isdigit() and rem[1:3] == '>&'
-                and rem[3].isdigit()
-                and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_'))):
-            return [], [], "Redirect dup target fd must be 1 or 2"
-
-        # -- 3-char: 2>>, 1>> --
-        if rem.startswith('2>>'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=2, op='>>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('1>>'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>>', target_path=None, target_fd=None, raw_target=t))
-            continue
-
-        # -- here-string: <<< --
-        if rem.startswith('<<<'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Here-string missing target"
-            body = _resolve_heredoc_body(t, "here-string")
-            if body is None:
-                return [], [], "Here-string body not found"
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<<<', body=body))
-            continue
-
-        # -- heredoc with tab strip: <<- --
-        if rem.startswith('<<-'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Heredoc missing delimiter sentinel"
-            body = _resolve_heredoc_body(t, "heredoc")
-            if body is None:
-                return [], [], "Heredoc body not found"
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<<-', body=body, strip_tabs=True))
-            continue
-
-        # -- 2-char: >>, 2>, 1> --
-        if rem.startswith('>>'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('2>'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=2, op='>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('1>'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target=t))
-            continue
-
-        # -- heredoc: << --
-        if rem.startswith('<<'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Heredoc missing delimiter sentinel"
-            body = _resolve_heredoc_body(t, "heredoc")
-            if body is None:
-                return [], [], "Heredoc body not found"
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<<', body=body))
-            continue
-
-        # -- 1-char: >, < --
-        if rem.startswith('>'):
+        elif c in ("'", '"'):
+            quote = c
             i += 1
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('<'):
+        else:
             i += 1
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Input redirect missing target file"
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<', target_path=None, target_fd=None, raw_target=t))
-            continue
-
-        # -- digit + > that aren't 1> / 2> --
-        if len(rem) >= 2 and rem[0].isdigit() and rem[1] == '>':
-            fd = int(rem[0])
-            return [], [], f"Redirects only support fds 1 and 2 (got {fd})"
-
-        # -- regular word --
-        w = _read_word()
-        if w is None:
-            return [], [], "Unbalanced quotes in command"
-        if w:
-            args.append(_resolve_word(w))
-
-    return args, redirects, None
+    return quote is not None
 
 
 def _extract_from_node(
@@ -1727,56 +1729,7 @@ def _extract_from_node(
 
 
 # ---------------------------------------------------------------------------
-# Variable expansion helpers (inside parse_command scanner)
-# ---------------------------------------------------------------------------
-
-def _emit_var_sentinel(
-    name: str,
-    new_i: int,
-    env: Optional[Mapping[str, str]],
-    next_arg_id_list: list[int],
-    expansion: Expansion,
-) -> tuple[str, int]:
-    """Emit an arg-sentinel for a single ``$VAR`` expansion."""
-    value = env.get(name, "") if env else ""
-    sentinel = f"\x01A{next_arg_id_list[0]}\x01"
-    next_arg_id_list[0] += 1
-    expansion.arg_values[sentinel] = value
-    return sentinel, new_i
-
-
-def _try_expand_var(
-    command: str,
-    i: int,
-    n: int,
-    env: Optional[Mapping[str, str]],
-    next_arg_id_list: list[int],
-    expansion: Expansion,
-) -> tuple[Optional[str], int]:
-    """If *command[i:]* starts with ``$VAR`` or ``${VAR}``, emit a sentinel.
-
-    Returns ``(sentinel, new_i)`` on success, or ``(None, i)`` if there is
-    no variable reference at this position.
-    """
-    if i + 1 >= n:
-        return None, i
-    nxt = command[i + 1]
-    if nxt == '{':
-        m = _BRACED_VAR_RE.match(command[i:])
-        if not m:
-            return None, i
-        name = m.group(0)[2:-1]
-        return _emit_var_sentinel(name, i + m.end(), env, next_arg_id_list, expansion)
-    if nxt.isalpha() or nxt == '_':
-        m = _VAR_NAME_RE.match(command, i + 1)
-        assert m is not None
-        name = m.group(0)
-        return _emit_var_sentinel(name, m.end(), env, next_arg_id_list, expansion)
-    return None, i
-
-
-# ---------------------------------------------------------------------------
-# parse_command — full expansion + AST parse
+# parse_command — thin AST wrapper (scan → lex → build → serialize)
 # ---------------------------------------------------------------------------
 
 def parse_command(
@@ -1791,10 +1744,11 @@ def parse_command(
 ) -> tuple[str, Expansion, Optional[ProgramNode]]:
     """Pre-pass: resolve ``$(...)``, heredocs, and here-strings.
 
-    Uses the proven char-by-char scanner to produce the cleaned command
-    string and populate the expansion table.  Also tokenizes with the new
-    :class:`Lexer` and builds the full AST via :func:`_build_ast`, so
-    consumers get a real ``ProgramNode``.
+    Lexes the command with :class:`Lexer`, builds the AST via
+    :func:`_build_ast` in populate mode (which performs ``$()`` capture,
+    ``$VAR``/``${VAR}`` expansion, and heredoc/here-string body
+    resolution), and derives the cleaned command string from the AST
+    via :func:`serialize_program`.
 
     *env* supplies ``$VAR`` values for expansion.  ``None`` or ``{}`` →
     every ``$VAR`` resolves to ``""``.  Expansion uses this env ONLY —
@@ -1809,385 +1763,20 @@ def parse_command(
     if deadline is None:
         deadline = _time.time() + timeout
 
-    expansion = Expansion(arg_values={}, heredoc_bodies={})
-    output: list[str] = []
-    i, n = 0, len(command)
-    quote: Optional[str] = None
-    next_arg_id = [0]
-    next_hd_id = [0]
-
-    # ---- char-by-char scanner (proven, tested) ----
-    # This populates `expansion` and produces `output` (→ cleaned string).
-    # It rejects unsupported constructs and handles escapes for quotes.
-    # This is the EXACT code from the old parse_command, preserved verbatim.
-
-    # Reject unsupported constructs during the scan
+    # Reject unsupported constructs (quote-aware scan)
     _check_unsupported(command)
 
-    while i < n:
-        c = command[i]
-
-        # ---- inside a quote ----
-        if quote is not None:
-            # Double-quote: handle backslash escapes
-            if quote == '"' and c == '\\' and i + 1 < n:
-                nxt = command[i + 1]
-                if nxt in ('"', '$', '\\', '\n'):
-                    output.append(c)
-                    output.append(nxt)
-                    i += 2
-                    continue
-
-            # Double-quote: $( ... ) command substitution
-            if quote == '"' and c == '$' and i + 1 < n and command[i + 1] == '(':
-                # Check for $(( arithmetic
-                if i + 2 < n and command[i + 2] == '(':
-                    raise ParseError("Arithmetic expansion $((...)) is not supported")
-                # Find matching ')' with paren + quote tracking
-                j = i + 2
-                paren_depth = 1
-                inner_quote: Optional[str] = None
-                while j < n and paren_depth > 0:
-                    ch = command[j]
-                    if inner_quote is not None:
-                        if ch == inner_quote:
-                            inner_quote = None
-                    elif ch in ("'", '"'):
-                        inner_quote = ch
-                    elif ch == '(':
-                        paren_depth += 1
-                    elif ch == ')':
-                        paren_depth -= 1
-                    j += 1
-                if paren_depth != 0:
-                    raise ValueError("Unbalanced $( ... )")
-                inner = command[i + 2 : j - 1]
-
-                # Check depth/count limits before recursing
-                if depth + 1 > MAX_SUBST_DEPTH:
-                    raise ValueError(
-                        f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
-                    )
-                subst_count[0] += 1
-                if subst_count[0] > MAX_SUBST_COUNT:
-                    raise ValueError(
-                        f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
-                    )
-
-                # Recursively capture inner command output
-                rc, stdout_bytes = capture_fn(inner)
-                result = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
-                result = result[:MAX_SUBST_OUTPUT]
-                sentinel = f"\x01A{next_arg_id[0]}\x01"
-                next_arg_id[0] += 1
-                expansion.arg_values[sentinel] = result
-                output.append(sentinel)
-                i = j
-                continue
-
-            # Double-quote: $VAR / ${VAR} expansion
-            if quote == '"' and c == '$':
-                sentinel, ni = _try_expand_var(command, i, n, env, next_arg_id, expansion)
-                if sentinel is not None:
-                    output.append(sentinel)
-                    i = ni
-                    continue
-
-            # Default: copy char verbatim (both single and double quotes)
-            output.append(c)
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-
-        # ---- quote start ----
-        if c in ("'", '"'):
-            quote = c
-            output.append(c)
-            i += 1
-            continue
-
-        # ---- backslash outside quotes: escape next character ----
-        if c == '\\' and i + 1 < n:
-            # Copy both the backslash and the escaped character
-            output.append(c)
-            output.append(command[i + 1])
-            i += 2
-            continue
-
-        # ---- $( ... ) command substitution ----
-        if c == '$' and i + 1 < n and command[i + 1] == '(':
-            # Check for $(( arithmetic
-            if i + 2 < n and command[i + 2] == '(':
-                raise ParseError("Arithmetic expansion $((...)) is not supported")
-            # Find matching ')' with paren + quote tracking
-            j = i + 2
-            paren_depth = 1
-            inner_quote: Optional[str] = None
-            while j < n and paren_depth > 0:
-                ch = command[j]
-                if inner_quote is not None:
-                    if ch == inner_quote:
-                        inner_quote = None
-                elif ch in ("'", '"'):
-                    inner_quote = ch
-                elif ch == '(':
-                    paren_depth += 1
-                elif ch == ')':
-                    paren_depth -= 1
-                j += 1
-            if paren_depth != 0:
-                raise ValueError("Unbalanced $( ... )")
-            inner = command[i + 2 : j - 1]
-
-            # Check depth/count limits before recursing
-            if depth + 1 > MAX_SUBST_DEPTH:
-                raise ValueError(
-                    f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
-                )
-            subst_count[0] += 1
-            if subst_count[0] > MAX_SUBST_COUNT:
-                raise ValueError(
-                    f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
-                )
-
-            # Recursively capture inner command output
-            rc, stdout_bytes = capture_fn(inner)
-            result = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
-            result = result[:MAX_SUBST_OUTPUT]
-            sentinel = f"\x01A{next_arg_id[0]}\x01"
-            next_arg_id[0] += 1
-            expansion.arg_values[sentinel] = result
-            output.append(sentinel)
-            i = j
-            continue
-
-        # ---- $VAR / ${VAR} (unquoted) ----
-        if c == '$':
-            sentinel, ni = _try_expand_var(command, i, n, env, next_arg_id, expansion)
-            if sentinel is not None:
-                output.append(sentinel)
-                i = ni
-                continue
-
-        # ---- here-string: <<< (3-char, before <<- and <<) ----
-        if command[i : i + 3] == '<<<':
-            output.append('<<<')
-            i += 3
-            # skip whitespace after <<<
-            while i < n and command[i] in (' ', '\t'):
-                i += 1
-            # read the word (quote-aware)
-            word_chars: list[str] = []
-            wq: Optional[str] = None
-            single_quoted = False
-            while i < n:
-                ch = command[i]
-                if wq is not None:
-                    word_chars.append(ch)
-                    if ch == wq:
-                        wq = None
-                    i += 1
-                elif ch in ("'", '"'):
-                    if ch == "'":
-                        single_quoted = True
-                    wq = ch
-                    word_chars.append(ch)
-                    i += 1
-                elif ch == '\n':
-                    break
-                else:
-                    word_chars.append(ch)
-                    i += 1
-            raw_word = "".join(word_chars)
-            body_word = _strip_quotes(raw_word) if raw_word else ""
-
-            if not single_quoted:
-                body_word = _expand_subst_in_text(body_word, capture_fn, env=env)
-
-            body = body_word + "\n"
-            body = body[:MAX_HEREDOC_BODY]
-            sentinel = f"\x01H{next_hd_id[0]}\x01"
-            next_hd_id[0] += 1
-            expansion.heredoc_bodies[sentinel] = body
-            output.append(" " + sentinel)
-            continue
-
-        # ---- heredoc: <<- (3-char, before <<) ----
-        if command[i : i + 3] == '<<-':
-            output.append('<<-')
-            i += 3
-            # skip whitespace after <<-
-            while i < n and command[i] in (' ', '\t'):
-                i += 1
-            # read delimiter word (quote-aware)
-            delim_chars: list[str] = []
-            dq: Optional[str] = None
-            delim_quoted = False
-            # Handle <<-\EOF (backslash-escaped delimiter → literal body)
-            if i < n and command[i] == '\\':
-                delim_quoted = True
-                i += 1
-            while i < n:
-                ch = command[i]
-                if dq is not None:
-                    delim_chars.append(ch)
-                    if ch == dq:
-                        dq = None
-                    i += 1
-                elif ch in ("'", '"'):
-                    delim_quoted = True
-                    dq = ch
-                    delim_chars.append(ch)
-                    i += 1
-                elif ch in (' ', '\t', '\n', ';', '|', '&'):
-                    break
-                else:
-                    delim_chars.append(ch)
-                    i += 1
-            delimiter = _strip_quotes("".join(delim_chars))
-
-            # Skip to end of current line
-            while i < n and command[i] != '\n':
-                i += 1
-            if i < n:
-                i += 1  # consume newline
-
-            # Collect body lines until delimiter
-            body_lines: list[str] = []
-            found = False
-            while i < n:
-                line_start = i
-                while i < n and command[i] != '\n':
-                    i += 1
-                line = command[line_start:i]
-                if i < n:
-                    i += 1  # consume newline
-
-                # Strip leading TABs from line for comparison
-                tab_count = 0
-                for ch_val in line:
-                    if ch_val == '\t':
-                        tab_count += 1
-                    else:
-                        break
-                stripped_line = line[tab_count:]
-
-                if stripped_line == delimiter:
-                    found = True
-                    break
-
-                body_lines.append(line[tab_count:])
-
-            if not found:
-                raise ValueError(f"heredoc delimiter {delimiter!r} not found")
-
-            body = "\n".join(body_lines) + "\n"
-            body = body[:MAX_HEREDOC_BODY]
-
-            if not delim_quoted:
-                body = _expand_subst_in_text(body, capture_fn, env=env)
-
-            sentinel = f"\x01H{next_hd_id[0]}\x01"
-            next_hd_id[0] += 1
-            expansion.heredoc_bodies[sentinel] = body
-            output.append(" " + sentinel)
-            continue
-
-        # ---- heredoc: << (2-char, after <<- and <<<) ----
-        if command[i : i + 2] == '<<':
-            output.append('<<')
-            i += 2
-            # skip whitespace after <<
-            while i < n and command[i] in (' ', '\t'):
-                i += 1
-            # read delimiter word (quote-aware)
-            delim_chars = []
-            dq = None
-            delim_quoted = False
-            # Handle <<\EOF (backslash-escaped delimiter → literal body)
-            if i < n and command[i] == '\\':
-                delim_quoted = True
-                i += 1
-            while i < n:
-                ch = command[i]
-                if dq is not None:
-                    delim_chars.append(ch)
-                    if ch == dq:
-                        dq = None
-                    i += 1
-                elif ch in ("'", '"'):
-                    delim_quoted = True
-                    dq = ch
-                    delim_chars.append(ch)
-                    i += 1
-                elif ch in (' ', '\t', '\n', ';', '|', '&'):
-                    break
-                else:
-                    delim_chars.append(ch)
-                    i += 1
-            delimiter = _strip_quotes("".join(delim_chars))
-
-            # Skip to end of current line
-            while i < n and command[i] != '\n':
-                i += 1
-            if i < n:
-                i += 1  # consume newline
-
-            # Collect body lines until delimiter
-            body_lines = []
-            found = False
-            while i < n:
-                line_start = i
-                while i < n and command[i] != '\n':
-                    i += 1
-                line = command[line_start:i]
-                if i < n:
-                    i += 1  # consume newline
-
-                if line == delimiter:
-                    found = True
-                    break
-
-                body_lines.append(line)
-
-            if not found:
-                raise ValueError(f"heredoc delimiter {delimiter!r} not found")
-
-            body = "\n".join(body_lines) + "\n"
-            body = body[:MAX_HEREDOC_BODY]
-
-            if not delim_quoted:
-                body = _expand_subst_in_text(body, capture_fn, env=env)
-
-            sentinel = f"\x01H{next_hd_id[0]}\x01"
-            next_hd_id[0] += 1
-            expansion.heredoc_bodies[sentinel] = body
-            output.append(" " + sentinel)
-            continue
-
-        # ---- regular character ----
-        output.append(c)
-        i += 1
-
-    if quote is not None:
-        raise ValueError("Unbalanced quotes in command")
-
-    cleaned = "".join(output)
-
-    # ---- build AST from the ORIGINAL command (not the cleaned string) ----
-    # The token stream preserves the original structure.  We assign sentinel
-    # IDs in the same order as the scanner above, so they match the expansion
-    # keys.
-    try:
-        lexer = Lexer(command)
-        tokens = lexer.tokenize()
-        program: Optional[ProgramNode] = _build_ast(tokens, expansion)
-    except (ParseError, ValueError):
-        # If lexing fails for some reason, return program=None rather than
-        # crashing — the cleaned string + expansion are still valid.
-        program = None
-
+    expansion = Expansion(arg_values={}, heredoc_bodies={})
+    tokens = Lexer(command).tokenize()
+    program = _build_ast(
+        tokens, expansion,
+        capture_fn=capture_fn,
+        env=env,
+        depth=depth,
+        subst_count=subst_count,
+        deadline=deadline,
+    )
+    cleaned = serialize_program(program)
     return cleaned, expansion, program
 
 

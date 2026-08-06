@@ -386,5 +386,86 @@ class SerializeProgramTest(unittest.TestCase):
         self.assertEqual(s, "a | b | c")
 
 
+class CmdToDisplayTest(unittest.TestCase):
+    """Test that cmd_to_display / _serialize_command produce human-readable strings."""
+
+    def _parse(self, cmd, outputs=None, env=None):
+        outputs = outputs or {}
+        def fake_capture(inner):
+            val = outputs.get(inner, "")
+            return 0, val.encode()
+        return parse_command(cmd, fake_capture, None, 30, 0, env=env)
+
+    def _first_cmd(self, prog):
+        for chain in prog.chains:
+            for cmd in chain.pipeline.commands:
+                return cmd
+        return None
+
+    def test_display_renders_subst_no_sentinel(self) -> None:
+        """cmd_to_display on a dq-embedded $(whoami) shows $(whoami), not a sentinel."""
+        from shell_sandbox_mcp.parser import cmd_to_display
+        _cleaned, _exp, prog = self._parse('echo "$(whoami)"', {"whoami": "root"})
+        cmd = self._first_cmd(prog)
+        display = cmd_to_display(cmd)
+        self.assertNotIn("\x01A", display,
+                         f"display must NOT contain sentinels: {display!r}")
+        self.assertIn("$(whoami)", display,
+                      f"display must show the original $(whoami): {display!r}")
+
+    def test_serialize_command_display_no_sentinel(self) -> None:
+        """_serialize_command on a dq-embedded subst shows human-readable text."""
+        from shell_sandbox_mcp.parser import _serialize_command
+        _cleaned, _exp, prog = self._parse('echo "$(whoami)"', {"whoami": "root"})
+        cmd = self._first_cmd(prog)
+        display = _serialize_command(cmd)
+        self.assertNotIn("\x01A", display)
+        self.assertIn("$(whoami)", display)
+
+    def test_display_multiple_subst(self) -> None:
+        """Multiple dq-embedded substs all render as $(...) not sentinels."""
+        from shell_sandbox_mcp.parser import _serialize_command
+        _cleaned, _exp, prog = self._parse(
+            'echo "$(echo a)$(echo b)"',
+            {"echo a": "alpha", "echo b": "beta"},
+        )
+        cmd = self._first_cmd(prog)
+        display = _serialize_command(cmd)
+        self.assertNotIn("\x01A", display)
+        self.assertIn("$(echo a)", display)
+        self.assertIn("$(echo b)", display)
+
+    def test_display_compound_dq(self) -> None:
+        """Display of compound dq 'pre$(cmd)post' shows original text."""
+        from shell_sandbox_mcp.parser import _serialize_command
+        _cleaned, _exp, prog = self._parse(
+            'echo "pre$(echo mid)post"',
+            {"echo mid": "mid"},
+        )
+        cmd = self._first_cmd(prog)
+        display = _serialize_command(cmd)
+        self.assertNotIn("\x01A", display)
+        self.assertIn("pre$(echo mid)post", display)
+
+    def test_display_heredoc_shows_operator(self) -> None:
+        """Heredoc operators display correctly (sentinel unavoidable for target)."""
+        from shell_sandbox_mcp.parser import _serialize_command
+        _cleaned, _exp, prog = self._parse("cat <<EOF\nhello\nEOF")
+        cmd = self._first_cmd(prog)
+        display = _serialize_command(cmd)
+        # heredoc target is a sentinel (raw == sentinel), but operator is human-readable
+        self.assertIn("<<", display)
+
+    def test_display_simple_command(self) -> None:
+        """Simple command without substs displays normally."""
+        from shell_sandbox_mcp.parser import _serialize_command
+        _cleaned, _exp, prog = self._parse("echo hello > out.txt")
+        cmd = self._first_cmd(prog)
+        display = _serialize_command(cmd)
+        self.assertIn("echo hello", display)
+        self.assertIn("> out.txt", display)
+        self.assertNotIn("\x01A", display)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -208,118 +208,46 @@ def shell_run(
     # without re-lexing the cleaned string.
     try:
         expanded, expansion, program = _expand_command(command, work_dir, timeout, depth=0)
-    except ValueError as e:
+    except (ParseError, ValueError) as e:
         return str(e)
 
-    # Walk the AST directly (Option B: single-parse path).
-    # Fall back to the legacy string-based _split_command only when the
-    # AST is unavailable (program is None).
-    if program is not None:
-        chains = program_to_chain(program)
-        if not chains:
-            return "Empty command."
-
-        # Single-command fast path — preserves the exact prior behaviour.
-        if len(chains) == 1 and chains[0][0] is None and len(chains[0][1]) == 1:
-            if chains[0][2]:
-                _rc, out = _run_background(chains[0][1], work_dir, expansion=expansion)
-                return out if out else "(no output)"
-            # cd builtin: resolve the target directory and return immediately.
-            new_dir, cd_err = _try_cd(chains[0][1][0], work_dir, expansion)
-            if cd_err is not None:
-                return cd_err
-            if new_dir is not None:
-                return "(no output)"
-            _rc, out = _run_segment(chains[0][1][0], work_dir, timeout,
-                                    expansion=expansion)
-            return out if out else "(no output)"
-
-        # Multi-pipeline chain: run each pipeline through the sandbox, applying
-        # `&&` / `||` short-circuit semantics based on the previous pipeline's
-        # exit code.
-        outputs: list[str] = []
-        prev_rc = 0
-        ran_any = False
-
-        for op, cmd_nodes, backgrounded in chains:
-            joined = _serialize_pipeline_from_cmds(cmd_nodes)
-            if op == "&&" and ran_any and prev_rc != 0:
-                outputs.append(f"(skipped: previous command exited {prev_rc}) — {joined}")
-                continue
-            if op == "||" and ran_any and prev_rc == 0:
-                outputs.append("(skipped: previous command succeeded) — " + joined)
-                continue
-
-            # cd builtin: intercept single-command non-backgrounded pipelines
-            # before allowlist dispatch so the directory change applies to
-            # subsequent segments of the same shell_run call.
-            if not backgrounded and len(cmd_nodes) == 1:
-                new_dir, cd_err = _try_cd(cmd_nodes[0], work_dir, expansion)
-                if cd_err is not None:
-                    outputs.append(cd_err)
-                    prev_rc = 1
-                    ran_any = True
-                    continue
-                if new_dir is not None:
-                    work_dir = new_dir
-                    prev_rc = 0
-                    ran_any = True
-                    continue
-
-            if backgrounded:
-                _rc, out = _run_background(cmd_nodes, work_dir, expansion=expansion)
-                ran_any = True
-                # Leave prev_rc unchanged — backgrounded exit code is unknown.
-            elif len(cmd_nodes) == 1:
-                rc, out = _run_segment(cmd_nodes[0], work_dir, timeout,
-                                       expansion=expansion)
-                prev_rc = rc
-                ran_any = True
-            else:
-                rc, out = _run_pipeline(cmd_nodes, work_dir, timeout,
-                                        expansion=expansion)
-                prev_rc = rc
-                ran_any = True
-            if out:
-                outputs.append(out)
-
-        if not outputs:
-            return "(no output)"
-        return "\n".join(outputs)
-
-    # ---- Legacy fallback (program is None) ----
-    try:
-        pipelines = _split_command(expanded)
-    except ValueError as e:
-        return str(e)
-    if not pipelines:
+    # Walk the AST directly (Option B: single-parse path).  The AST is now the
+    # ONLY execution path — the legacy string-based _split_command fallback
+    # was removed in U2.
+    if program is None:
+        # Defensive: parse_command returns program=None only if AST building
+        # failed after the scanner succeeded (see parser.parse_command). Surface
+        # a clean error string rather than crashing. Do NOT route to
+        # _split_command.
+        return "Command parse error."
+    chains = program_to_chain(program)
+    if not chains:
         return "Empty command."
 
     # Single-command fast path — preserves the exact prior behaviour.
-    if len(pipelines) == 1 and pipelines[0][0] is None and len(pipelines[0][1]) == 1:
-        if pipelines[0][2]:
-            _rc, out = _run_background(pipelines[0][1], work_dir, expansion=expansion)
+    if len(chains) == 1 and chains[0][0] is None and len(chains[0][1]) == 1:
+        if chains[0][2]:
+            _rc, out = _run_background(chains[0][1], work_dir, expansion=expansion)
             return out if out else "(no output)"
         # cd builtin: resolve the target directory and return immediately.
-        new_dir, cd_err = _try_cd(pipelines[0][1][0], work_dir, expansion)
+        new_dir, cd_err = _try_cd(chains[0][1][0], work_dir, expansion)
         if cd_err is not None:
             return cd_err
         if new_dir is not None:
             return "(no output)"
-        _rc, out = _run_segment(pipelines[0][1][0], work_dir, timeout,
+        _rc, out = _run_segment(chains[0][1][0], work_dir, timeout,
                                 expansion=expansion)
         return out if out else "(no output)"
 
     # Multi-pipeline chain: run each pipeline through the sandbox, applying
-    # `&&` / `||` short-circuit semantics based on the previous pipeline's exit
-    # code. Pipelines are independent processes (no shared shell variables), but
-    # they share the same cwd, so file-based state persists across stages.
+    # `&&` / `||` short-circuit semantics based on the previous pipeline's
+    # exit code.
     outputs: list[str] = []
     prev_rc = 0
     ran_any = False
 
-    for op, stages, backgrounded in pipelines:
-        joined = " | ".join(stages)
+    for op, cmd_nodes, backgrounded in chains:
+        joined = _serialize_pipeline_from_cmds(cmd_nodes)
         if op == "&&" and ran_any and prev_rc != 0:
             outputs.append(f"(skipped: previous command exited {prev_rc}) — {joined}")
             continue
@@ -328,9 +256,10 @@ def shell_run(
             continue
 
         # cd builtin: intercept single-command non-backgrounded pipelines
-        # before allowlist dispatch (legacy string path).
-        if not backgrounded and len(stages) == 1:
-            new_dir, cd_err = _try_cd(stages[0], work_dir, expansion)
+        # before allowlist dispatch so the directory change applies to
+        # subsequent segments of the same shell_run call.
+        if not backgrounded and len(cmd_nodes) == 1:
+            new_dir, cd_err = _try_cd(cmd_nodes[0], work_dir, expansion)
             if cd_err is not None:
                 outputs.append(cd_err)
                 prev_rc = 1
@@ -343,15 +272,17 @@ def shell_run(
                 continue
 
         if backgrounded:
-            rc, out = _run_background(stages, work_dir, expansion=expansion)
+            _rc, out = _run_background(cmd_nodes, work_dir, expansion=expansion)
             ran_any = True
             # Leave prev_rc unchanged — backgrounded exit code is unknown.
-        elif len(stages) == 1:
-            rc, out = _run_segment(stages[0], work_dir, timeout, expansion=expansion)
+        elif len(cmd_nodes) == 1:
+            rc, out = _run_segment(cmd_nodes[0], work_dir, timeout,
+                                   expansion=expansion)
             prev_rc = rc
             ran_any = True
         else:
-            rc, out = _run_pipeline(stages, work_dir, timeout, expansion=expansion)
+            rc, out = _run_pipeline(cmd_nodes, work_dir, timeout,
+                                    expansion=expansion)
             prev_rc = rc
             ran_any = True
         if out:
@@ -359,7 +290,6 @@ def shell_run(
 
     if not outputs:
         return "(no output)"
-
     return "\n".join(outputs)
 
 

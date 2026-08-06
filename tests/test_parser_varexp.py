@@ -181,9 +181,8 @@ class UnsetVarTest(unittest.TestCase):
     """Vars not in env resolve to empty string."""
 
     def test_unset_unquoted(self) -> None:
-        """Empty var → whole-word dropped (known pre-existing divergence).
-        STRING path: ['echo', '']; AST path: ['echo'].  Do NOT assert parity."""
-        _assert_str_path(self, "echo $UNSET_VAR", ["echo", ""])
+        """Empty var → whole-word dropped (unified on AST path)."""
+        _assert_both_equal(self, "echo $UNSET_VAR", ["echo"])
 
     def test_unset_in_word(self) -> None:
         """Empty var in the middle of a word."""
@@ -198,9 +197,8 @@ class UnsetVarTest(unittest.TestCase):
         self.assertEqual(ast_args, ["echo", "prepost"])
 
     def test_two_unset_vars(self) -> None:
-        """$A$B both unset → STRING: ['echo',''], AST: ['echo'].
-        Known pre-existing divergence — only check STRING path."""
-        _assert_str_path(self, "echo $A$B", ["echo", ""])
+        """$A$B both unset → whole-word dropped (unified on AST path)."""
+        _assert_both_equal(self, "echo $A$B", ["echo"])
 
 
 # ---------------------------------------------------------------------------

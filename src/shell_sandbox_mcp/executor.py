@@ -861,25 +861,29 @@ def _capture_stdout(
     if deadline is None:
         deadline = time.time() + timeout
 
-    # Expand inner command (recursion).  The AST is discarded here — the
-    # recursive path uses the legacy string-based split (split_legacy) for
-    # simplicity, since the inner command is a short $(...) snippet.
+    # Expand inner command (recursion).  Run purely on the AST returned by
+    # _expand_command — the legacy string-based split is not used here.
     srv = _get_server()
-    expanded, expansion, _program = srv._expand_command(
+    expanded, expansion, program = srv._expand_command(
         command, work_dir, timeout, depth, deadline, subst_count,
         env=env,
     )
 
-    # Split into pipelines
-    pipelines = srv._split_command(expanded)
-    if not pipelines:
+    # Defensive: program is None only if AST building failed post-U1.  Cheap
+    # safety net — should not happen, but avoid a crash if it does.
+    if program is None:
+        return 0, b""
+
+    # Project the AST to legacy chain format and run each pipeline.
+    chains = srv.program_to_chain(program)
+    if not chains:
         return 0, b""
 
     collected = bytearray()
     prev_rc = 0
     ran_any = False
 
-    for op, stages, backgrounded in pipelines:
+    for op, cmd_nodes, backgrounded in chains:
         if backgrounded:
             raise ValueError("background not allowed in command substitution")
 
@@ -892,13 +896,13 @@ def _capture_stdout(
         # like `$(sleep 29; sleep 29)` can't exceed the overall deadline.
         remaining = max(1, deadline - time.time())
 
-        if len(stages) == 1:
+        if len(cmd_nodes) == 1:
             rc, stdout_b, stderr_b, report = srv._run_segment_core(
-                stages[0], work_dir, int(remaining), expansion=expansion,
+                cmd_nodes[0], work_dir, int(remaining), expansion=expansion,
             )
         else:
             rc, stdout_b, stderr_b, report = srv._run_pipeline_core(
-                stages, work_dir, int(remaining), expansion=expansion,
+                cmd_nodes, work_dir, int(remaining), expansion=expansion,
             )
         prev_rc = rc
         ran_any = True

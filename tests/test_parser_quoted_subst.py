@@ -354,18 +354,12 @@ class QuotedSubstASTParityTest(unittest.TestCase):
         )
 
     def test_dq_empty_subst_parity(self) -> None:
-        """Empty $() output — known pre-existing divergence: string path
-        preserves empty args but AST path drops them.  Skip the parity
-        assert and just verify the scanner path is correct."""
-        # Scanner path: empty output produces an empty arg
-        cleaned, exp, _prog = _parse(
+        """Empty $() output — whole-word dropped (unified on AST path)."""
+        self._assert_parity(
             'echo "$(echo -n)"',
+            ["echo"],
             {"echo -n": ""},
         )
-        str_args, _, str_err = extract_redirects(cleaned, exp)
-        self.assertIsNone(str_err)
-        # String path has the empty arg (pre-existing behavior)
-        self.assertEqual(str_args, ["echo", ""])
 
     def test_unquoted_subst_still_works(self) -> None:
         """Unquoted $() must still work (regression check)."""
