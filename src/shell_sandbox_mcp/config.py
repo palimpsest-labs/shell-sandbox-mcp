@@ -24,8 +24,13 @@ DEFAULT_ALLOWED_DIRS = [
     "/tmp",
 ]
 # Redirect targets may live inside the working directory OR under these extra
-# roots (e.g. /tmp). Used by _validate_redirect_paths.
-EXTRA_REDIRECT_ROOTS = [Path("/tmp").resolve()]
+# roots (e.g. /tmp, and /dev/null for `> /dev/null` / `< /dev/null`). Used by
+# _validate_redirect_paths. Only *absolute* targets are checked against these
+# roots; relative targets always resolve against the working directory.
+EXTRA_REDIRECT_ROOTS = [
+    Path("/tmp").resolve(),
+    Path("/dev/null").resolve(),
+]
 DEFAULT_TIMEOUT = 30
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 1_000_000  # 1 MB

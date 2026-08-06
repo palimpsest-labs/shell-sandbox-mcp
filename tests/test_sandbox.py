@@ -1054,6 +1054,27 @@ class ValidateRedirectPathsTest(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("escapes allowed roots", err)
 
+    def test_dev_null_output(self) -> None:
+        redirs = [server.Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target='/dev/null')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNone(err)
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0].target_path, str(Path("/dev/null").resolve()))
+
+    def test_dev_null_input(self) -> None:
+        redirs = [server.Redirect(fd=0, op='<', target_path=None, target_fd=None, raw_target='/dev/null')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNone(err)
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0].target_path, str(Path("/dev/null").resolve()))
+
+    def test_dev_null_2gt(self) -> None:
+        redirs = [server.Redirect(fd=2, op='>', target_path=None, target_fd=None, raw_target='/dev/null')]
+        validated, err = server._validate_redirect_paths(redirs, self.root)
+        self.assertIsNone(err)
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0].target_path, str(Path("/dev/null").resolve()))
+
     def test_2gt1_passes_through(self) -> None:
         redirs = [server.Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1')]
         validated, err = server._validate_redirect_paths(redirs, self.root)
