@@ -21,7 +21,7 @@ from __future__ import annotations
 import enum
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Mapping, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +30,8 @@ from typing import Callable, Literal, Optional
 
 SENTINEL_ARG = re.compile(r"\x01A(\d+)\x01")
 SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
+_BRACED_VAR_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+_VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 MAX_SUBST_DEPTH = 8
 MAX_SUBST_COUNT = 256
@@ -101,6 +103,7 @@ class TokenKind(enum.Enum):
 
     # Subst
     SUBST = 30          # $(...) — value is raw inner text
+    VARREF = 31         # $VAR or ${VAR} — value is the variable name
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +279,17 @@ class Lexer:
             self._lex_subst()
             return
 
+        # --- ${VAR} / $VAR (variable reference) ---
+        if c == '$':
+            nxt = self._peek(1)
+            if nxt == '{' and _BRACED_VAR_RE.match(self._cmd[self._pos:]):
+                self._lex_varref_braced()
+                return
+            if nxt and (nxt.isalpha() or nxt == '_'):
+                self._lex_varref()
+                return
+            # else fall through to _lex_word (literal $)
+
         # --- chain operators (longest-match first) ---
         if rem.startswith('&&'):
             self._emit(TokenKind.AND_AND, '&&')
@@ -426,7 +440,12 @@ class Lexer:
             if c == '\\':
                 # backslash outside quotes: escape next character
                 if i + 1 < self._n:
-                    chars.append(self._cmd[i + 1])
+                    nxt = self._cmd[i + 1]
+                    if nxt == '$':
+                        chars.append('\\')
+                        chars.append('$')
+                    else:
+                        chars.append(nxt)
                     i += 2
                 else:
                     chars.append('\\')
@@ -470,9 +489,15 @@ class Lexer:
             if c in (' ', '\t', '\n', '|', ';', '&'):
                 break
 
-            # $( outside quotes → let the main loop handle it (not mid-word)
-            if c == '$' and i + 1 < self._n and self._cmd[i + 1] == '(':
-                break
+            # $ outside quotes → let the main loop handle it (not mid-word)
+            if c == '$' and i + 1 < self._n:
+                nxt = self._cmd[i + 1]
+                if nxt == '(':
+                    break
+                if nxt == '{' and _BRACED_VAR_RE.match(self._cmd[i:]):
+                    break
+                if nxt and (nxt.isalpha() or nxt == '_'):
+                    break
 
             # redirect-like chars mid-word → stay part of word
             chars.append(c)
@@ -512,6 +537,30 @@ class Lexer:
 
         inner = self._cmd[start + 2 : self._pos - 1]
         self._tokens.append(Token(TokenKind.SUBST, inner, start))
+
+    # ------------------------------------------------------------------
+    # $VAR / ${VAR}  variable reference
+    # ------------------------------------------------------------------
+
+    def _lex_varref(self) -> None:
+        """Lex a bare $VAR token — read the identifier name."""
+        start = self._pos
+        self._pos += 1  # skip $
+        m = _VAR_NAME_RE.match(self._cmd, self._pos)
+        assert m is not None  # precondition: next char is [A-Za-z_]
+        name = m.group(0)
+        self._pos = m.end()
+        self._tokens.append(Token(TokenKind.VARREF, name, start))
+
+    def _lex_varref_braced(self) -> None:
+        """Lex a ${VAR} token — read the identifier between braces."""
+        start = self._pos
+        m = _BRACED_VAR_RE.match(self._cmd[self._pos:])
+        assert m is not None  # precondition: matches ^\$\{[A-Za-z_][A-Za-z0-9_]*\}
+        full = m.group(0)
+        name = full[2:-1]  # strip ${ and }
+        self._pos += m.end()
+        self._tokens.append(Token(TokenKind.VARREF, name, start))
 
     # ------------------------------------------------------------------
     # here-string  <<< word
@@ -702,8 +751,8 @@ def _build_ast(
         parts: list[WordPart] = []
         i, n2 = 0, len(raw)
 
-        # Quick path: no quotes
-        if '"' not in raw and "'" not in raw:
+        # Quick path: no quotes and no $ (no sentinels needed)
+        if '"' not in raw and "'" not in raw and '$' not in raw:
             parts.append(WordPart(text=raw, raw=raw))
             return parts
 
@@ -793,6 +842,43 @@ def _build_ast(
                         )
                         parts.append(wp)
                         i = j
+                    # Detect $VAR / ${VAR} inside double quotes
+                    elif (ch == '$' and i + 1 < n2 and next_arg_id is not None
+                          and raw[i + 1] != '('):
+                        nxt2 = raw[i + 1]
+                        if nxt2 == '{' and _BRACED_VAR_RE.match(raw[i:]):
+                            flush()
+                            m = _BRACED_VAR_RE.match(raw[i:])
+                            assert m is not None
+                            raw_subst = m.group(0)
+                            aid = next_arg_id[0]
+                            next_arg_id[0] += 1
+                            sentinel = f"\x01A{aid}\x01"
+                            wp = WordPart(
+                                text=sentinel, raw=raw_subst,
+                                is_sentinel=True, is_quoted=True,
+                            )
+                            parts.append(wp)
+                            i += m.end()
+                        elif nxt2 and (nxt2.isalpha() or nxt2 == '_'):
+                            flush()
+                            m = _VAR_NAME_RE.match(raw, i + 1)
+                            assert m is not None
+                            var_name = m.group(0)
+                            raw_subst = raw[i:i + 1 + len(var_name)]
+                            aid = next_arg_id[0]
+                            next_arg_id[0] += 1
+                            sentinel = f"\x01A{aid}\x01"
+                            wp = WordPart(
+                                text=sentinel, raw=raw_subst,
+                                is_sentinel=True, is_quoted=True,
+                            )
+                            parts.append(wp)
+                            i = i + 1 + len(var_name)
+                        else:
+                            current_text.append(ch)
+                            current_raw.append(ch)
+                            i += 1
                     else:
                         current_text.append(ch)
                         current_raw.append(ch)
@@ -801,6 +887,16 @@ def _build_ast(
                     current_raw.append('"')
                     i += 1
                 continue
+            # Backslash outside quotes: escape next character.
+            # In _lex_word, \$ keeps the backslash so _split_word_parts
+            # can detect the escape.  Emit a literal $ (no expansion).
+            if c == '\\' and i + 1 < n2 and raw[i + 1] == '$':
+                current_text.append('$')
+                current_raw.append('\\')
+                current_raw.append('$')
+                i += 2
+                continue
+
             current_text.append(c)
             current_raw.append(c)
             i += 1
@@ -902,6 +998,17 @@ def _build_ast(
 
             # SUBST — if preceded by WS, start new word; else continue current
             if kind == TokenKind.SUBST:
+                if ws_seen and current_parts:
+                    _flush_word()
+                _consume()
+                sentinel = f"\x01A{next_arg_id}\x01"
+                next_arg_id += 1
+                wp = WordPart(text=sentinel, raw=sentinel, is_sentinel=True)
+                current_parts.append(wp)
+                continue
+
+            # VARREF — same arg-sentinel mechanism as SUBST
+            if kind == TokenKind.VARREF:
                 if ws_seen and current_parts:
                     _flush_word()
                 _consume()
@@ -1221,12 +1328,19 @@ def cmd_to_display(cmd: CommandNode) -> str:
 def _expand_subst_in_text(
     text: str,
     capture_fn,
+    env: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Scan *text* for ``$( ... )`` and replace each with its raw output.
 
     Used for expanding ``$()`` inside unquoted heredoc bodies and unquoted
     here-string words.  No sentinel tokens — the output is spliced directly
     into the body text.
+
+    Note that *env* is currently reserved and NOT used: ``$VAR`` / ``${VAR}``
+    are NOT expanded in heredoc/here-string bodies (only ``$( ... )`` is).
+    ``None`` or ``{}`` → every ``$VAR`` resolves to ``""`` (i.e. stays as the
+    literal text).  The parameter exists to keep the call sites consistent
+    with the surrounding expansion machinery, which does handle ``$VAR``.
     """
     result: list[str] = []
     i, n = 0, len(text)
@@ -1613,6 +1727,55 @@ def _extract_from_node(
 
 
 # ---------------------------------------------------------------------------
+# Variable expansion helpers (inside parse_command scanner)
+# ---------------------------------------------------------------------------
+
+def _emit_var_sentinel(
+    name: str,
+    new_i: int,
+    env: Optional[Mapping[str, str]],
+    next_arg_id_list: list[int],
+    expansion: Expansion,
+) -> tuple[str, int]:
+    """Emit an arg-sentinel for a single ``$VAR`` expansion."""
+    value = env.get(name, "") if env else ""
+    sentinel = f"\x01A{next_arg_id_list[0]}\x01"
+    next_arg_id_list[0] += 1
+    expansion.arg_values[sentinel] = value
+    return sentinel, new_i
+
+
+def _try_expand_var(
+    command: str,
+    i: int,
+    n: int,
+    env: Optional[Mapping[str, str]],
+    next_arg_id_list: list[int],
+    expansion: Expansion,
+) -> tuple[Optional[str], int]:
+    """If *command[i:]* starts with ``$VAR`` or ``${VAR}``, emit a sentinel.
+
+    Returns ``(sentinel, new_i)`` on success, or ``(None, i)`` if there is
+    no variable reference at this position.
+    """
+    if i + 1 >= n:
+        return None, i
+    nxt = command[i + 1]
+    if nxt == '{':
+        m = _BRACED_VAR_RE.match(command[i:])
+        if not m:
+            return None, i
+        name = m.group(0)[2:-1]
+        return _emit_var_sentinel(name, i + m.end(), env, next_arg_id_list, expansion)
+    if nxt.isalpha() or nxt == '_':
+        m = _VAR_NAME_RE.match(command, i + 1)
+        assert m is not None
+        name = m.group(0)
+        return _emit_var_sentinel(name, m.end(), env, next_arg_id_list, expansion)
+    return None, i
+
+
+# ---------------------------------------------------------------------------
 # parse_command — full expansion + AST parse
 # ---------------------------------------------------------------------------
 
@@ -1624,6 +1787,7 @@ def parse_command(
     depth: int,
     deadline: Optional[float] = None,
     subst_count: Optional[list[int]] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> tuple[str, Expansion, Optional[ProgramNode]]:
     """Pre-pass: resolve ``$(...)``, heredocs, and here-strings.
 
@@ -1631,6 +1795,10 @@ def parse_command(
     string and populate the expansion table.  Also tokenizes with the new
     :class:`Lexer` and builds the full AST via :func:`_build_ast`, so
     consumers get a real ``ProgramNode``.
+
+    *env* supplies ``$VAR`` values for expansion.  ``None`` or ``{}`` →
+    every ``$VAR`` resolves to ``""``.  Expansion uses this env ONLY —
+    NOT the per-command unveil_env (which is computed after parse time).
 
     Returns ``(cleaned_command, expansion, program_ast)``.
     """
@@ -1645,8 +1813,8 @@ def parse_command(
     output: list[str] = []
     i, n = 0, len(command)
     quote: Optional[str] = None
-    next_arg_id = 0
-    next_hd_id = 0
+    next_arg_id = [0]
+    next_hd_id = [0]
 
     # ---- char-by-char scanner (proven, tested) ----
     # This populates `expansion` and produces `output` (→ cleaned string).
@@ -1710,12 +1878,20 @@ def parse_command(
                 rc, stdout_bytes = capture_fn(inner)
                 result = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
                 result = result[:MAX_SUBST_OUTPUT]
-                sentinel = f"\x01A{next_arg_id}\x01"
-                next_arg_id += 1
+                sentinel = f"\x01A{next_arg_id[0]}\x01"
+                next_arg_id[0] += 1
                 expansion.arg_values[sentinel] = result
                 output.append(sentinel)
                 i = j
                 continue
+
+            # Double-quote: $VAR / ${VAR} expansion
+            if quote == '"' and c == '$':
+                sentinel, ni = _try_expand_var(command, i, n, env, next_arg_id, expansion)
+                if sentinel is not None:
+                    output.append(sentinel)
+                    i = ni
+                    continue
 
             # Default: copy char verbatim (both single and double quotes)
             output.append(c)
@@ -1779,12 +1955,20 @@ def parse_command(
             rc, stdout_bytes = capture_fn(inner)
             result = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
             result = result[:MAX_SUBST_OUTPUT]
-            sentinel = f"\x01A{next_arg_id}\x01"
-            next_arg_id += 1
+            sentinel = f"\x01A{next_arg_id[0]}\x01"
+            next_arg_id[0] += 1
             expansion.arg_values[sentinel] = result
             output.append(sentinel)
             i = j
             continue
+
+        # ---- $VAR / ${VAR} (unquoted) ----
+        if c == '$':
+            sentinel, ni = _try_expand_var(command, i, n, env, next_arg_id, expansion)
+            if sentinel is not None:
+                output.append(sentinel)
+                i = ni
+                continue
 
         # ---- here-string: <<< (3-char, before <<- and <<) ----
         if command[i : i + 3] == '<<<':
@@ -1819,12 +2003,12 @@ def parse_command(
             body_word = _strip_quotes(raw_word) if raw_word else ""
 
             if not single_quoted:
-                body_word = _expand_subst_in_text(body_word, capture_fn)
+                body_word = _expand_subst_in_text(body_word, capture_fn, env=env)
 
             body = body_word + "\n"
             body = body[:MAX_HEREDOC_BODY]
-            sentinel = f"\x01H{next_hd_id}\x01"
-            next_hd_id += 1
+            sentinel = f"\x01H{next_hd_id[0]}\x01"
+            next_hd_id[0] += 1
             expansion.heredoc_bodies[sentinel] = body
             output.append(" " + sentinel)
             continue
@@ -1902,10 +2086,10 @@ def parse_command(
             body = body[:MAX_HEREDOC_BODY]
 
             if not delim_quoted:
-                body = _expand_subst_in_text(body, capture_fn)
+                body = _expand_subst_in_text(body, capture_fn, env=env)
 
-            sentinel = f"\x01H{next_hd_id}\x01"
-            next_hd_id += 1
+            sentinel = f"\x01H{next_hd_id[0]}\x01"
+            next_hd_id[0] += 1
             expansion.heredoc_bodies[sentinel] = body
             output.append(" " + sentinel)
             continue
@@ -1974,10 +2158,10 @@ def parse_command(
             body = body[:MAX_HEREDOC_BODY]
 
             if not delim_quoted:
-                body = _expand_subst_in_text(body, capture_fn)
+                body = _expand_subst_in_text(body, capture_fn, env=env)
 
-            sentinel = f"\x01H{next_hd_id}\x01"
-            next_hd_id += 1
+            sentinel = f"\x01H{next_hd_id[0]}\x01"
+            next_hd_id[0] += 1
             expansion.heredoc_bodies[sentinel] = body
             output.append(" " + sentinel)
             continue

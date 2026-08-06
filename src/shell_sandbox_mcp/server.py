@@ -65,6 +65,30 @@ MAX_OUTPUT = 1_000_000  # 1 MB
 from .parser import MAX_SUBST_DEPTH, MAX_SUBST_COUNT, MAX_SUBST_OUTPUT, MAX_HEREDOC_BODY
 
 # ---------------------------------------------------------------------------
+# Environment allowlist
+# ---------------------------------------------------------------------------
+
+_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM",
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_TIME", "TZ",
+    # TMPDIR: build tools (GCC/make/configure) consult it. The sandbox still
+    # confines the filesystem via unveil to work_dir + /tmp, so a host TMPDIR
+    # pointing under /tmp is fine.
+    "TMPDIR",
+)
+
+
+def _base_env() -> dict[str, str]:
+    """Allowlisted host env for a sandboxed subprocess.  Unlisted vars DROPPED.
+
+    Per-command unveil_env (SANDBOX_*, PYTHONUSERBASE, PYTHONPATH,
+    GIT_CONFIG_GLOBAL) are layered on by _build_invocation and are NOT part
+    of this allowlist — they are always added regardless.
+    """
+    return {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+
+
+# ---------------------------------------------------------------------------
 # Command definitions
 # ---------------------------------------------------------------------------
 
@@ -509,16 +533,16 @@ def _build_invocation(
     command,
     work_dir: Path,
     expansion: Optional[Expansion] = None,
-) -> tuple[Optional[str], Optional[list[str]], Optional[dict], Optional[dict], list[Redirect]]:
+) -> tuple[Optional[str], Optional[list[str]], Optional[dict[str, str]], Optional[dict], list[Redirect]]:
     """Parse, resolve, and build the sandbox invocation for one segment.
 
     Accepts either a ``str`` (legacy) or a :class:`parser.CommandNode`
     (AST-native — no re-lexing).  Returns ``(binary, sandbox_args, env,
-    cfg, redirects)`` on success.  ``env`` is ``None`` when no env overrides
-    are needed.  On failure, returns a tuple whose first element is the
-    error message (string) and whose remaining elements are ``None`` / empty:
-    ``(error_msg, None, None, None, [])``.  An empty command returns
-    ``(None, None, None, None, [])``.
+    cfg, redirects)`` on success.  ``env`` is always a dict (allowlisted
+    base + per-command overrides).  On failure, returns a tuple whose first
+    element is the error message (string) and whose remaining elements are
+    ``None`` / empty: ``(error_msg, None, None, None, [])``.  An empty
+    command returns ``(None, None, None, None, [])``.
     """
     args, raw_redirects, parse_err = _extract_redirects(command, expansion)
     if parse_err is not None:
@@ -551,7 +575,6 @@ def _build_invocation(
     # Extra unveil paths via env vars the sandbox honors:
     #   SANDBOX_UNVEIL_R  — read-only (e.g. git config dotfiles under $HOME)
     #   SANDBOX_UNVEIL_RW — read-write (optional)
-    env: Optional[dict] = None
     unveil_env: dict[str, str] = {}
     extra_unveil = cfg.get("extra_unveil")
     if extra_unveil:
@@ -600,8 +623,8 @@ def _build_invocation(
         # rx + read-only config/cred paths) remains the security boundary.
         unveil_env["SANDBOX_NO_PLEDGE"] = "1"
 
-    if unveil_env:
-        env = {**os.environ, **unveil_env}
+    env: dict[str, str] = _base_env()          # always allowlisted base
+    env.update(unveil_env)                      # SANDBOX_*, PYTHON*, GIT_*
 
     # Optionally prepend a directory to PATH (e.g. so build commands resolve a
     # busybox `mv` from the vendored toolchain instead of GNU /usr/bin/mv).
@@ -609,10 +632,8 @@ def _build_invocation(
     if path_prefix:
         prefix = path_prefix() if callable(path_prefix) else path_prefix
         if prefix:
-            base = env if env is not None else dict(os.environ)
-            cur = base.get("PATH", "")
-            base["PATH"] = f"{prefix}:{cur}" if cur else prefix
-            env = base
+            cur = env.get("PATH", "")
+            env["PATH"] = f"{prefix}:{cur}" if cur else prefix
 
     return binary, sandbox_args, env, cfg, redirects
 
@@ -864,7 +885,7 @@ def _run_pipeline_core(
     ``stdout_bytes`` is the last stage's captured stdout; ``stderr_bytes`` is
     the combined stderr from all stages.
     """
-    invocations: list[tuple[list[str], Optional[dict], list[Redirect]]] = []
+    invocations: list[tuple[list[str], Optional[dict[str, str]], list[Redirect]]] = []
     for i, seg in enumerate(segments):
         binary, sandbox_args, env, cfg, redirects = _build_invocation(
             seg, work_dir, expansion=expansion,
@@ -1111,6 +1132,7 @@ def _capture_stdout(
     depth: int,
     deadline: Optional[float] = None,
     subst_count: Optional[list[int]] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> tuple[int, bytes]:
     """Execute *command* in the sandbox and return ``(rc, raw_stdout_bytes)``.
 
@@ -1118,6 +1140,8 @@ def _capture_stdout(
     Depth and count limits are enforced to prevent runaway recursion.
     The sub-command's exit code does NOT propagate (matches shell default).
     Background ``&`` inside ``$()`` is rejected.
+
+    *env* is the allowlisted environment forwarded to recursive expansion.
     """
     if subst_count is None:
         subst_count = [0]
@@ -1140,6 +1164,7 @@ def _capture_stdout(
     # simplicity, since the inner command is a short $(...) snippet.
     expanded, expansion, _program = _expand_command(
         command, work_dir, timeout, depth, deadline, subst_count,
+        env=env,
     )
 
     # Split into pipelines
@@ -1199,14 +1224,15 @@ def _expand_subst_in_text(
     depth: int,
     deadline: float,
     subst_count: list[int],
+    env: Optional[dict[str, str]] = None,
 ) -> str:
     """Scan *text* for ``$( ... )`` and replace each with its raw output.
 
     Thin wrapper around :func:`parser._expand_subst_in_text`.
     """
     def _capture(inner: str) -> tuple[int, bytes]:
-        return _capture_stdout(inner, work_dir, timeout, depth + 1, deadline, subst_count)
-    return _parser_expand_subst_in_text(text, _capture)
+        return _capture_stdout(inner, work_dir, timeout, depth + 1, deadline, subst_count, env=env)
+    return _parser_expand_subst_in_text(text, _capture, env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1255,7 @@ def _expand_command(
     depth: int,
     deadline: Optional[float] = None,
     subst_count: Optional[list[int]] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> tuple[str, Expansion, Optional[ProgramNode]]:
     """Pre-pass: resolve ``$(...)``, heredocs, and here-strings.
 
@@ -1236,12 +1263,18 @@ def _expand_command(
     ``(cleaned_command, expansion, program_ast)`` — the caller should
     use the AST directly for execution rather than re-parsing the
     cleaned string.
+
+    *env* supplies ``$VAR`` values.  When None, defaults to
+    :func:`_base_env()` so expansion sees the same allowlisted vars as
+    the subprocess will later receive.
     """
+    base_env = env if env is not None else _base_env()
     def _capture(inner: str) -> tuple[int, bytes]:
         return _capture_stdout(inner, work_dir, timeout, depth + 1,
-                               deadline, subst_count)
+                               deadline, subst_count, env=base_env)
     cleaned, expansion, program = _parser_parse_command(
         command, _capture, work_dir, timeout, depth, deadline, subst_count,
+        env=base_env,
     )
     return cleaned, expansion, program
 
@@ -1310,7 +1343,7 @@ def _run_background(
 
     Returns ``(0, message)`` with the PID and log path.
     """
-    invocations: list[tuple[list[str], Optional[dict], list[Redirect]]] = []
+    invocations: list[tuple[list[str], Optional[dict[str, str]], list[Redirect]]] = []
     for i, seg in enumerate(segments):
         binary, sandbox_args, env, cfg, redirects = _build_invocation(
             seg, work_dir, expansion=expansion,

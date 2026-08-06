@@ -1802,7 +1802,7 @@ class ExpandCommandTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _stub_capture(self, outputs: dict[str, str]) -> None:
-        def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None):
+        def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None, env=None):
             self.captures.append(command)
             val = outputs.get(command, "")
             return 0, val.encode("utf-8")
@@ -2505,7 +2505,7 @@ class EndToEndSmokeTest(unittest.TestCase):
         """Verify $(...) produces a sentinel with single-word value."""
         original = server._capture_stdout
         try:
-            def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None):
+            def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None, env=None):
                 return 0, b"a b"
             server._capture_stdout = fake
             cmd = "echo $(printf 'a b')"
@@ -2525,7 +2525,7 @@ class EndToEndSmokeTest(unittest.TestCase):
         """Verify that _expand_command can handle $(cat <<EOF\nx\nEOF)."""
         original = server._capture_stdout
         try:
-            def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None):
+            def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None, env=None):
                 return 0, b"x"
             server._capture_stdout = fake
             cmd = "echo $(cat <<EOF\nx\nEOF)"

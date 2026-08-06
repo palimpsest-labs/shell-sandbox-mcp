@@ -12,7 +12,7 @@ Validates that:
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Mapping
 
 from shell_sandbox_mcp.parser import (
     Expansion,
@@ -38,13 +38,13 @@ def _stub_capture(outputs: dict[str, str]):
     return fake_capture
 
 
-def _parse(cmd: str, outputs: dict[str, str] | None = None):
-    """Shortcut for parse_command with a stub capture."""
+def _parse(cmd: str, outputs: dict[str, str] | None = None, env: Mapping[str, str] | None = None):
+    """Shortcut for parse_command with a stub capture and optional *env*."""
     outputs = outputs or {}
     capture_fn = _stub_capture(outputs)
     with tempfile.TemporaryDirectory() as td:
         wd = Path(td)
-        return parse_command(cmd, capture_fn, wd, 30, 0)
+        return parse_command(cmd, capture_fn, wd, 30, 0, env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -155,23 +155,36 @@ class QuotedArithmeticRejectionTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# $VAR / ${VAR} stay literal everywhere
+# $VAR / ${VAR} expansion (with and without env)
 # ---------------------------------------------------------------------------
 
-class VariableLiteralTest(unittest.TestCase):
-    """$VAR and ${VAR} must stay literal — NO variable expansion."""
+class VariableExpansionTest(unittest.TestCase):
+    """$VAR and ${VAR} expand when env is provided; empty-string when not."""
 
-    def test_unquoted_var_literal(self) -> None:
-        cleaned, exp, _prog = _parse("echo $HOME")
-        self.assertIn("$HOME", cleaned)
+    def test_unquoted_var_expands(self) -> None:
+        """echo $HOME with env expands to /root (sentinel, not literal)."""
+        cleaned, exp, _prog = _parse("echo $HOME", env={"HOME": "/root"})
+        # The scanner replaces $HOME with a sentinel; the literal $HOME is gone
+        m = SENTINEL_ARG.search(cleaned)
+        self.assertIsNotNone(m, "Should have a sentinel for $HOME")
+        sentinel = f"\x01A{m.group(1)}\x01"
+        self.assertEqual(exp.arg_values.get(sentinel), "/root")
 
-    def test_dq_var_literal(self) -> None:
-        cleaned, exp, _prog = _parse('echo "$HOME"')
-        self.assertIn("$HOME", cleaned)
+    def test_dq_var_expands(self) -> None:
+        """echo "$HOME" with env expands to /root."""
+        cleaned, exp, _prog = _parse('echo "$HOME"', env={"HOME": "/root"})
+        m = SENTINEL_ARG.search(cleaned)
+        self.assertIsNotNone(m, "Should have a sentinel for $HOME in dq")
+        sentinel = f"\x01A{m.group(1)}\x01"
+        self.assertEqual(exp.arg_values.get(sentinel), "/root")
 
-    def test_dq_braced_var_literal(self) -> None:
-        cleaned, exp, _prog = _parse('echo "${HOME}"')
-        self.assertIn("${HOME}", cleaned)
+    def test_dq_braced_var_expands(self) -> None:
+        """echo "${HOME}" with env expands to /root."""
+        cleaned, exp, _prog = _parse('echo "${HOME}"', env={"HOME": "/root"})
+        m = SENTINEL_ARG.search(cleaned)
+        self.assertIsNotNone(m, "Should have a sentinel for ${HOME} in dq")
+        sentinel = f"\x01A{m.group(1)}\x01"
+        self.assertEqual(exp.arg_values.get(sentinel), "/root")
 
     def test_sq_var_literal(self) -> None:
         cleaned, exp, _prog = _parse("echo '$HOME'")
@@ -217,6 +230,7 @@ class QuotedSubstASTParityTest(unittest.TestCase):
     def _both_extract_with_capture(
         cmd: str,
         capture_outputs: dict[str, str],
+        env: Mapping[str, str] | None = None,
     ) -> tuple[
         tuple[list[str], list[Redirect], Optional[str]],
         tuple[list[str], list[Redirect], Optional[str]],
@@ -230,7 +244,7 @@ class QuotedSubstASTParityTest(unittest.TestCase):
             cap = _stub_capture(capture_outputs)
 
             try:
-                cleaned, exp, prog = parse_command(cmd, cap, wd, 30, 0)
+                cleaned, exp, prog = parse_command(cmd, cap, wd, 30, 0, env=env)
             except (ValueError, ParseError) as exc:
                 # parse_command rejected; string path can't run either
                 str_result = extract_redirects(cmd, None)
@@ -255,9 +269,10 @@ class QuotedSubstASTParityTest(unittest.TestCase):
 
     def _assert_parity(
         self, cmd: str, expected_args: list[str], capture_outputs: dict[str, str],
+        env: Mapping[str, str] | None = None,
     ) -> None:
         """Assert both paths produce the same args and match expected."""
-        str_r, ast_r = self._both_extract_with_capture(cmd, capture_outputs)
+        str_r, ast_r = self._both_extract_with_capture(cmd, capture_outputs, env=env)
         str_args, _, str_err = str_r
         ast_args, _, ast_err = ast_r
 
@@ -329,12 +344,13 @@ class QuotedSubstASTParityTest(unittest.TestCase):
             {"echo a": "alpha", "echo b": "beta"},
         )
 
-    def test_var_literal_parity(self) -> None:
-        """$HOME stays literal in both paths."""
+    def test_var_expansion_parity(self) -> None:
+        """$HOME expands in both paths when env is provided."""
         self._assert_parity(
             'echo "$HOME"',
-            ["echo", "$HOME"],
+            ["echo", "/root"],
             {},
+            env={"HOME": "/root"},
         )
 
     def test_dq_empty_subst_parity(self) -> None:
