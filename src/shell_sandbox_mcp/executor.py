@@ -173,6 +173,533 @@ def _build_invocation(
 
 
 # ---------------------------------------------------------------------------
+# Pipeline plan — shared pre-launch dance
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LastStageSink:
+    """Lazy last-stage sink for background mode.
+
+    We only open the background log file after resolving fd targets, so we
+    don't create an empty log file when the last stage redirects both stdout
+    and stderr to user files.
+    """
+    log_path: Path
+    _sentinel: object = field(default_factory=object)
+    opened_fh: Optional[object] = None
+    opened: bool = False
+
+    @property
+    def sentinel(self) -> object:
+        return self._sentinel
+
+    def maybe_open_and_substitute(
+        self, stdout_target, stderr_target, all_to_close: list,
+    ):
+        """If neither *stdout_target* nor *stderr_target* still equals the
+        sentinel, do nothing (no empty log file).  Otherwise open the log
+        once (append the handle to *all_to_close*, set ``opened=True``), and
+        replace any sentinel target with the handle.
+
+        Returns ``(new_stdout, new_stderr, opened_in_this_call)``.
+        """
+        if not (stdout_target is self._sentinel or stderr_target is self._sentinel):
+            return stdout_target, stderr_target, False
+        if not self.opened:
+            self.opened_fh = open(str(self.log_path), "wb")
+            all_to_close.append(self.opened_fh)
+            self.opened = True
+        new_stdout = self.opened_fh if stdout_target is self._sentinel else stdout_target
+        new_stderr = self.opened_fh if stderr_target is self._sentinel else stderr_target
+        return new_stdout, new_stderr, self.opened
+
+
+@dataclass
+class PipelinePlan:
+    """Pre-built launch plan for a pipeline (1 or more stages).
+
+    Everything the three mode-specific launchers need is pre-resolved:
+    invocations, fd targets, heredoc/stdin bytes, and (in background mode)
+    the lazy last-stage sink.
+    """
+    mode: str                       # "foreground" | "background"
+    invocations: list               # [(sandbox_args, env, redirects), ...]  (non-empty)
+    stdout_targets: list
+    stderr_targets: list
+    all_to_close: list
+    all_report: list
+    last_shared_read_fd: Optional[int]
+    first_stdin_bytes: Optional[bytes]
+    first_stdin_file: Optional[object]
+    sink: Optional[LastStageSink]       # background only
+    log_path: Optional[Path]            # background only
+
+
+@dataclass
+class _PlanError:
+    """Carries an error message from :func:`_build_pipeline_plan`.
+
+    Callers decide encoding (bytes vs str).
+    """
+    message: str
+
+
+def _build_pipeline_plan(segments, work_dir, expansion, mode):
+    """Shared pre-launch: build invocations, validate, resolve fd targets.
+
+    Returns a :class:`PipelinePlan` on success, ``None`` when all segments
+    were empty (no work), or :class:`_PlanError` on failure.
+
+    *mode* must be ``"foreground"`` or ``"background"``.
+    """
+    if mode not in ("foreground", "background"):
+        raise ValueError(
+            f"Invalid mode: {mode!r}; expected 'foreground' or 'background'"
+        )
+    srv = _get_server()
+
+    # ── step 1: build invocations ──────────────────────────────────────
+    invocations: list = []
+    for i, seg in enumerate(segments):
+        inv = srv._build_invocation(seg, work_dir, expansion=expansion)
+        if isinstance(inv, EmptyInvocation):
+            continue
+        if isinstance(inv, InvocationError):
+            return _PlanError(inv.message)
+        binary, sandbox_args, env, cfg, redirects = (
+            inv.binary, inv.sandbox_args, inv.env, inv.cfg, inv.redirects,
+        )
+        # TOCTOU for local binaries
+        if cfg.get("is_local_binary") and not srv._binary_still_contained(binary, work_dir):
+            return _PlanError(
+                f"Local binary no longer valid inside working directory: {binary}"
+            )
+        # Reject heredoc/here-string/input-redirect on non-first stages
+        if i > 0:
+            for r in redirects:
+                if r.fd == 0:
+                    seg_str = (
+                        _serialize_command(seg)
+                        if isinstance(seg, CommandNode)
+                        else seg
+                    )
+                    return _PlanError(
+                        f"heredoc/here-string/input-redirect not allowed on "
+                        f"non-first pipeline stage: {seg_str}"
+                    )
+        invocations.append((sandbox_args, env, redirects))
+
+    if not invocations:
+        return None  # all segments were empty
+
+    # ── step 2: reject intermediate stdout redirects ───────────────────
+    for i, (_sa, _env, redirects) in enumerate(invocations[:-1]):
+        for r in redirects:
+            if r.fd == 1:
+                seg_str = (
+                    _serialize_command(segments[i])
+                    if isinstance(segments[i], CommandNode)
+                    else segments[i]
+                )
+                return _PlanError(
+                    f"Cannot redirect stdout of intermediate pipe stage: "
+                    f"{seg_str}"
+                )
+
+    # ── step 3: resolve fd targets ─────────────────────────────────────
+    stdout_targets: list = []
+    stderr_targets: list = []
+    all_to_close: list = []
+    all_report: list = []
+    last_shared_read_fd: Optional[int] = None
+    first_stdin_bytes: Optional[bytes] = None
+    first_stdin_file: Optional[object] = None
+    sink: Optional[LastStageSink] = None
+    log_path: Optional[Path] = None
+
+    if mode == "background":
+        log_path = work_dir / f".bg-{int(time.time() * 1000)}.log"
+        sink = LastStageSink(log_path)
+
+    try:
+        for i, (_sa, _env, redirects) in enumerate(invocations):
+            is_last = i == len(invocations) - 1
+
+            if mode == "foreground":
+                def_stdout = _stdlib_subprocess.PIPE
+                def_stderr = _stdlib_subprocess.PIPE
+            else:
+                def_stdout = sink.sentinel if is_last else _stdlib_subprocess.PIPE
+                def_stderr = sink.sentinel if is_last else _stdlib_subprocess.PIPE
+
+            plan = srv._resolve_fd_targets(
+                redirects, def_stdout, def_stderr,
+                snapshot_2gt1=is_last,
+            )
+
+            if mode == "background" and is_last:
+                st, et, _ = sink.maybe_open_and_substitute(
+                    plan.stdout, plan.stderr, all_to_close,
+                )
+            else:
+                st = plan.stdout
+                et = plan.stderr
+
+            stdout_targets.append(st)
+            stderr_targets.append(et)
+            all_to_close.extend(plan.to_close)
+            all_report.append(plan.report)
+
+            if is_last:
+                last_shared_read_fd = plan.shared_read_fd
+
+            if i == 0:
+                # Background mode intentionally drops stdin_bytes (heredoc
+                # bodies are not written to background children).
+                if mode == "foreground" and plan.stdin_bytes is not None:
+                    first_stdin_bytes = plan.stdin_bytes
+                if plan.stdin_file is not None:
+                    first_stdin_file = plan.stdin_file
+
+    except OSError as e:
+        for fh in all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        return _PlanError(f"Error opening redirect target: {e}")
+    except ValueError as e:
+        # Background mode: ValueError propagates (matches old behaviour).
+        if mode != "foreground":
+            raise
+        for fh in all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        return _PlanError(f"Error opening redirect target: {e}")
+
+    return PipelinePlan(
+        mode=mode,
+        invocations=invocations,
+        stdout_targets=stdout_targets,
+        stderr_targets=stderr_targets,
+        all_to_close=all_to_close,
+        all_report=all_report,
+        last_shared_read_fd=last_shared_read_fd,
+        first_stdin_bytes=first_stdin_bytes,
+        first_stdin_file=first_stdin_file,
+        sink=sink,
+        log_path=log_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode-specific launchers — thin, one job each
+# ---------------------------------------------------------------------------
+
+
+def _launch_segment_run(
+    plan: PipelinePlan,
+    work_dir: Path,
+    timeout: int,
+) -> tuple[int, bytes, bytes, list[str]]:
+    """Launch a single stage via ``subprocess.run`` (no pipe chain)."""
+    assert len(plan.invocations) == 1
+    srv = _get_server()
+    sandbox_args, env, _redirects = plan.invocations[0]
+    to_close: list = list(plan.all_to_close)  # shallow copy — we may append
+
+    shared_read_fd = plan.last_shared_read_fd
+    if shared_read_fd is not None:
+        to_close.append(shared_read_fd)
+
+    try:
+        run_kwargs = dict(
+            stdout=plan.stdout_targets[0],
+            stderr=plan.stderr_targets[0],
+            timeout=timeout,
+            cwd=str(work_dir),
+            env=env,
+        )
+        if plan.first_stdin_file is not None:
+            run_kwargs["stdin"] = plan.first_stdin_file
+        elif plan.first_stdin_bytes is not None:
+            run_kwargs["input"] = plan.first_stdin_bytes
+        result = srv.subprocess.run(sandbox_args, **run_kwargs)
+
+        stdout_bytes = result.stdout if result.stdout is not None else b""
+        stderr_bytes = result.stderr if result.stderr is not None else b""
+
+        if shared_read_fd is not None:
+            combined = os.read(shared_read_fd, MAX_OUTPUT + 1)
+            stdout_bytes = combined
+            stderr_bytes = b""
+
+        return (
+            result.returncode,
+            stdout_bytes,
+            stderr_bytes,
+            plan.all_report[-1] if plan.all_report else [],
+        )
+
+    except _stdlib_subprocess.TimeoutExpired:
+        return 1, f"Command timed out after {timeout}s".encode(), b"", []
+    except FileNotFoundError:
+        return 1, f"Sandbox binary not found: {SANDBOX_BIN}".encode(), b"", []
+    except OSError as e:
+        return 1, f"Error running command: {e}".encode(), b"", []
+    finally:
+        for item in to_close:
+            try:
+                if isinstance(item, int):
+                    os.close(item)
+                else:
+                    item.close()
+            except OSError:
+                pass
+
+
+def _launch_pipeline_foreground(
+    plan: PipelinePlan,
+    work_dir: Path,
+    timeout: int,
+) -> tuple[int, bytes, bytes, list[str]]:
+    """Launch a multi-stage pipeline via chained ``Popen`` (foreground)."""
+    srv = _get_server()
+    invocations = plan.invocations
+
+    procs: list[_stdlib_subprocess.Popen] = []
+    prev: Optional[_stdlib_subprocess.Popen] = None
+    stdin_writer_thread: Optional[threading.Thread] = None
+
+    try:
+        for i, (sandbox_args, env, _redirects) in enumerate(invocations):
+            # Determine stdin for this stage
+            if prev is not None:
+                stage_stdin = prev.stdout
+            elif i == 0 and plan.first_stdin_file is not None:
+                stage_stdin = plan.first_stdin_file
+            elif i == 0 and plan.first_stdin_bytes is not None:
+                stage_stdin = _stdlib_subprocess.PIPE
+            else:
+                stage_stdin = None
+
+            p = srv.subprocess.Popen(
+                sandbox_args,
+                stdin=stage_stdin,
+                stdout=plan.stdout_targets[i],
+                stderr=plan.stderr_targets[i],
+                cwd=str(work_dir),
+                env=env,
+            )
+            if prev is not None:
+                prev.stdout.close()  # parent no longer holds the read end
+            procs.append(p)
+            prev = p
+
+            # If first stage has stdin_bytes, write them from a daemon thread
+            if i == 0 and plan.first_stdin_bytes is not None and p.stdin is not None:
+
+                def _write_stdin(pipe, data):
+                    try:
+                        pipe.write(data)
+                    finally:
+                        pipe.close()
+
+                stdin_writer_thread = threading.Thread(
+                    target=_write_stdin,
+                    args=(p.stdin, plan.first_stdin_bytes),
+                    daemon=True,
+                )
+                stdin_writer_thread.start()
+
+    except Exception as e:
+        # Clean up already-launched procs and open handles.
+        for p in procs:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+        for p in procs:
+            p.wait()
+        for fh in plan.all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if plan.last_shared_read_fd is not None:
+            try:
+                os.close(plan.last_shared_read_fd)
+            except OSError:
+                pass
+        return 1, f"Failed to launch pipeline: {e}".encode(), b"", []
+
+    # Drain the stderr of every stage but the last on a thread.
+    last = procs[-1]
+    stderr_bufs: dict[int, bytes] = {}
+    bufs_lock = threading.Lock()
+
+    def _drain_stderr(i: int, p: _stdlib_subprocess.Popen) -> None:
+        if p.stderr is None:
+            return
+        data = p.stderr.read()
+        p.stderr.close()
+        with bufs_lock:
+            stderr_bufs[i] = data
+
+    threads: list[threading.Thread] = []
+    for i, p in enumerate(procs[:-1]):
+        if p.stderr is not None:
+            t = threading.Thread(target=_drain_stderr, args=(i, p), daemon=True)
+            t.start()
+            threads.append(t)
+
+    timed_out = False
+    try:
+        stdout_bytes, last_stderr = last.communicate(timeout=timeout)
+    except _stdlib_subprocess.TimeoutExpired:
+        timed_out = True
+
+    # Reap every process that is still running.
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+    for p in procs:
+        p.wait()
+
+    # Drain threads complete.
+    for t in threads:
+        t.join(timeout=1)
+
+    # Close any file handles opened for redirects.
+    for fh in plan.all_to_close:
+        try:
+            fh.close()
+        except OSError:
+            pass
+    if plan.last_shared_read_fd is not None:
+        try:
+            os.close(plan.last_shared_read_fd)
+        except OSError:
+            pass
+
+    if timed_out:
+        if last.stdout is not None:
+            try:
+                last.stdout.close()
+            except OSError:
+                pass
+        if last.stderr is not None:
+            try:
+                last.stderr.close()
+            except OSError:
+                pass
+        return 1, f"Pipeline timed out after {timeout}s".encode(), b"", []
+
+    rc = last.returncode
+    with bufs_lock:
+        intermediate_err = b"\n".join(
+            stderr_bufs.get(i, b"") for i in range(len(procs) - 1)
+        )
+    combined_err = (intermediate_err + b"\n" + (last_stderr or b"")).strip()
+
+    if stdout_bytes is None:
+        stdout_bytes = b""
+
+    return (
+        rc,
+        stdout_bytes,
+        combined_err,
+        plan.all_report[-1] if plan.all_report else [],
+    )
+
+
+def _launch_background(
+    plan: PipelinePlan,
+    work_dir: Path,
+) -> tuple[int, str]:
+    """Launch a pipeline in the background via chained ``Popen``.
+
+    Returns ``(0, message)`` with the PID and (if applicable) log path.
+    """
+    srv = _get_server()
+    invocations = plan.invocations
+
+    procs: list[_stdlib_subprocess.Popen] = []
+    prev: Optional[_stdlib_subprocess.Popen] = None
+    try:
+        for i, (sandbox_args, env, _redirects) in enumerate(invocations):
+            if prev is not None:
+                stage_stdin = prev.stdout
+            elif i == 0 and plan.first_stdin_file is not None:
+                stage_stdin = plan.first_stdin_file
+            else:
+                stage_stdin = None
+            p = srv.subprocess.Popen(
+                sandbox_args,
+                stdin=stage_stdin,
+                stdout=plan.stdout_targets[i],
+                stderr=plan.stderr_targets[i],
+                cwd=str(work_dir),
+                env=env,
+                start_new_session=True,
+            )
+            if prev is not None:
+                prev.stdout.close()
+            procs.append(p)
+            prev = p
+    except Exception as e:
+        # Clean up already-launched procs and open handles so nothing leaks.
+        for p in procs:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+        for p in procs:
+            p.wait()
+        for fh in plan.all_to_close:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        return 1, f"Failed to launch background pipeline: {e}"
+
+    # Parent releases its handles; children hold their own copies.
+    for fh in plan.all_to_close:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+    # Register every launched pid so the reaper thread only reaps our own
+    # children and never races with a concurrent foreground process.
+    with _bg_pids_lock:
+        for p in procs:
+            _bg_pids.add(p.pid)
+
+    # Build the message with report details.
+    if plan.sink and plan.sink.opened:
+        msg_parts = [f"Backgrounded PID {procs[0].pid}; output -> {plan.log_path}"]
+    else:
+        msg_parts = [f"Backgrounded PID {procs[0].pid}"]
+    # Collect all unique report lines across stages.
+    seen: set[str] = set()
+    for rpt in plan.all_report:
+        for line in rpt:
+            if line not in seen:
+                msg_parts.append(line)
+                seen.add(line)
+
+    srv._start_reaper()
+    return 0, "\n".join(msg_parts)
+
+
+# ---------------------------------------------------------------------------
 # Single-segment execution
 # ---------------------------------------------------------------------------
 
@@ -190,71 +717,12 @@ def _run_segment_core(
     stderr_bytes, report_lines)``.  ``stdout_bytes`` and ``stderr_bytes``
     are the captured output (may be empty but never ``None``).
     """
-    srv = _get_server()
-    inv = srv._build_invocation(command, work_dir, expansion=expansion)
-    if isinstance(inv, EmptyInvocation):
-        return 0, b"", b"", []  # empty command
-    if isinstance(inv, InvocationError):
-        return 1, inv.message.encode("utf-8", errors="replace"), b"", []
-    binary, sandbox_args, env, cfg, redirects = (
-        inv.binary, inv.sandbox_args, inv.env, inv.cfg, inv.redirects,
-    )
-
-    # Narrow the TOCTOU window for local binaries.
-    if cfg.get("is_local_binary") and not srv._binary_still_contained(binary, work_dir):
-        msg = f"Local binary no longer valid inside working directory: {binary}"
-        return 1, msg.encode("utf-8", errors="replace"), b"", []
-
-    try:
-        plan = srv._resolve_fd_targets(
-            redirects, _stdlib_subprocess.PIPE, _stdlib_subprocess.PIPE,
-        )
-        stdout_t = plan.stdout
-        stderr_t = plan.stderr
-        to_close = plan.to_close
-        report = plan.report
-        shared_read_fd = plan.shared_read_fd
-        stdin_bytes = plan.stdin_bytes
-        stdin_file = plan.stdin_file
-    except (OSError, ValueError) as e:
-        return 1, f"Error opening redirect target: {e}".encode(), b"", []
-
-    if shared_read_fd is not None:
-        to_close.append(shared_read_fd)
-
-    try:
-        run_kwargs = dict(stdout=stdout_t, stderr=stderr_t, timeout=timeout, cwd=str(work_dir), env=env)
-        if stdin_file is not None:
-            run_kwargs["stdin"] = stdin_file
-        elif stdin_bytes is not None:
-            run_kwargs["input"] = stdin_bytes
-        result = srv.subprocess.run(sandbox_args, **run_kwargs)
-
-        stdout_bytes = result.stdout if result.stdout is not None else b""
-        stderr_bytes = result.stderr if result.stderr is not None else b""
-
-        if shared_read_fd is not None:
-            combined = os.read(shared_read_fd, MAX_OUTPUT + 1)
-            stdout_bytes = combined
-            stderr_bytes = b""
-
-        return result.returncode, stdout_bytes, stderr_bytes, report
-
-    except _stdlib_subprocess.TimeoutExpired:
-        return 1, f"Command timed out after {timeout}s".encode(), b"", []
-    except FileNotFoundError:
-        return 1, f"Sandbox binary not found: {SANDBOX_BIN}".encode(), b"", []
-    except OSError as e:
-        return 1, f"Error running command: {e}".encode(), b"", []
-    finally:
-        for item in to_close:
-            try:
-                if isinstance(item, int):
-                    os.close(item)
-                else:
-                    item.close()
-            except OSError:
-                pass
+    plan = _build_pipeline_plan([command], work_dir, expansion, "foreground")
+    if plan is None:
+        return 0, b"", b"", []
+    if isinstance(plan, _PlanError):
+        return 1, plan.message.encode("utf-8", errors="replace"), b"", []
+    return _launch_segment_run(plan, work_dir, timeout)
 
 
 def _format_output(
@@ -318,222 +786,14 @@ def _run_pipeline_core(
     ``stdout_bytes`` is the last stage's captured stdout; ``stderr_bytes`` is
     the combined stderr from all stages.
     """
-    srv = _get_server()
-    invocations: list[tuple[list[str], Optional[dict[str, str]], list["Redirect"]]] = []
-    for i, seg in enumerate(segments):
-        inv = srv._build_invocation(seg, work_dir, expansion=expansion)
-        if isinstance(inv, EmptyInvocation):
-            continue  # empty segment inside a pipeline
-        if isinstance(inv, InvocationError):
-            return 1, inv.message.encode(), b"", []
-        binary, sandbox_args, env, cfg, redirects = (
-            inv.binary, inv.sandbox_args, inv.env, inv.cfg, inv.redirects,
-        )
-        if cfg.get("is_local_binary") and not srv._binary_still_contained(binary, work_dir):
-            msg = f"Local binary no longer valid inside working directory: {binary}"
-            return 1, msg.encode(), b"", []
-        # Reject heredoc/here-string/input-redirect on non-first pipeline stages
-        if i > 0:
-            for r in redirects:
-                if r.fd == 0:
-                    seg_str = _serialize_command(seg) if isinstance(seg, CommandNode) else seg
-                    return 1, (
-                        f"heredoc/here-string/input-redirect not allowed on "
-                        f"non-first pipeline stage: {seg_str}"
-                    ).encode(), b"", []
-        invocations.append((sandbox_args, env, redirects))
-
-    if not invocations:
+    plan = _build_pipeline_plan(segments, work_dir, expansion, "foreground")
+    if plan is None:
         return 0, b"", b"", []
-
-    # Reject stdout redirects on intermediate pipe stages.
-    for i, (_sa, _env, redirects) in enumerate(invocations[:-1]):
-        for r in redirects:
-            if r.fd == 1:
-                seg_str = _serialize_command(segments[i]) if isinstance(segments[i], CommandNode) else segments[i]
-                return 1, (
-                    f"Cannot redirect stdout of intermediate pipe stage: "
-                    f"{seg_str}"
-                ).encode(), b"", []
-
-    # Resolve fd targets per stage.
-    stdout_targets: list = []
-    stderr_targets: list = []
-    all_to_close: list = []
-    all_report: list[list[str]] = []
-    last_shared_read_fd = None
-    first_stdin_bytes: Optional[bytes] = None
-    first_stdin_file: Optional[object] = None
-    try:
-        for i, (_sa, _env, redirects) in enumerate(invocations):
-            is_last = i == len(invocations) - 1
-            plan = srv._resolve_fd_targets(
-                redirects, _stdlib_subprocess.PIPE, _stdlib_subprocess.PIPE,
-                snapshot_2gt1=is_last,
-            )
-            st = plan.stdout
-            et = plan.stderr
-            tc = plan.to_close
-            rpt = plan.report
-            srf = plan.shared_read_fd
-            stdin_b = plan.stdin_bytes
-            stdin_f = plan.stdin_file
-            stdout_targets.append(st)
-            stderr_targets.append(et)
-            all_to_close.extend(tc)
-            all_report.append(rpt)
-            if is_last:
-                last_shared_read_fd = srf
-            if i == 0:
-                if stdin_b is not None:
-                    first_stdin_bytes = stdin_b
-                if stdin_f is not None:
-                    first_stdin_file = stdin_f
-    except (OSError, ValueError) as e:
-        for fh in all_to_close:
-            try:
-                fh.close()
-            except OSError:
-                pass
-        return 1, f"Error opening redirect target: {e}".encode(), b"", []
-
-    # Launch every stage, chaining each one's stdout into the next one's stdin.
-    procs: list[_stdlib_subprocess.Popen] = []
-    prev: Optional[_stdlib_subprocess.Popen] = None
-    stdin_writer_thread: Optional[threading.Thread] = None
-    try:
-        for i, (sandbox_args, env, _redirects) in enumerate(invocations):
-            # Determine stdin for this stage
-            if prev is not None:
-                stage_stdin = prev.stdout
-            elif i == 0 and first_stdin_file is not None:
-                stage_stdin = first_stdin_file
-            elif i == 0 and first_stdin_bytes is not None:
-                stage_stdin = _stdlib_subprocess.PIPE
-            else:
-                stage_stdin = None
-
-            p = srv.subprocess.Popen(
-                sandbox_args,
-                stdin=stage_stdin,
-                stdout=stdout_targets[i],
-                stderr=stderr_targets[i],
-                cwd=str(work_dir),
-                env=env,
-            )
-            if prev is not None:
-                prev.stdout.close()  # parent no longer holds the read end
-            procs.append(p)
-            prev = p
-
-            # If first stage has stdin_bytes, write them from a daemon thread
-            if i == 0 and first_stdin_bytes is not None and p.stdin is not None:
-                def _write_stdin(pipe, data):
-                    try:
-                        pipe.write(data)
-                    finally:
-                        pipe.close()
-                stdin_writer_thread = threading.Thread(
-                    target=_write_stdin, args=(p.stdin, first_stdin_bytes), daemon=True,
-                )
-                stdin_writer_thread.start()
-    except Exception as e:
-        # Clean up already-launched procs and open handles.
-        for p in procs:
-            try:
-                p.kill()
-            except ProcessLookupError:
-                pass
-        for p in procs:
-            p.wait()
-        for fh in all_to_close:
-            try:
-                fh.close()
-            except OSError:
-                pass
-        if last_shared_read_fd is not None:
-            try:
-                os.close(last_shared_read_fd)
-            except OSError:
-                pass
-        return 1, f"Failed to launch pipeline: {e}".encode(), b"", []
-
-    # Drain the stderr of every stage but the last on a thread.
-    last = procs[-1]
-    stderr_bufs: dict[int, bytes] = {}
-    bufs_lock = threading.Lock()
-
-    def _drain_stderr(i: int, p: _stdlib_subprocess.Popen) -> None:
-        if p.stderr is None:
-            return
-        data = p.stderr.read()
-        p.stderr.close()
-        with bufs_lock:
-            stderr_bufs[i] = data
-
-    threads: list[threading.Thread] = []
-    for i, p in enumerate(procs[:-1]):
-        if p.stderr is not None:
-            t = threading.Thread(target=_drain_stderr, args=(i, p), daemon=True)
-            t.start()
-            threads.append(t)
-
-    timed_out = False
-    try:
-        stdout_bytes, last_stderr = last.communicate(timeout=timeout)
-    except _stdlib_subprocess.TimeoutExpired:
-        timed_out = True
-
-    # Reap every process that is still running.
-    for p in procs:
-        if p.poll() is None:
-            try:
-                p.kill()
-            except ProcessLookupError:
-                pass
-    for p in procs:
-        p.wait()
-
-    # Drain threads complete.
-    for t in threads:
-        t.join(timeout=1)
-
-    # Close any file handles opened for redirects.
-    for fh in all_to_close:
-        try:
-            fh.close()
-        except OSError:
-            pass
-    if last_shared_read_fd is not None:
-        try:
-            os.close(last_shared_read_fd)
-        except OSError:
-            pass
-
-    if timed_out:
-        if last.stdout is not None:
-            try:
-                last.stdout.close()
-            except OSError:
-                pass
-        if last.stderr is not None:
-            try:
-                last.stderr.close()
-            except OSError:
-                pass
-        return 1, f"Pipeline timed out after {timeout}s".encode(), b"", []
-
-    rc = last.returncode
-    with bufs_lock:
-        intermediate_err = b"\n".join(
-            stderr_bufs.get(i, b"") for i in range(len(procs) - 1)
-        )
-    combined_err = (intermediate_err + b"\n" + (last_stderr or b"")).strip()
-
-    if stdout_bytes is None:
-        stdout_bytes = b""
-
-    return rc, stdout_bytes, combined_err, all_report[-1] if all_report else []
+    if isinstance(plan, _PlanError):
+        return 1, plan.message.encode("utf-8", errors="replace"), b"", []
+    if len(plan.invocations) == 1:
+        return _launch_segment_run(plan, work_dir, timeout)  # one-stage fast path
+    return _launch_pipeline_foreground(plan, work_dir, timeout)
 
 
 def _run_pipeline(
@@ -802,164 +1062,9 @@ def _run_background(
 
     Returns ``(0, message)`` with the PID and log path.
     """
-    srv = _get_server()
-    invocations: list[tuple[list[str], Optional[dict[str, str]], list["Redirect"]]] = []
-    for i, seg in enumerate(segments):
-        inv = srv._build_invocation(seg, work_dir, expansion=expansion)
-        if isinstance(inv, EmptyInvocation):
-            continue  # empty segment inside a pipeline
-        if isinstance(inv, InvocationError):
-            return 1, inv.message  # error message
-        binary, sandbox_args, env, cfg, redirects = (
-            inv.binary, inv.sandbox_args, inv.env, inv.cfg, inv.redirects,
-        )
-        if cfg.get("is_local_binary") and not srv._binary_still_contained(binary, work_dir):
-            return 1, f"Local binary no longer valid inside working directory: {binary}"
-        # Reject heredoc/here-string/input-redirect on non-first pipeline stages
-        # (matches _run_pipeline_core).
-        if i > 0:
-            for r in redirects:
-                if r.fd == 0:
-                    seg_str = _serialize_command(seg) if isinstance(seg, CommandNode) else seg
-                    return 1, (
-                        f"heredoc/here-string/input-redirect not allowed on "
-                        f"non-first pipeline stage: {seg_str}"
-                    )
-        invocations.append((sandbox_args, env, redirects))
-
-    if not invocations:
+    plan = _build_pipeline_plan(segments, work_dir, expansion, "background")
+    if plan is None:
         return 0, ""
-
-    # Reject stdout redirects on intermediate pipe stages.
-    for i, (_sa, _env, redirects) in enumerate(invocations[:-1]):
-        for r in redirects:
-            if r.fd == 1:
-                seg_str = _serialize_command(segments[i]) if isinstance(segments[i], CommandNode) else segments[i]
-                return 1, (
-                    f"Cannot redirect stdout of intermediate pipe stage: "
-                    f"{seg_str}"
-                )
-
-    log_path = work_dir / f".bg-{int(time.time() * 1000)}.log"
-
-    # Sentinel marking "fall through to the background log". We only open the
-    # log lazily, after resolving fd targets, so we don't create an empty log
-    # file when the last stage redirects both stdout and stderr to user files.
-    LOG_SENTINEL = object()
-
-    # Resolve fd targets per stage; last stage defaults to the log file.
-    stdout_targets: list = []
-    stderr_targets: list = []
-    all_to_close: list = []
-    all_report: list[list[str]] = []
-    log_opened = False
-    log_fh = None
-    first_stdin_file: Optional[object] = None
-    try:
-        for i, (_sa, _env, redirects) in enumerate(invocations):
-            is_last = i == len(invocations) - 1
-            def_stdout = LOG_SENTINEL if is_last else _stdlib_subprocess.PIPE
-            def_stderr = LOG_SENTINEL if is_last else _stdlib_subprocess.PIPE
-            plan = srv._resolve_fd_targets(
-                redirects, def_stdout, def_stderr, snapshot_2gt1=is_last,
-            )
-            st = plan.stdout
-            et = plan.stderr
-            tc = plan.to_close
-            rpt = plan.report
-            _srf = plan.shared_read_fd
-            _stdin_b = plan.stdin_bytes
-            stdin_f = plan.stdin_file
-            if is_last:
-                # Substitute the log handle for any fd that fell through to the
-                # sentinel (i.e. was not redirected to a user file).
-                if st is LOG_SENTINEL or et is LOG_SENTINEL:
-                    if not log_opened:
-                        log_fh = open(str(log_path), "wb")
-                        all_to_close.append(log_fh)
-                        log_opened = True
-                    if st is LOG_SENTINEL:
-                        st = log_fh
-                    if et is LOG_SENTINEL:
-                        et = log_fh
-            stdout_targets.append(st)
-            stderr_targets.append(et)
-            all_to_close.extend(tc)
-            all_report.append(rpt)
-            if i == 0 and stdin_f is not None:
-                first_stdin_file = stdin_f
-    except OSError as e:
-        for fh in all_to_close:
-            try:
-                fh.close()
-            except OSError:
-                pass
-        return 1, f"Error opening redirect target: {e}"
-
-    procs: list[_stdlib_subprocess.Popen] = []
-    prev: Optional[_stdlib_subprocess.Popen] = None
-    try:
-        for i, (sandbox_args, env, _redirects) in enumerate(invocations):
-            if prev is not None:
-                stage_stdin = prev.stdout
-            elif i == 0 and first_stdin_file is not None:
-                stage_stdin = first_stdin_file
-            else:
-                stage_stdin = None
-            p = srv.subprocess.Popen(
-                sandbox_args,
-                stdin=stage_stdin,
-                stdout=stdout_targets[i],
-                stderr=stderr_targets[i],
-                cwd=str(work_dir),
-                env=env,
-                start_new_session=True,
-            )
-            if prev is not None:
-                prev.stdout.close()
-            procs.append(p)
-            prev = p
-    except Exception as e:
-        # Clean up already-launched procs and open handles so nothing leaks.
-        for p in procs:
-            try:
-                p.kill()
-            except ProcessLookupError:
-                pass
-        for p in procs:
-            p.wait()
-        for fh in all_to_close:
-            try:
-                fh.close()
-            except OSError:
-                pass
-        return 1, f"Failed to launch background pipeline: {e}"
-
-    # Parent releases its handles; children hold their own copies.
-    for fh in all_to_close:
-        try:
-            fh.close()
-        except OSError:
-            pass
-
-    # Register every launched pid so the reaper thread only reaps our own
-    # children and never races with a concurrent foreground process.
-    with _bg_pids_lock:
-        for p in procs:
-            _bg_pids.add(p.pid)
-
-    # Build the message with report details.
-    if log_opened:
-        msg_parts = [f"Backgrounded PID {procs[0].pid}; output -> {log_path}"]
-    else:
-        msg_parts = [f"Backgrounded PID {procs[0].pid}"]
-    # Collect all unique report lines across stages.
-    seen: set[str] = set()
-    for rpt in all_report:
-        for line in rpt:
-            if line not in seen:
-                msg_parts.append(line)
-                seen.add(line)
-
-    srv._start_reaper()
-    return 0, "\n".join(msg_parts)
+    if isinstance(plan, _PlanError):
+        return 1, plan.message
+    return _launch_background(plan, work_dir)
