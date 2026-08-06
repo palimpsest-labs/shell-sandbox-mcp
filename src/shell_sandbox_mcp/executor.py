@@ -6,6 +6,7 @@ import os
 import subprocess as _stdlib_subprocess
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -40,39 +41,59 @@ def _get_server():
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Invocation:
+    """A successfully built sandbox invocation."""
+    binary: str
+    sandbox_args: list[str]
+    env: Optional[dict[str, str]] = None
+    cfg: dict = field(default_factory=dict)
+    redirects: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class InvocationError:
+    """_build_invocation rejected the command (error message)."""
+    message: str
+
+
+@dataclass(frozen=True)
+class EmptyInvocation:
+    """Empty command — nothing to run."""
+
+
 def _build_invocation(
     command,
     work_dir: Path,
     expansion: Optional[Expansion] = None,
-) -> tuple[Optional[str], Optional[list[str]], Optional[dict[str, str]], Optional[dict], list["Redirect"]]:
+) -> "Invocation | InvocationError | EmptyInvocation":
     """Parse, resolve, and build the sandbox invocation for one segment.
 
     Accepts either a ``str`` (legacy) or a :class:`parser.CommandNode`
-    (AST-native — no re-lexing).  Returns ``(binary, sandbox_args, env,
-    cfg, redirects)`` on success.  ``env`` is always a dict (allowlisted
-    base + per-command overrides).  On failure, returns a tuple whose first
-    element is the error message (string) and whose remaining elements are
-    ``None`` / empty: ``(error_msg, None, None, None, [])``.  An empty
-    command returns ``(None, None, None, None, [])``.
+    (AST-native — no re-lexing).  Returns an :class:`Invocation` on success
+    (``env`` is always a dict — allowlisted base + per-command overrides).
+    Returns an :class:`InvocationError` when the command is rejected, carrying
+    the error message.  Returns an :class:`EmptyInvocation` for an empty
+    command (nothing to run).
     """
     from .parser import Redirect  # for type annotation only
     srv = _get_server()
     args, raw_redirects, parse_err = srv._extract_redirects(command, expansion)
     if parse_err is not None:
-        return parse_err, None, None, None, []
+        return InvocationError(parse_err)
 
     if not args:
-        return None, None, None, None, []
+        return EmptyInvocation()
 
     # Validate redirect paths against the working directory
     redirects, path_err = srv._validate_redirect_paths(raw_redirects, work_dir)
     if path_err is not None:
-        return path_err, None, None, None, []
+        return InvocationError(path_err)
 
     # Resolve and validate against the allowlist (or a local binary under cwd)
     binary, final_args, cfg = srv._resolve_command(args, work_dir)
     if binary is None:
-        return final_args, None, None, None, []  # error message
+        return InvocationError(final_args)  # error message
 
     # Build sandbox invocation via the exec wrapper (bypasses posix_spawn APE issue)
     # Prepend per-command args (e.g. python3's "-S") before the user's args.
@@ -118,7 +139,7 @@ def _build_invocation(
         try:
             site_base.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            return f"Error creating python site dir {site_base}: {e}", None, None, None, []
+            return InvocationError(f"Error creating python site dir {site_base}: {e}")
         site_packages = site_base / "lib" / "python3.12" / "site-packages"
         site_packages.mkdir(parents=True, exist_ok=True)
         unveil_env["PYTHONUSERBASE"] = str(site_base)
@@ -148,7 +169,7 @@ def _build_invocation(
             cur = env.get("PATH", "")
             env["PATH"] = f"{prefix}:{cur}" if cur else prefix
 
-    return binary, sandbox_args, env, cfg, redirects
+    return Invocation(binary, sandbox_args, env, cfg, redirects)
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +191,14 @@ def _run_segment_core(
     are the captured output (may be empty but never ``None``).
     """
     srv = _get_server()
-    binary, sandbox_args, env, cfg, redirects = srv._build_invocation(
-        command, work_dir, expansion=expansion,
+    inv = srv._build_invocation(command, work_dir, expansion=expansion)
+    if isinstance(inv, EmptyInvocation):
+        return 0, b"", b"", []  # empty command
+    if isinstance(inv, InvocationError):
+        return 1, inv.message.encode("utf-8", errors="replace"), b"", []
+    binary, sandbox_args, env, cfg, redirects = (
+        inv.binary, inv.sandbox_args, inv.env, inv.cfg, inv.redirects,
     )
-    if sandbox_args is None:
-        if binary is None:
-            return 0, b"", b"", []  # empty command
-        return 1, binary.encode("utf-8", errors="replace"), b"", []  # error
 
     # Narrow the TOCTOU window for local binaries.
     if cfg.get("is_local_binary") and not srv._binary_still_contained(binary, work_dir):
@@ -294,14 +316,14 @@ def _run_pipeline_core(
     srv = _get_server()
     invocations: list[tuple[list[str], Optional[dict[str, str]], list["Redirect"]]] = []
     for i, seg in enumerate(segments):
-        binary, sandbox_args, env, cfg, redirects = srv._build_invocation(
-            seg, work_dir, expansion=expansion,
+        inv = srv._build_invocation(seg, work_dir, expansion=expansion)
+        if isinstance(inv, EmptyInvocation):
+            continue  # empty segment inside a pipeline
+        if isinstance(inv, InvocationError):
+            return 1, inv.message.encode(), b"", []
+        binary, sandbox_args, env, cfg, redirects = (
+            inv.binary, inv.sandbox_args, inv.env, inv.cfg, inv.redirects,
         )
-        if sandbox_args is None:
-            if binary is None:
-                continue  # empty segment inside a pipeline
-            # error message
-            return 1, binary.encode(), b"", []
         if cfg.get("is_local_binary") and not srv._binary_still_contained(binary, work_dir):
             msg = f"Local binary no longer valid inside working directory: {binary}"
             return 1, msg.encode(), b"", []
@@ -771,13 +793,14 @@ def _run_background(
     srv = _get_server()
     invocations: list[tuple[list[str], Optional[dict[str, str]], list["Redirect"]]] = []
     for i, seg in enumerate(segments):
-        binary, sandbox_args, env, cfg, redirects = srv._build_invocation(
-            seg, work_dir, expansion=expansion,
+        inv = srv._build_invocation(seg, work_dir, expansion=expansion)
+        if isinstance(inv, EmptyInvocation):
+            continue  # empty segment inside a pipeline
+        if isinstance(inv, InvocationError):
+            return 1, inv.message  # error message
+        binary, sandbox_args, env, cfg, redirects = (
+            inv.binary, inv.sandbox_args, inv.env, inv.cfg, inv.redirects,
         )
-        if sandbox_args is None:
-            if binary is None:
-                continue  # empty segment inside a pipeline
-            return 1, binary  # error message
         if cfg.get("is_local_binary") and not srv._binary_still_contained(binary, work_dir):
             return 1, f"Local binary no longer valid inside working directory: {binary}"
         # Reject heredoc/here-string/input-redirect on non-first pipeline stages

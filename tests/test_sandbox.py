@@ -600,16 +600,16 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         server._build_invocation = self._orig_build
         self._tmp.cleanup()
 
-    def _fake_build(self, mapping: dict[str, tuple]):
+    def _fake_build(self, mapping: dict[str, server.Invocation]):
         def fake(command: str, work_dir, expansion=None):
-            return mapping.get(command, (None, None, None, None, []))
+            return mapping.get(command, server.EmptyInvocation())
 
         server._build_invocation = fake
 
     def test_real_two_stage_pipe(self) -> None:
         self._fake_build({
-            "producer": ("/bin/echo", ["/bin/echo", "hello"], None, {}, []),
-            "consumer": ("/usr/bin/wc", ["/usr/bin/wc", "-c"], None, {}, []),
+            "producer": server.Invocation("/bin/echo", ["/bin/echo", "hello"], None, {}, []),
+            "consumer": server.Invocation("/usr/bin/wc", ["/usr/bin/wc", "-c"], None, {}, []),
         })
         rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 10)
         self.assertEqual(rc, 0)
@@ -621,14 +621,14 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         # upstream stage and still return promptly without hanging or racing
         # on the stderr buffer.
         self._fake_build({
-            "producer": (
+            "producer": server.Invocation(
                 "/bin/sh",
                 ["/bin/sh", "-c", "echo out; while true; do echo err >&2; done"],
                 None,
                 {},
                 [],
             ),
-            "consumer": ("/usr/bin/head", ["/usr/bin/head", "-n1"], None, {}, []),
+            "consumer": server.Invocation("/usr/bin/head", ["/usr/bin/head", "-n1"], None, {}, []),
         })
         rc, out = server._run_pipeline(["producer", "consumer"], self.work_dir, 10)
         self.assertEqual(rc, 0)
@@ -639,8 +639,8 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         # A last stage that never exits must be killed and reported as a
         # timeout rather than hanging the tool.
         self._fake_build({
-            "producer": ("/bin/echo", ["/bin/echo", "hi"], None, {}, []),
-            "consumer": (
+            "producer": server.Invocation("/bin/echo", ["/bin/echo", "hi"], None, {}, []),
+            "consumer": server.Invocation(
                 "/bin/sh",
                 ["/bin/sh", "-c", "while true; do :; done"],
                 None,
@@ -657,9 +657,9 @@ class RunPipelineIntegrationTest(unittest.TestCase):
 
         grep = "/usr/bin/grep" if _os.path.exists("/usr/bin/grep") else "/bin/grep"
         self._fake_build({
-            "a": ("/bin/echo", ["/bin/echo", "one\ntwo\nthree"], None, {}, []),
-            "b": (grep, [grep, "two"], None, {}, []),
-            "c": ("/usr/bin/wc", ["/usr/bin/wc", "-l"], None, {}, []),
+            "a": server.Invocation("/bin/echo", ["/bin/echo", "one\ntwo\nthree"], None, {}, []),
+            "b": server.Invocation(grep, [grep, "two"], None, {}, []),
+            "c": server.Invocation("/usr/bin/wc", ["/usr/bin/wc", "-l"], None, {}, []),
         })
         rc, out = server._run_pipeline(["a", "b", "c"], self.work_dir, 10)
         self.assertEqual(rc, 0)
@@ -1106,31 +1106,23 @@ class BuildInvocationRedirectTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_redirect_resolved_to_work_dir(self) -> None:
-        binary, sandbox_args, env, cfg, redirects = server._build_invocation(
-            "echo hi > out.txt", self.root,
-        )
-        self.assertIsNotNone(binary)
-        self.assertIsNotNone(sandbox_args)
-        self.assertEqual(len(redirects), 1)
-        self.assertEqual(redirects[0].target_path, str((self.root / "out.txt").resolve()))
+        inv = server._build_invocation("echo hi > out.txt", self.root)
+        self.assertIsInstance(inv, server.Invocation)
+        self.assertEqual(len(inv.redirects), 1)
+        self.assertEqual(inv.redirects[0].target_path, str((self.root / "out.txt").resolve()))
         # Ensure > and out.txt are NOT in sandbox_args
-        self.assertNotIn(">", sandbox_args)
-        self.assertNotIn("out.txt", sandbox_args)
+        self.assertNotIn(">", inv.sandbox_args)
+        self.assertNotIn("out.txt", inv.sandbox_args)
 
     def test_escape_path_error(self) -> None:
-        err, binary, sandbox_args, cfg, redirects = server._build_invocation(
-            "echo > ../escape", self.root,
-        )
-        self.assertIsNotNone(err)
-        self.assertIn("escapes allowed roots", err)
-        self.assertIsNone(binary)
+        inv = server._build_invocation("echo > ../escape", self.root)
+        self.assertIsInstance(inv, server.InvocationError)
+        self.assertIn("escapes allowed roots", inv.message)
 
     def test_invalid_fd_error(self) -> None:
-        err, binary, sandbox_args, cfg, redirects = server._build_invocation(
-            "echo 3> f", self.root,
-        )
-        self.assertIsNotNone(err)
-        self.assertIn("only support fds 1 and 2", err)
+        inv = server._build_invocation("echo 3> f", self.root)
+        self.assertIsInstance(inv, server.InvocationError)
+        self.assertIn("only support fds 1 and 2", inv.message)
 
 
 # ---------------------------------------------------------------------------
@@ -1153,7 +1145,7 @@ class RunSegmentRedirectTest(unittest.TestCase):
     def _stub_build(self, redirects):
         """Stub _build_invocation to return a busybox echo invocation with given redirects."""
         def fake_build(command, work_dir, expansion=None):
-            return (
+            return server.Invocation(
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
                 None,
@@ -1336,7 +1328,7 @@ class RunPipelineRedirectTest(unittest.TestCase):
     def test_intermediate_stdout_redirect_rejected(self) -> None:
         def fake_build(command, work_dir, expansion=None):
             if command == "producer > f":
-                return (
+                return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
                     None,
@@ -1344,14 +1336,14 @@ class RunPipelineRedirectTest(unittest.TestCase):
                     [server.Redirect(fd=1, op='>', target_path=str(work_dir / "f"), target_fd=None, raw_target="f")],
                 )
             if command == "consumer":
-                return (
+                return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "cat"],
                     None,
                     {},
                     [],
                 )
-            return (None, None, None, None, [])
+            return server.EmptyInvocation()
 
         server._build_invocation = fake_build
         rc, out = server._run_pipeline(["producer > f", "consumer"], self.root, 10)
@@ -1363,7 +1355,7 @@ class RunPipelineRedirectTest(unittest.TestCase):
 
         def fake_build(command, work_dir, expansion=None):
             if command == "producer":
-                return (
+                return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "echo", "hello"],
                     None,
@@ -1371,14 +1363,14 @@ class RunPipelineRedirectTest(unittest.TestCase):
                     [],
                 )
             if command == f"consumer > {outfile}":
-                return (
+                return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "cat"],
                     None,
                     {},
                     [server.Redirect(fd=1, op='>', target_path=str(outfile), target_fd=None, raw_target="out.txt")],
                 )
-            return (None, None, None, None, [])
+            return server.EmptyInvocation()
 
         server._build_invocation = fake_build
 
@@ -1459,7 +1451,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         outfile = self.root / "out.txt"
 
         def fake_build(command, work_dir, expansion=None):
-            return (
+            return server.Invocation(
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
                 None,
@@ -1480,7 +1472,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         errfile = self.root / "err.txt"
 
         def fake_build(command, work_dir, expansion=None):
-            return (
+            return server.Invocation(
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
                 None,
@@ -1511,7 +1503,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
 
         def fake_build(command, work_dir, expansion=None):
             received["expansion"] = expansion
-            return (
+            return server.Invocation(
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "cat"],
                 None,
@@ -1561,7 +1553,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         """Non-first pipeline stage heredoc is rejected in background mode."""
         def fake_build(command, work_dir, expansion=None):
             if "echo" in command:
-                return (
+                return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
                     None,
@@ -1569,14 +1561,14 @@ class RunBackgroundRedirectTest(unittest.TestCase):
                     [],
                 )
             if "cat" in command:
-                return (
+                return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "cat"],
                     None,
                     {},
                     [server.Redirect(fd=0, op="<<", body="hello\n")],
                 )
-            return (None, None, None, None, [])
+            return server.EmptyInvocation()
 
         server._build_invocation = fake_build
         rc, out = server._run_background(
@@ -1608,7 +1600,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         server._start_reaper = lambda: None
 
         def fake_build(command, work_dir, expansion=None):
-            return (
+            return server.Invocation(
                 str(server.BUSYBOX_BIN.resolve()),
                 [str(server.BUSYBOX_BIN.resolve()), "cat"],
                 None,
@@ -1634,7 +1626,10 @@ class RunBackgroundRedirectTest(unittest.TestCase):
 
 from shell_sandbox_mcp.server import (
     CommandNode,
+    EmptyInvocation,
     Expansion,
+    Invocation,
+    InvocationError,
     ProgramNode,
     Redirect,
     SENTINEL_ARG,
@@ -2128,14 +2123,14 @@ class BuildInvocationHeredocTest(unittest.TestCase):
             arg_values={},
             heredoc_bodies={"\x01H0\x01": "body\n"},
         )
-        binary, sandbox_args, env, cfg, redirects = _build_invocation(
+        inv = _build_invocation(
             "cat << \x01H0\x01", self.root, expansion=expansion,
         )
-        self.assertIsNotNone(binary)
-        self.assertEqual(len(redirects), 1)
-        self.assertEqual(redirects[0].fd, 0)
-        self.assertEqual(redirects[0].op, "<<")
-        self.assertEqual(redirects[0].body, "body\n")
+        self.assertIsInstance(inv, Invocation)
+        self.assertEqual(len(inv.redirects), 1)
+        self.assertEqual(inv.redirects[0].fd, 0)
+        self.assertEqual(inv.redirects[0].op, "<<")
+        self.assertEqual(inv.redirects[0].body, "body\n")
 
 
 class RunSegmentCoreStdinTest(unittest.TestCase):
@@ -2164,7 +2159,7 @@ class RunSegmentCoreStdinTest(unittest.TestCase):
         server.subprocess.run = fake_run
 
         def fake_build(command, work_dir, expansion=None):
-            return (
+            return Invocation(
                 "/usr/bin/cat",
                 ["/usr/bin/cat"],
                 None,
@@ -2193,7 +2188,7 @@ class RunSegmentCoreStdinTest(unittest.TestCase):
         server.subprocess.run = fake_run
 
         def fake_build(command, work_dir, expansion=None):
-            return (
+            return Invocation(
                 "/usr/bin/echo",
                 ["/usr/bin/echo", "hi"],
                 None,
@@ -2223,7 +2218,7 @@ class RunSegmentCoreStdinTest(unittest.TestCase):
         server.subprocess.run = fake_run
 
         def fake_build(command, work_dir, expansion=None):
-            return (
+            return Invocation(
                 "/usr/bin/cat",
                 ["/usr/bin/cat"],
                 None,
@@ -2296,7 +2291,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
 
         def fake_build(command, work_dir, expansion=None):
             if "cat" in command:
-                return (
+                return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
                     None,
@@ -2304,14 +2299,14 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     [Redirect(fd=0, op="<<", body="hello\n")],
                 )
             if "grep" in command:
-                return (
+                return Invocation(
                     "/usr/bin/grep",
                     ["/usr/bin/grep", "x"],
                     None,
                     {},
                     [],
                 )
-            return (None, None, None, None, [])
+            return EmptyInvocation()
 
         server._build_invocation = fake_build
         server.subprocess.Popen = FakePopen
@@ -2329,7 +2324,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
         """Non-first stage with heredoc should be rejected."""
         def fake_build(command, work_dir, expansion=None):
             if "echo" in command:
-                return (
+                return Invocation(
                     "/usr/bin/echo",
                     ["/usr/bin/echo", "hi"],
                     None,
@@ -2337,14 +2332,14 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     [],
                 )
             if "cat" in command:
-                return (
+                return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
                     None,
                     {},
                     [Redirect(fd=0, op="<<", body="hello\n")],
                 )
-            return (None, None, None, None, [])
+            return EmptyInvocation()
 
         server._build_invocation = fake_build
 
@@ -2387,7 +2382,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
 
         def fake_build(command, work_dir, expansion=None):
             if "cat" in command:
-                return (
+                return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
                     None,
@@ -2395,14 +2390,14 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     [Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile))],
                 )
             if "grep" in command:
-                return (
+                return Invocation(
                     "/usr/bin/grep",
                     ["/usr/bin/grep", "x"],
                     None,
                     {},
                     [],
                 )
-            return (None, None, None, None, [])
+            return EmptyInvocation()
 
         server._build_invocation = fake_build
         server.subprocess.Popen = FakePopen
@@ -2422,7 +2417,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
         """< file on a non-first stage is rejected like a heredoc."""
         def fake_build(command, work_dir, expansion=None):
             if "echo" in command:
-                return (
+                return Invocation(
                     "/usr/bin/echo",
                     ["/usr/bin/echo", "hi"],
                     None,
@@ -2430,14 +2425,14 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     [],
                 )
             if "cat" in command:
-                return (
+                return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
                     None,
                     {},
                     [Redirect(fd=0, op="<", raw_target="in.txt", target_path="/tmp/in.txt")],
                 )
-            return (None, None, None, None, [])
+            return EmptyInvocation()
 
         server._build_invocation = fake_build
 
@@ -2581,7 +2576,7 @@ class ASTConsumptionTest(unittest.TestCase):
         def spy_build(command, work_dir, expansion=None):
             received_types.append(type(command))
             # Return error to short-circuit (avoid actual sandbox)
-            return "spy", None, None, None, []
+            return server.InvocationError("spy")
 
         server._build_invocation = spy_build
         server.shell_run("echo hi", cwd=str(self.allowed))
@@ -2639,7 +2634,7 @@ class ASTConsumptionTest(unittest.TestCase):
         server.split_legacy = counting_split
         # Stub _build_invocation to short-circuit
         def _fake_build(command, work_dir, expansion=None):
-            return "spy", None, None, None, []
+            return server.InvocationError("spy")
         server._build_invocation = _fake_build
 
         try:

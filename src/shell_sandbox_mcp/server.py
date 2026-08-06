@@ -110,6 +110,9 @@ from .builtins import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 from .executor import (  # noqa: F401
+    EmptyInvocation,
+    Invocation,
+    InvocationError,
     _build_invocation,
     _capture_stdout,
     _expand_command,
