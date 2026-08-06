@@ -75,6 +75,7 @@ from .containment import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 from .redirects import (  # noqa: F401
+    FdPlan,
     _extract_redirects,
     _resolve_fd_targets,
 )

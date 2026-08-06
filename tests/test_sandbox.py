@@ -1628,6 +1628,7 @@ from shell_sandbox_mcp.server import (
     CommandNode,
     EmptyInvocation,
     Expansion,
+    FdPlan,
     Invocation,
     InvocationError,
     ProgramNode,
@@ -2036,33 +2037,30 @@ class ResolveFdTargetsStdinTest(unittest.TestCase):
     def test_herestring_returns_stdin_bytes(self) -> None:
         redirs = [Redirect(fd=0, op="<<<", body="hello\n")]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        self.assertEqual(len(result), 7)
-        stdout_t, stderr_t, to_close, report, srf, stdin_b, stdin_f = result
-        self.assertEqual(stdin_b, b"hello\n")
-        self.assertIsNone(stdin_f)
-        self.assertIn("[stdin <<<]", report)
+        self.assertIsInstance(result, FdPlan)
+        self.assertEqual(result.stdin_bytes, b"hello\n")
+        self.assertIsNone(result.stdin_file)
+        self.assertIn("[stdin <<<]", result.report)
 
     def test_heredoc_returns_stdin_bytes(self) -> None:
         redirs = [Redirect(fd=0, op="<<", body="line1\nline2\n")]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        _, _, _, report, _, stdin_b, stdin_f = result
-        self.assertEqual(stdin_b, b"line1\nline2\n")
-        self.assertIsNone(stdin_f)
-        self.assertIn("[stdin <<]", report)
+        self.assertEqual(result.stdin_bytes, b"line1\nline2\n")
+        self.assertIsNone(result.stdin_file)
+        self.assertIn("[stdin <<]", result.report)
 
     def test_heredoc_tab_returns_stdin_bytes(self) -> None:
         redirs = [Redirect(fd=0, op="<<-", body="tabbed\n", strip_tabs=True)]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        _, _, _, report, _, stdin_b, _ = result
-        self.assertEqual(stdin_b, b"tabbed\n")
-        self.assertIn("[stdin <<-]", report)
+        self.assertEqual(result.stdin_bytes, b"tabbed\n")
+        self.assertIn("[stdin <<-]", result.report)
 
     def test_no_stdin_redirect_returns_none(self) -> None:
         redirs = [Redirect(fd=1, op=">", raw_target="out.txt", target_path="/tmp/out.txt")]
         result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-        self.assertEqual(len(result), 7)
-        self.assertIsNone(result[5])  # stdin_bytes is None
-        self.assertIsNone(result[6])  # stdin_file is None
+        self.assertIsInstance(result, FdPlan)
+        self.assertIsNone(result.stdin_bytes)
+        self.assertIsNone(result.stdin_file)
 
     def test_multiple_stdin_rejected_by_resolve(self) -> None:
         redirs = [
@@ -2079,15 +2077,14 @@ class ResolveFdTargetsStdinTest(unittest.TestCase):
             infile.write_text("data\n")
             redirs = [Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile))]
             result = _resolve_fd_targets(redirs, subprocess.PIPE, subprocess.PIPE)
-            self.assertEqual(len(result), 7)
-            stdout_t, stderr_t, to_close, report, srf, stdin_b, stdin_f = result
-            self.assertIsNone(stdin_b)
-            self.assertIsNotNone(stdin_f)
-            self.assertIn(f"[stdin <- {infile}]", report)
-            self.assertIn(stdin_f, to_close)
+            self.assertIsInstance(result, FdPlan)
+            self.assertIsNone(result.stdin_bytes)
+            self.assertIsNotNone(result.stdin_file)
+            self.assertIn(f"[stdin <- {infile}]", result.report)
+            self.assertIn(result.stdin_file, result.to_close)
             # Sanity: the file object actually reads the file content.
-            self.assertEqual(stdin_f.read(), b"data\n")
-            stdin_f.close()
+            self.assertEqual(result.stdin_file.read(), b"data\n")
+            result.stdin_file.close()
 
     def test_input_redirect_missing_file_raises(self) -> None:
         redirs = [Redirect(fd=0, op="<", raw_target="nope.txt", target_path="/nonexistent/nope.txt")]

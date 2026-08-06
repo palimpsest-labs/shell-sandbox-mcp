@@ -206,11 +206,16 @@ def _run_segment_core(
         return 1, msg.encode("utf-8", errors="replace"), b"", []
 
     try:
-        stdout_t, stderr_t, to_close, report, shared_read_fd, stdin_bytes, stdin_file = (
-            srv._resolve_fd_targets(
-                redirects, _stdlib_subprocess.PIPE, _stdlib_subprocess.PIPE,
-            )
+        plan = srv._resolve_fd_targets(
+            redirects, _stdlib_subprocess.PIPE, _stdlib_subprocess.PIPE,
         )
+        stdout_t = plan.stdout
+        stderr_t = plan.stderr
+        to_close = plan.to_close
+        report = plan.report
+        shared_read_fd = plan.shared_read_fd
+        stdin_bytes = plan.stdin_bytes
+        stdin_file = plan.stdin_file
     except (OSError, ValueError) as e:
         return 1, f"Error opening redirect target: {e}".encode(), b"", []
 
@@ -362,10 +367,17 @@ def _run_pipeline_core(
     try:
         for i, (_sa, _env, redirects) in enumerate(invocations):
             is_last = i == len(invocations) - 1
-            st, et, tc, rpt, srf, stdin_b, stdin_f = srv._resolve_fd_targets(
+            plan = srv._resolve_fd_targets(
                 redirects, _stdlib_subprocess.PIPE, _stdlib_subprocess.PIPE,
                 snapshot_2gt1=is_last,
             )
+            st = plan.stdout
+            et = plan.stderr
+            tc = plan.to_close
+            rpt = plan.report
+            srf = plan.shared_read_fd
+            stdin_b = plan.stdin_bytes
+            stdin_f = plan.stdin_file
             stdout_targets.append(st)
             stderr_targets.append(et)
             all_to_close.extend(tc)
@@ -848,9 +860,16 @@ def _run_background(
             is_last = i == len(invocations) - 1
             def_stdout = LOG_SENTINEL if is_last else _stdlib_subprocess.PIPE
             def_stderr = LOG_SENTINEL if is_last else _stdlib_subprocess.PIPE
-            st, et, tc, rpt, _srf, _stdin_b, stdin_f = srv._resolve_fd_targets(
+            plan = srv._resolve_fd_targets(
                 redirects, def_stdout, def_stderr, snapshot_2gt1=is_last,
             )
+            st = plan.stdout
+            et = plan.stderr
+            tc = plan.to_close
+            rpt = plan.report
+            _srf = plan.shared_read_fd
+            _stdin_b = plan.stdin_bytes
+            stdin_f = plan.stdin_file
             if is_last:
                 # Substitute the log handle for any fd that fell through to the
                 # sentinel (i.e. was not redirected to a user file).

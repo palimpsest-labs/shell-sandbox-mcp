@@ -6,9 +6,22 @@ that converts parsed Redirect objects into subprocess file descriptors.
 
 import os
 import subprocess
+from dataclasses import dataclass
 from typing import Optional
 
 from .parser import Redirect, extract_redirects as _parser_extract_redirects
+
+
+@dataclass
+class FdPlan:
+    """Resolved file-descriptor plan for running one command segment."""
+    stdout: object
+    stderr: object
+    to_close: list
+    report: list
+    shared_read_fd: Optional[int] = None
+    stdin_bytes: Optional[bytes] = None
+    stdin_file: Optional[object] = None
 
 
 def _extract_redirects(
@@ -30,17 +43,17 @@ def _resolve_fd_targets(
     default_stderr,
     *,
     snapshot_2gt1: bool = True,
-) -> tuple:
-    """Apply redirects in order (last-wins per fd) and return fd targets.
+) -> FdPlan:
+    """Apply redirects in order (last-wins per fd) and return an ``FdPlan``.
 
-    Returns ``(stdout_target, stderr_target, files_to_close, report_lines,
-    shared_pipe_read_fd, stdin_bytes, stdin_file)`` where
-    ``shared_pipe_read_fd`` is ``None`` unless a ``1>&2`` (or ``2>&1`` when
-    ``snapshot_2gt1``) redirect forced creation of a shared pipe (when the
-    source fd is ``subprocess.PIPE``).  ``stdin_bytes`` is ``None`` unless a
-    heredoc/here-string redirect was provided; ``stdin_file`` is ``None``
-    unless a ``< file`` input redirect was provided (an open binary file
-    object).
+    Returns an :class:`FdPlan` with attributes ``stdout``, ``stderr``,
+    ``to_close``, ``report``, ``shared_read_fd``, ``stdin_bytes`` and
+    ``stdin_file``.  ``shared_read_fd`` is ``None`` unless a ``1>&2`` (or
+    ``2>&1`` when ``snapshot_2gt1``) redirect forced creation of a shared
+    pipe (when the source fd is ``subprocess.PIPE``).  ``stdin_bytes`` is
+    ``None`` unless a heredoc/here-string redirect was provided;
+    ``stdin_file`` is ``None`` unless a ``< file`` input redirect was
+    provided (an open binary file object).
 
     ``snapshot_2gt1=False`` is used for intermediate pipeline stages, where
     a ``2>&1`` must merge stderr into the existing stdout pipe (so a later
@@ -137,7 +150,12 @@ def _resolve_fd_targets(
                     stdout_target = stderr_target
                 report_lines.append("[stdout -> stderr]")
 
-    return (
-        stdout_target, stderr_target, files_to_close, report_lines,
-        shared_pipe_read_fd, stdin_bytes, stdin_file,
+    return FdPlan(
+        stdout=stdout_target,
+        stderr=stderr_target,
+        to_close=files_to_close,
+        report=report_lines,
+        shared_read_fd=shared_pipe_read_fd,
+        stdin_bytes=stdin_bytes,
+        stdin_file=stdin_file,
     )
