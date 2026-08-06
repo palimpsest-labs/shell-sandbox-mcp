@@ -382,10 +382,16 @@ class ShellRunChainingTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _stub(self, rc_map: dict[str, int]) -> None:
-        def fake(command: str, work_dir: Path, timeout: int, expansion=None) -> tuple[int, str]:
-            self.calls.append(command)
-            rc = rc_map.get(command, 0)
-            return rc, f"out:{command}" if rc == 0 else f"err:{command}"
+        def fake(command, work_dir: Path, timeout: int, expansion=None) -> tuple[int, str]:
+            # command may be a str (legacy) or CommandNode (AST-native)
+            cmd_str = (
+                _serialize_command(command)
+                if isinstance(command, CommandNode)
+                else command
+            )
+            self.calls.append(cmd_str)
+            rc = rc_map.get(cmd_str, 0)
+            return rc, f"out:{cmd_str}" if rc == 0 else f"err:{cmd_str}"
 
         server._run_segment = fake
 
@@ -471,20 +477,36 @@ class ShellRunPipelineTest(unittest.TestCase):
         segment_rc = segment_rc or {}
         background_rc = background_rc or {}
 
-        def fake_pipeline(stages: list[str], work_dir, timeout, expansion=None):
-            self.pipeline_calls.append(stages)
-            rc = pipeline_rc.get(tuple(stages), 0)
-            return rc, f"pipe:{'|'.join(stages)}" if rc == 0 else f"err-pipe:{'|'.join(stages)}"
+        def fake_pipeline(stages, work_dir, timeout, expansion=None):
+            # stages may be list[str] (legacy) or list[CommandNode] (AST-native)
+            str_stages = [
+                _serialize_command(s) if isinstance(s, CommandNode) else s
+                for s in stages
+            ]
+            self.pipeline_calls.append(str_stages)
+            rc = pipeline_rc.get(tuple(str_stages), 0)
+            return rc, f"pipe:{'|'.join(str_stages)}" if rc == 0 else f"err-pipe:{'|'.join(str_stages)}"
 
-        def fake_segment(command: str, work_dir, timeout, expansion=None):
-            self.segment_calls.append(command)
-            rc = segment_rc.get(command, 0)
-            return rc, f"out:{command}" if rc == 0 else f"err:{command}"
+        def fake_segment(command, work_dir, timeout, expansion=None):
+            # command may be a str (legacy) or CommandNode (AST-native)
+            cmd_str = (
+                _serialize_command(command)
+                if isinstance(command, CommandNode)
+                else command
+            )
+            self.segment_calls.append(cmd_str)
+            rc = segment_rc.get(cmd_str, 0)
+            return rc, f"out:{cmd_str}" if rc == 0 else f"err:{cmd_str}"
 
-        def fake_background(stages: list[str], work_dir, expansion=None):
-            self.background_calls.append(stages)
-            rc = background_rc.get(tuple(stages), 0)
-            return rc, f"bg:{'|'.join(stages)}"
+        def fake_background(stages, work_dir, expansion=None):
+            # stages may be list[str] (legacy) or list[CommandNode] (AST-native)
+            str_stages = [
+                _serialize_command(s) if isinstance(s, CommandNode) else s
+                for s in stages
+            ]
+            self.background_calls.append(str_stages)
+            rc = background_rc.get(tuple(str_stages), 0)
+            return rc, f"bg:{'|'.join(str_stages)}"
 
         server._run_pipeline = fake_pipeline
         server._run_segment = fake_segment
@@ -1611,7 +1633,9 @@ class RunBackgroundRedirectTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 from shell_sandbox_mcp.server import (
+    CommandNode,
     Expansion,
+    ProgramNode,
     Redirect,
     SENTINEL_ARG,
     SENTINEL_HD,
@@ -1622,6 +1646,7 @@ from shell_sandbox_mcp.server import (
     _resolve_fd_targets,
     _run_segment_core,
     _run_pipeline_core,
+    _serialize_command,
     MAX_SUBST_DEPTH,
     MAX_SUBST_COUNT,
     MAX_SUBST_OUTPUT,
@@ -1786,7 +1811,7 @@ class ExpandCommandTest(unittest.TestCase):
 
     def test_unquoted_heredoc(self) -> None:
         cmd = "cat <<EOF\nhello\nworld\nEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         # Should contain << + sentinel
         self.assertIn("<<", expanded)
         m = SENTINEL_HD.search(expanded)
@@ -1798,7 +1823,7 @@ class ExpandCommandTest(unittest.TestCase):
     def test_single_quoted_delimiter_no_expansion(self) -> None:
         self._stub_capture({"echo hi": "hi"})
         cmd = "cat <<'EOF'\n$(echo hi)\nEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -1809,7 +1834,7 @@ class ExpandCommandTest(unittest.TestCase):
     def test_unquoted_heredoc_expands_dollar_paren(self) -> None:
         self._stub_capture({"echo hello": "hello"})
         cmd = "cat <<EOF\n$(echo hello)\nEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -1819,7 +1844,7 @@ class ExpandCommandTest(unittest.TestCase):
         """A backslash-escaped $() in an unquoted heredoc body stays literal."""
         self._stub_capture({"echo hi": "hi"})
         cmd = "cat <<EOF\n\\$(echo hi)\nEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -1828,7 +1853,7 @@ class ExpandCommandTest(unittest.TestCase):
 
     def test_heredoc_tab_strip(self) -> None:
         cmd = "cat <<-EOF\n\t\thello\n\tEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -1838,7 +1863,7 @@ class ExpandCommandTest(unittest.TestCase):
 
     def test_herestring_unquoted(self) -> None:
         cmd = "cat <<<hello"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -1847,7 +1872,7 @@ class ExpandCommandTest(unittest.TestCase):
 
     def test_herestring_quoted(self) -> None:
         cmd = "cat <<<'hello world'"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -1857,7 +1882,7 @@ class ExpandCommandTest(unittest.TestCase):
         self._stub_capture({"echo hi": "hi"})
         # Unquoted here-string with $()
         cmd = "cat <<<$(echo hi)"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -1866,7 +1891,7 @@ class ExpandCommandTest(unittest.TestCase):
         # Single-quoted here-string with $() — no expansion
         self.captures.clear()
         cmd2 = "cat <<<'$(echo hi)'"
-        expanded2, exp2 = _expand_command(cmd2, self.work_dir, 30, 0)
+        expanded2, exp2, _program2 = _expand_command(cmd2, self.work_dir, 30, 0)
         m2 = SENTINEL_HD.search(expanded2)
         self.assertIsNotNone(m2)
         sentinel2 = f"\x01H{m2.group(1)}\x01"
@@ -1876,7 +1901,7 @@ class ExpandCommandTest(unittest.TestCase):
     def test_command_substitution_sentinel(self) -> None:
         self._stub_capture({"echo hello": "hello"})
         cmd = "echo $(echo hello)"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         # Should contain arg sentinel
         m = SENTINEL_ARG.search(expanded)
         self.assertIsNotNone(m)
@@ -1890,7 +1915,7 @@ class ExpandCommandTest(unittest.TestCase):
         outputs = {"echo inner": "inner", "echo $(echo inner)": "outer"}
         self._stub_capture(outputs)
         cmd = "echo $(echo $(echo inner))"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         # The outer $() captures "echo $(echo inner)" since the inner $()
         # is inside the outer $(), and the outer _capture_stdout call is what
         # triggers the recursive expansion (via its own _expand_command call).
@@ -1928,7 +1953,7 @@ class ExpandCommandTest(unittest.TestCase):
 
     def test_quotes_inside_heredoc_body_preserved(self) -> None:
         cmd = "cat <<EOF\nline with \"quotes\" and 'apostrophes'\nEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         sentinel = f"\x01H{m.group(1)}\x01"
         self.assertEqual(exp.heredoc_bodies[sentinel], "line with \"quotes\" and 'apostrophes'\n")
@@ -1936,7 +1961,7 @@ class ExpandCommandTest(unittest.TestCase):
     def test_double_quoted_delimiter_no_expansion(self) -> None:
         self._stub_capture({"echo hi": "hi"})
         cmd = 'cat <<"EOF"\n$(echo hi)\nEOF'
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         sentinel = f"\x01H{m.group(1)}\x01"
         # Body should be literal $(echo hi), not expanded
@@ -2443,7 +2468,7 @@ class EndToEndSmokeTest(unittest.TestCase):
     def test_heredoc_expansion_produces_correct_result(self) -> None:
         """Verify the full expansion pipeline without subprocess."""
         cmd = "cat <<EOF\nhello\nEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         # Verify the expanded command has a heredoc sentinel
         self.assertIn("<<", expanded)
         m = SENTINEL_HD.search(expanded)
@@ -2461,7 +2486,7 @@ class EndToEndSmokeTest(unittest.TestCase):
     def test_heredoc_single_quoted_literal(self) -> None:
         """Verify single-quoted delimiters produce literal bodies."""
         cmd = "cat <<'EOF'\n$(echo hi)\nEOF"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -2470,7 +2495,7 @@ class EndToEndSmokeTest(unittest.TestCase):
     def test_herestring_expansion(self) -> None:
         """Verify here-string produces correct body."""
         cmd = "cat <<<hello world"
-        expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
         m = SENTINEL_HD.search(expanded)
         self.assertIsNotNone(m)
         sentinel = f"\x01H{m.group(1)}\x01"
@@ -2484,7 +2509,7 @@ class EndToEndSmokeTest(unittest.TestCase):
                 return 0, b"a b"
             server._capture_stdout = fake
             cmd = "echo $(printf 'a b')"
-            expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+            expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
             m = SENTINEL_ARG.search(expanded)
             self.assertIsNotNone(m)
             sentinel = f"\x01A{m.group(1)}\x01"
@@ -2504,13 +2529,176 @@ class EndToEndSmokeTest(unittest.TestCase):
                 return 0, b"x"
             server._capture_stdout = fake
             cmd = "echo $(cat <<EOF\nx\nEOF)"
-            expanded, exp = _expand_command(cmd, self.work_dir, 30, 0)
+            expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
             m = SENTINEL_ARG.search(expanded)
             self.assertIsNotNone(m)
             sentinel = f"\x01A{m.group(1)}\x01"
             self.assertEqual(exp.arg_values.get(sentinel), "x")
         finally:
             server._capture_stdout = original
+
+
+# ---------------------------------------------------------------------------
+# AST consumption tests — prove the live path parses once and threads the
+# CommandNode through to _extract_redirects / _build_invocation without
+# re-lexing.
+# ---------------------------------------------------------------------------
+
+
+class ASTConsumptionTest(unittest.TestCase):
+    """Prove the live shell_run path consumes the AST without double-lex.
+
+    Uses monkey-patching to spy on internal functions and assert that:
+    1. ``_build_invocation`` receives a ``CommandNode`` (not a ``str``) from
+       the live path.
+    2. ``_extract_redirects`` is called with a ``CommandNode`` via the AST
+       projection path (``_extract_from_node``).
+    3. The ``split_legacy`` function is NOT called from the live path
+       (proving the double-lex is eliminated).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.allowed = Path(tempfile.gettempdir()) / ("sandbox-ast-" + os.urandom(4).hex())
+        self.allowed.mkdir()
+        # Save originals
+        self._orig_build = server._build_invocation
+        self._orig_extract = server._extract_redirects
+        self._orig_split_legacy = server.split_legacy
+
+    def tearDown(self) -> None:
+        import shutil
+        server._build_invocation = self._orig_build
+        server._extract_redirects = self._orig_extract
+        server.split_legacy = self._orig_split_legacy
+        shutil.rmtree(self.allowed, ignore_errors=True)
+        self._tmp.cleanup()
+
+    def test_build_invocation_receives_commandnode_from_live_path(self) -> None:
+        """shell_run threads CommandNode through to _build_invocation."""
+        received_types: list[type] = []
+
+        def spy_build(command, work_dir, expansion=None):
+            received_types.append(type(command))
+            # Return error to short-circuit (avoid actual sandbox)
+            return "spy", None, None, None, []
+
+        server._build_invocation = spy_build
+        server.shell_run("echo hi", cwd=str(self.allowed))
+
+        self.assertTrue(
+            len(received_types) > 0,
+            "_build_invocation was never called",
+        )
+        self.assertIn(
+            CommandNode,
+            received_types,
+            f"Expected CommandNode in received_types, got {received_types}",
+        )
+
+    def test_extract_redirects_receives_commandnode_from_live_path(self) -> None:
+        """_extract_redirects receives CommandNode via AST projection."""
+        received_types: list[type] = []
+
+        def spy_extract(segment, expansion=None):
+            received_types.append(type(segment))
+            # Return valid empty result
+            return ["echo", "hi"], [], None
+
+        server._extract_redirects = spy_extract
+
+        # Also stub _resolve_command to avoid the real allowlist path
+        orig_resolve = server._resolve_command
+        try:
+            def fake_resolve(args, work_dir):
+                return "/bin/echo", ["/bin/echo", "hi"], server.COMMANDS.get("echo", {"promises": "stdio"})
+            server._resolve_command = fake_resolve
+            server.shell_run("echo hi", cwd=str(self.allowed))
+        finally:
+            server._resolve_command = orig_resolve
+
+        self.assertTrue(
+            len(received_types) > 0,
+            "_extract_redirects was never called",
+        )
+        self.assertIn(
+            CommandNode,
+            received_types,
+            f"Expected CommandNode in received_types, got {received_types}",
+        )
+
+    def test_split_legacy_not_called_from_live_path(self) -> None:
+        """split_legacy is NOT invoked from the AST live path."""
+        call_count = [0]
+        orig_split = server.split_legacy
+
+        def counting_split(command):
+            call_count[0] += 1
+            return orig_split(command)
+
+        server.split_legacy = counting_split
+        # Stub _build_invocation to short-circuit
+        def _fake_build(command, work_dir, expansion=None):
+            return "spy", None, None, None, []
+        server._build_invocation = _fake_build
+
+        try:
+            server.shell_run("echo hi", cwd=str(self.allowed))
+        finally:
+            server.split_legacy = orig_split
+
+        # split_legacy should NOT be called from the live AST path
+        self.assertEqual(
+            call_count[0], 0,
+            f"split_legacy was called {call_count[0]} times from the live path; "
+            "double-lex is still present!",
+        )
+
+    def test_expand_command_returns_programnode(self) -> None:
+        """_expand_command returns a non-None ProgramNode for valid input."""
+        from shell_sandbox_mcp.server import _expand_command
+
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            # Stub capture to avoid real subprocess
+            orig_capture = server._capture_stdout
+            server._capture_stdout = lambda cmd, wd2, to, d, dl=None, sc=None: (0, b"test")
+            try:
+                _cleaned, _exp, program = _expand_command(
+                    "echo hi", wd, 30, 0,
+                )
+                self.assertIsNotNone(
+                    program,
+                    "ProgramNode should not be None for valid input",
+                )
+                self.assertIsInstance(
+                    program, ProgramNode,
+                    "Returned object should be a ProgramNode",
+                )
+            finally:
+                server._capture_stdout = orig_capture
+
+    def test_program_to_chain_projection(self) -> None:
+        """program_to_chain correctly projects AST to legacy chain format."""
+        from shell_sandbox_mcp.parser import (
+            AndOrNode,
+            CommandNode as PCmd,
+            PipelineNode,
+            ProgramNode,
+            Word,
+            WordPart,
+            program_to_chain,
+        )
+        cmd = PCmd(words=(Word(parts=(WordPart(text="ls", raw="ls"),)),), redirects=())
+        pipeline = PipelineNode(commands=(cmd,))
+        chain = AndOrNode(operator=None, pipeline=pipeline, backgrounded=False)
+        program = ProgramNode(chains=(chain,))
+
+        result = program_to_chain(program)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0][0], None)  # operator
+        self.assertEqual(result[0][2], False)  # backgrounded
+        self.assertEqual(len(result[0][1]), 1)  # one CommandNode
 
 
 if __name__ == "__main__":

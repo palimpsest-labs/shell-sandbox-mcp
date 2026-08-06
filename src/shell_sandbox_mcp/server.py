@@ -7,34 +7,35 @@ Tools:
 """
 
 import os
-import re
-import shlex
 import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-
-# ---------------------------------------------------------------------------
-# Redirect dataclass
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Redirect:
-    """A parsed shell redirect operator extracted from a command segment."""
-    fd: int                                  # 0 (stdin), 1 (stdout), or 2 (stderr)
-    op: Literal[">", ">>", ">&", "<", "<<", "<<<", "<<-"]
-    target_path: Optional[str] = None        # resolved absolute path (None for ">&")
-    target_fd: Optional[int] = None          # source fd for ">&" (1 or 2); else None
-    raw_target: Optional[str] = None         # user-typed target (for messages)
-    body: Optional[str] = None               # literal stdin content for heredoc/here-string
-    strip_tabs: bool = False                 # <<- semantics (strip leading TABs)
+# Import parser symbols and re-export them for backward compatibility.
+# Tests do `from shell_sandbox_mcp.server import Expansion, Redirect, ...`.
+from .parser import (
+    CommandNode,
+    Expansion,
+    ParseError,
+    ProgramNode,
+    Redirect,
+    SENTINEL_ARG,
+    SENTINEL_HD,
+    _expand_subst_in_text as _parser_expand_subst_in_text,
+    _serialize_command,
+    _serialize_pipeline,
+    cmd_to_display,
+    extract_redirects as _parser_extract_redirects,
+    parse_command as _parser_parse_command,
+    program_to_chain,
+    split_legacy,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -58,22 +59,10 @@ MAX_TIMEOUT = 300
 MAX_OUTPUT = 1_000_000  # 1 MB
 
 # ---------------------------------------------------------------------------
-# Command substitution / heredoc limits
+# Command substitution / heredoc limits (imported from parser, re-exported)
 # ---------------------------------------------------------------------------
 
-MAX_SUBST_DEPTH = 8
-MAX_SUBST_COUNT = 256
-MAX_SUBST_OUTPUT = 64_000
-MAX_HEREDOC_BODY = 256_000
-SENTINEL_ARG = re.compile(r"\x01A(\d+)\x01")
-SENTINEL_HD = re.compile(r"\x01H(\d+)\x01")
-
-
-@dataclass
-class Expansion:
-    """Side table holding resolved $() output words and heredoc/here-string bodies."""
-    arg_values: dict[str, str]      # sentinel -> single-word $() result
-    heredoc_bodies: dict[str, str]  # sentinel -> literal stdin body text
+from .parser import MAX_SUBST_DEPTH, MAX_SUBST_COUNT, MAX_SUBST_OUTPUT, MAX_HEREDOC_BODY
 
 # ---------------------------------------------------------------------------
 # Command definitions
@@ -464,93 +453,9 @@ def _validate_cwd(resolved: Path, raw: str) -> Optional[str]:
 def _split_command(command: str) -> list[tuple[Optional[str], list[str], bool]]:
     """Split a command string into a chain of pipe-connected pipelines.
 
-    A pipeline is a list of segments joined by a single top-level `|` (pipe),
-    where each segment's stdout feeds the next segment's stdin. Pipelines are
-    joined by top-level `;`, `&&`, `||`, or `&` operators. Operators nested
-    inside single or double quotes are preserved as literal text of the segment
-    (they are not shell operators).
-
-    Returns a list of ``(operator, pipeline, backgrounded)`` triples where
-    ``operator`` is None for the first pipeline and ``';'``, ``'&&'``, or
-    ``'||'`` for each subsequent one (never ``'&'`` — bare ``&`` acts like
-    ``;`` semantically but sets ``backgrounded=True`` on the preceding
-    pipeline). Each ``pipeline`` is a list of pipe-separated segment strings.
-    Leading/trailing whitespace is stripped from each segment; empty segments
-    are dropped.
+    Thin wrapper around :func:`parser.split_legacy`.
     """
-    pipelines: list[tuple[Optional[str], list[str], bool]] = []
-    current_pipeline: list[str] = []
-    current_seg: list[str] = []
-    i, n = 0, len(command)
-    quote: Optional[str] = None
-    prev_op: Optional[str] = None
-
-    def flush_segment() -> None:
-        text = "".join(current_seg).strip()
-        if text:
-            current_pipeline.append(text)
-        current_seg.clear()
-
-    def flush_pipeline(backgrounded: bool = False) -> None:
-        nonlocal prev_op
-        flush_segment()
-        if current_pipeline:
-            pipelines.append((prev_op, current_pipeline[:], backgrounded))
-        del current_pipeline[:]
-        prev_op = None
-
-    while i < n:
-        c = command[i]
-        if quote is not None:
-            current_seg.append(c)
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-        if c in ("'", '"'):
-            quote = c
-            current_seg.append(c)
-            i += 1
-            continue
-        if c == ";":
-            flush_pipeline()
-            prev_op = ";"
-            i += 1
-            continue
-        if c == "&" and i + 1 < n and command[i + 1] == "&":
-            flush_pipeline()
-            prev_op = "&&"
-            i += 2
-            continue
-        if c == "&" and i > 0 and command[i - 1] == ">" and i + 1 < n and command[i + 1].isdigit():
-            # fd-dup redirect like `2>&1` / `1>&2`: the `&` here is part of a
-            # redirect operator, not a backgrounding operator. Leave it in the
-            # current segment so _extract_redirects can parse it.
-            current_seg.append(c)
-            i += 1
-            continue
-        if c == "&":
-            # Bare '&' backgrounding: flush the current pipeline marked as
-            # backgrounded and reset prev_op (like ';' — next pipeline always
-            # runs).
-            flush_pipeline(backgrounded=True)
-            i += 1
-            continue
-        if c == "|" and i + 1 < n and command[i + 1] == "|":
-            flush_pipeline()
-            prev_op = "||"
-            i += 2
-            continue
-        if c == "|":
-            # single pipe — end the current segment within the pipeline
-            flush_segment()
-            i += 1
-            continue
-        current_seg.append(c)
-        i += 1
-
-    flush_pipeline()
-    return pipelines
+    return split_legacy(command)
 
 
 # ---------------------------------------------------------------------------
@@ -558,271 +463,17 @@ def _split_command(command: str) -> list[tuple[Optional[str], list[str], bool]]:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_heredoc_body(
-    token: str,
-    expansion: Optional[Expansion],
-    kind: str = "heredoc",
-) -> Optional[str]:
-    """Resolve a ``\\x01H<n>\\x01`` sentinel to its body text from *expansion*."""
-    if not expansion:
-        return None
-    m = SENTINEL_HD.fullmatch(token)
-    if not m:
-        return None
-    key = f"\x01H{m.group(1)}\x01"
-    return expansion.heredoc_bodies.get(key)
-
-
-def _strip_quotes(s: str) -> str:
-    """Strip one level of single or double quotes from *s*.
-
-    Returns the inner text if *s* is fully quoted (e.g. ``'hello'`` → ``hello``,
-    ``"world"`` → ``world``), otherwise returns *s* unchanged.
-    """
-    if len(s) >= 2:
-        if (s[0] == "'" and s[-1] == "'") or (s[0] == '"' and s[-1] == '"'):
-            return s[1:-1]
-    return s
-
-
 def _extract_redirects(
-    segment: str,
+    segment,
     expansion: Optional[Expansion] = None,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """Tokenize a command segment, extracting redirect operators.
 
-    Single-pass char-by-char tokenizer that:
-    - Splits on unquoted whitespace
-    - Strips quote characters (``'`` and ``"``) from words (POSIX-style)
-    - Recognizes unquoted redirect operators only at word boundaries:
-      ``> file``, ``>> file``, ``2> file``, ``2>> file``, ``2>&1``, ``1>&2``
-    - Recognizes heredoc/here-string operators (``<<<``, ``<<-``, ``<<``)
-      when their target is a sentinel token (``\\x01H<n>\\x01``)
-    - Resolves ``\\x01A<n>\\x01`` sentinels to single-word $() results
-    - Glued forms like ``foo>bar`` are treated as literal words (a deliberate
-      divergence from POSIX; this avoids ambiguous parsing with commands that
-      embed ``>`` in their arguments).
-
-    Returns ``(args, redirects, None)`` on success, or
-    ``([], [], error_msg)`` on error.
-    ``args`` is the tokenized command with quotes stripped and redirect
-    operators (plus their targets) removed.
+    Thin wrapper around :func:`parser.extract_redirects`.  Accepts either a
+    ``str`` (legacy path — lexes inline) or a :class:`parser.CommandNode`
+    (AST-native path — uses the pre-parsed AST directly without re-lexing).
     """
-    args: list[str] = []
-    redirects: list[Redirect] = []
-    i = 0
-    n = len(segment)
-
-    def _resolve_word(w: str) -> str:
-        """Resolve ``\\x01A<n>\\x01`` sentinels anywhere within a word.
-
-        Substitutes every sentinel found (so compound words like
-        ``a\x01A0\x01c`` resolve to ``a<val>c``), not just a word that is
-        exactly one sentinel. A sentinel with no stored value is left as-is.
-        """
-        if not expansion:
-            return w
-
-        def _replace(m: re.Match) -> str:
-            key = f"\x01A{m.group(1)}\x01"
-            val = expansion.arg_values.get(key)
-            return val if val is not None else m.group(0)
-
-        return SENTINEL_ARG.sub(_replace, w)
-
-    def _read_word() -> Optional[str]:
-        """Read a shell word starting at *i*, stripping quotes.
-        Stops at unquoted whitespace.  Returns ``None`` on unbalanced quotes.
-        """
-        nonlocal i
-        chars: list[str] = []
-        quote: Optional[str] = None
-        while i < n:
-            c = segment[i]
-            if quote is not None:
-                if c == quote:
-                    quote = None
-                else:
-                    chars.append(c)
-                i += 1
-            elif c in ("'", '"'):
-                quote = c
-                i += 1
-            elif c in (' ', '\t'):
-                break
-            else:
-                chars.append(c)
-                i += 1
-        if quote is not None:
-            return None
-        return ''.join(chars)
-
-    def _read_redirect_target() -> Optional[str]:
-        """Read the target of a ``>`` / ``>>`` operator.
-        *i* is positioned right after the operator characters.
-        The target may be glued (``>out.txt``) or space-separated
-        (``> out.txt``).  Returns the target word, or ``None`` if missing.
-        """
-        nonlocal i
-        if i < n and segment[i] not in (' ', '\t'):
-            target = _read_word()
-            return _resolve_word(target) if target is not None else None
-        while i < n and segment[i] in (' ', '\t'):
-            i += 1
-        if i >= n:
-            return None
-        target = _read_word()
-        return _resolve_word(target) if target is not None else None
-
-    while i < n:
-        while i < n and segment[i] in (' ', '\t'):
-            i += 1
-        if i >= n:
-            break
-
-        rem = segment[i:]
-
-        # -- longest-match-first: 4-char fd-dup patterns --
-        # Only treat `2>&1` / `1>&2` as fd-dup when the char after the
-        # 4-char sequence (if any) is NOT alphanumeric or underscore
-        # (whitespace, end-of-input, or another operator).  Otherwise
-        # `cmd 2>&1x` is a `2>` redirect to file `&1x`, not fd-dup.
-        if rem.startswith('2>&1') and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_')):
-            i += 4
-            redirects.append(Redirect(fd=2, op='>&', target_path=None, target_fd=1, raw_target='1'))
-            continue
-        if rem.startswith('1>&2') and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_')):
-            i += 4
-            redirects.append(Redirect(fd=1, op='>&', target_path=None, target_fd=2, raw_target='2'))
-            continue
-
-        # -- 4-char fd-dup patterns for disallowed target fds --
-        # e.g. `2>&3`, `1>&4` — only 1 and 2 are valid dup targets.
-        # Require a word boundary after the 4-char sequence, otherwise
-        # `2>&3x` is a `2>` redirect to file `&3x`, not fd-dup.
-        if (len(rem) >= 4 and rem[0].isdigit() and rem[1:3] == '>&'
-                and rem[3].isdigit()
-                and not (len(rem) > 4 and (rem[4].isalnum() or rem[4] == '_'))):
-            return [], [], "Redirect dup target fd must be 1 or 2"
-
-        # -- 3-char patterns --
-        if rem.startswith('2>>'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=2, op='>>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('1>>'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>>', target_path=None, target_fd=None, raw_target=t))
-            continue
-
-        # -- here-string: <<<  (3-char, checked before 2-char <<) --
-        if rem.startswith('<<<'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Here-string missing target"
-            # Resolve sentinel to body
-            body = _resolve_heredoc_body(t, expansion, "here-string")
-            if body is None:
-                return [], [], "Here-string body not found"
-            # Check for duplicate stdin redirects
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<<<', body=body))
-            continue
-
-        # -- heredoc with tab strip: <<-  (3-char, before <<) --
-        if rem.startswith('<<-'):
-            i += 3
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Heredoc missing delimiter sentinel"
-            body = _resolve_heredoc_body(t, expansion, "heredoc")
-            if body is None:
-                return [], [], "Heredoc body not found"
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<<-', body=body, strip_tabs=True))
-            continue
-
-        # -- 2-char patterns --
-        if rem.startswith('>>'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('2>'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=2, op='>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('1>'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target=t))
-            continue
-
-        # -- heredoc: <<  (2-char, after <<- and <<<) --
-        if rem.startswith('<<'):
-            i += 2
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Heredoc missing delimiter sentinel"
-            body = _resolve_heredoc_body(t, expansion, "heredoc")
-            if body is None:
-                return [], [], "Heredoc body not found"
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<<', body=body))
-            continue
-
-        # -- 1-char patterns --
-        if rem.startswith('>'):
-            i += 1
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Redirect operator missing target file"
-            redirects.append(Redirect(fd=1, op='>', target_path=None, target_fd=None, raw_target=t))
-            continue
-        if rem.startswith('<'):
-            i += 1
-            t = _read_redirect_target()
-            if t is None:
-                return [], [], "Input redirect missing target file"
-            for r in redirects:
-                if r.fd == 0:
-                    return [], [], "Multiple stdin redirects in one segment"
-            redirects.append(Redirect(fd=0, op='<', target_path=None, target_fd=None, raw_target=t))
-            continue
-
-        # -- digit + >  patterns that aren't the allowed 1> / 2> → error --
-        if len(rem) >= 2 and rem[0].isdigit() and rem[1] == '>':
-            fd = int(rem[0])
-            return [], [], f"Redirects only support fds 1 and 2 (got {fd})"
-
-        # -- regular word --
-        w = _read_word()
-        if w is None:
-            return [], [], "Unbalanced quotes in command"
-        if w:
-            args.append(_resolve_word(w))
-
-    return args, redirects, None
+    return _parser_extract_redirects(segment, expansion)
 
 
 def _validate_redirect_paths(
@@ -837,8 +488,6 @@ def _validate_redirect_paths(
     populated) or ``([], error_msg)`` if a target escapes all allowed roots.
     ``>&`` redirects pass through unchanged.
     """
-    from dataclasses import replace
-
     validated: list[Redirect] = []
     for r in redirects:
         if r.op in (">", ">>", "<"):
@@ -857,18 +506,19 @@ def _validate_redirect_paths(
 
 
 def _build_invocation(
-    command: str,
+    command,
     work_dir: Path,
     expansion: Optional[Expansion] = None,
 ) -> tuple[Optional[str], Optional[list[str]], Optional[dict], Optional[dict], list[Redirect]]:
     """Parse, resolve, and build the sandbox invocation for one segment.
 
-    Returns ``(binary, sandbox_args, env, cfg, redirects)`` on success.
-    ``env`` is ``None`` when no env overrides are needed.
-    On failure, returns a tuple whose first element is the error message
-    (string) and whose remaining elements are ``None`` / empty:
-    ``(error_msg, None, None, None, [])``.
-    An empty command returns ``(None, None, None, None, [])``.
+    Accepts either a ``str`` (legacy) or a :class:`parser.CommandNode`
+    (AST-native — no re-lexing).  Returns ``(binary, sandbox_args, env,
+    cfg, redirects)`` on success.  ``env`` is ``None`` when no env overrides
+    are needed.  On failure, returns a tuple whose first element is the
+    error message (string) and whose remaining elements are ``None`` / empty:
+    ``(error_msg, None, None, None, [])``.  An empty command returns
+    ``(None, None, None, None, [])``.
     """
     args, raw_redirects, parse_err = _extract_redirects(command, expansion)
     if parse_err is not None:
@@ -1087,16 +737,17 @@ def _resolve_fd_targets(
 
 
 def _run_segment_core(
-    command: str,
+    command,
     work_dir: Path,
     timeout: int,
     expansion: Optional[Expansion] = None,
 ) -> tuple[int, bytes, bytes, list[str]]:
     """Run a single operator-free command segment in the sandbox (raw bytes).
 
-    Returns ``(returncode, stdout_bytes, stderr_bytes, report_lines)``.
-    ``stdout_bytes`` and ``stderr_bytes`` are the captured output (may be
-    empty but never ``None``).
+    *command* may be a ``str`` (legacy) or a :class:`parser.CommandNode`
+    (AST-native — avoids re-lexing).  Returns ``(returncode, stdout_bytes,
+    stderr_bytes, report_lines)``.  ``stdout_bytes`` and ``stderr_bytes``
+    are the captured output (may be empty but never ``None``).
     """
     binary, sandbox_args, env, cfg, redirects = _build_invocation(
         command, work_dir, expansion=expansion,
@@ -1185,13 +836,15 @@ def _format_output(
     return "\n".join(output)
 
 
-def _run_segment(command: str, work_dir: Path, timeout: int, expansion: Optional[Expansion] = None) -> tuple[int, str]:
+def _run_segment(command, work_dir: Path, timeout: int, expansion: Optional[Expansion] = None) -> tuple[int, str]:
     """Run a single operator-free command segment in the sandbox.
 
-    Returns ``(returncode, output_string)``. ``returncode`` is 0 on success and
-    non-zero on failure, an error, or an invalid/denied command, so callers can
-    apply ``&&``/``||`` short-circuit semantics. ``output_string`` is the
-    formatted output, or ``""`` when the segment produced nothing to report.
+    *command* may be a ``str`` (legacy) or a :class:`parser.CommandNode`
+    (AST-native).  Returns ``(returncode, output_string)``.  ``returncode``
+    is 0 on success and non-zero on failure, an error, or an invalid/denied
+    command, so callers can apply ``&&``/``||`` short-circuit semantics.
+    ``output_string`` is the formatted output, or ``""`` when the segment
+    produced nothing to report.
     """
     rc, stdout_bytes, stderr_bytes, report = _run_segment_core(
         command, work_dir, timeout, expansion=expansion,
@@ -1228,9 +881,10 @@ def _run_pipeline_core(
         if i > 0:
             for r in redirects:
                 if r.fd == 0:
+                    seg_str = _serialize_command(seg) if isinstance(seg, CommandNode) else seg
                     return 1, (
                         f"heredoc/here-string/input-redirect not allowed on "
-                        f"non-first pipeline stage: {seg}"
+                        f"non-first pipeline stage: {seg_str}"
                     ).encode(), b"", []
         invocations.append((sandbox_args, env, redirects))
 
@@ -1241,9 +895,10 @@ def _run_pipeline_core(
     for i, (_sa, _env, redirects) in enumerate(invocations[:-1]):
         for r in redirects:
             if r.fd == 1:
+                seg_str = _serialize_command(segments[i]) if isinstance(segments[i], CommandNode) else segments[i]
                 return 1, (
                     f"Cannot redirect stdout of intermediate pipe stage: "
-                    f"{segments[i]}"
+                    f"{seg_str}"
                 ).encode(), b"", []
 
     # Resolve fd targets per stage.
@@ -1420,17 +1075,18 @@ def _run_pipeline_core(
 
 
 def _run_pipeline(
-    segments: list[str],
+    segments,
     work_dir: Path,
     timeout: int,
     expansion: Optional[Expansion] = None,
 ) -> tuple[int, str]:
     """Run a pipe-connected sequence of segments concurrently in the sandbox.
 
-    Each segment's stdout is connected to the next segment's stdin, so data
-    flows through the pipeline as in a real shell pipe. Every segment is still
-    run through its own pledge sandbox and checked against the allowlist
-    independently.
+    Each element of *segments* may be a ``str`` (legacy) or a
+    :class:`parser.CommandNode` (AST-native).  Each segment's stdout is
+    connected to the next segment's stdin, so data flows through the
+    pipeline as in a real shell pipe. Every segment is still run through its
+    own pledge sandbox and checked against the allowlist independently.
 
     Returns ``(returncode, output_string)``. ``returncode`` is the exit code of
     the *last* segment (shell default; no pipefail). Intermediate segments'
@@ -1479,8 +1135,10 @@ def _capture_stdout(
     if deadline is None:
         deadline = time.time() + timeout
 
-    # Expand inner command (recursion)
-    expanded, expansion = _expand_command(
+    # Expand inner command (recursion).  The AST is discarded here — the
+    # recursive path uses the legacy string-based split (split_legacy) for
+    # simplicity, since the inner command is a short $(...) snippet.
+    expanded, expansion, _program = _expand_command(
         command, work_dir, timeout, depth, deadline, subst_count,
     )
 
@@ -1544,45 +1202,24 @@ def _expand_subst_in_text(
 ) -> str:
     """Scan *text* for ``$( ... )`` and replace each with its raw output.
 
-    Used for expanding ``$()`` inside unquoted heredoc bodies and unquoted
-    here-string words. No sentinel tokens — the output is spliced directly
-    into the body text.
+    Thin wrapper around :func:`parser._expand_subst_in_text`.
     """
-    result: list[str] = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if (c == '$' and i + 1 < n and text[i + 1] == '('
-                and not (i > 0 and text[i - 1] == '\\')):
-            # Find matching close paren with quote tracking
-            j = i + 2
-            paren_depth = 1
-            inner_quote: Optional[str] = None
-            while j < n and paren_depth > 0:
-                ch = text[j]
-                if inner_quote is not None:
-                    if ch == inner_quote:
-                        inner_quote = None
-                elif ch in ("'", '"'):
-                    inner_quote = ch
-                elif ch == '(':
-                    paren_depth += 1
-                elif ch == ')':
-                    paren_depth -= 1
-                j += 1
-            if paren_depth != 0:
-                raise ValueError("Unbalanced $( ... )")
-            inner = text[i + 2 : j - 1]
-            _rc, stdout_bytes = _capture_stdout(
-                inner, work_dir, timeout, depth + 1, deadline, subst_count,
-            )
-            expanded = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
-            result.append(expanded)
-            i = j
-        else:
-            result.append(c)
-            i += 1
-    return "".join(result)
+    def _capture(inner: str) -> tuple[int, bytes]:
+        return _capture_stdout(inner, work_dir, timeout, depth + 1, deadline, subst_count)
+    return _parser_expand_subst_in_text(text, _capture)
+
+
+# ---------------------------------------------------------------------------
+# AST display helpers
+# ---------------------------------------------------------------------------
+
+
+def _serialize_pipeline_from_cmds(cmd_nodes) -> str:
+    """Join a list of CommandNode objects into a display string."""
+    return " | ".join(
+        _serialize_command(c) if isinstance(c, CommandNode) else str(c)
+        for c in cmd_nodes
+    )
 
 
 def _expand_command(
@@ -1592,285 +1229,21 @@ def _expand_command(
     depth: int,
     deadline: Optional[float] = None,
     subst_count: Optional[list[int]] = None,
-) -> tuple[str, Expansion]:
+) -> tuple[str, Expansion, Optional[ProgramNode]]:
     """Pre-pass: resolve ``$(...)``, heredocs, and here-strings.
 
-    Scans *command* left-to-right, quote-aware, and replaces each ``$(...)``
-    with a sentinel token (``\\x01A<n>\\x01``) while storing the captured
-    output in *expansion.arg_values*. Heredoc and here-string bodies are moved
-    to *expansion.heredoc_bodies*, keyed by sentinel tokens
-    (``\\x01H<n>\\x01``), and the operators are replaced with ``<<<`` /
-    ``<<-`` / ``<<`` + sentinel.
-
-    Returns ``(cleaned_command, expansion)``.  The cleaned command contains
-    only sentinels where bodies/results were removed — it is safe to pass to
-    the normal ``_split_command`` / ``_extract_redirects`` tokenizers.
+    Thin wrapper around :func:`parser.parse_command`.  Returns
+    ``(cleaned_command, expansion, program_ast)`` — the caller should
+    use the AST directly for execution rather than re-parsing the
+    cleaned string.
     """
-    if subst_count is None:
-        subst_count = [0]
-    if deadline is None:
-        deadline = time.time() + timeout
-
-    expansion = Expansion(arg_values={}, heredoc_bodies={})
-    output: list[str] = []
-    i, n = 0, len(command)
-    quote: Optional[str] = None
-    next_arg_id = 0
-    next_hd_id = 0
-
-    while i < n:
-        c = command[i]
-
-        # ---- inside a quote: copy verbatim ----
-        if quote is not None:
-            output.append(c)
-            if c == quote:
-                quote = None
-            i += 1
-            continue
-
-        # ---- quote start ----
-        if c in ("'", '"'):
-            quote = c
-            output.append(c)
-            i += 1
-            continue
-
-        # ---- $( ... ) command substitution ----
-        if c == '$' and i + 1 < n and command[i + 1] == '(':
-            # Find matching ')' with paren + quote tracking
-            j = i + 2
-            paren_depth = 1
-            inner_quote: Optional[str] = None
-            while j < n and paren_depth > 0:
-                ch = command[j]
-                if inner_quote is not None:
-                    if ch == inner_quote:
-                        inner_quote = None
-                elif ch in ("'", '"'):
-                    inner_quote = ch
-                elif ch == '(':
-                    paren_depth += 1
-                elif ch == ')':
-                    paren_depth -= 1
-                j += 1
-            if paren_depth != 0:
-                raise ValueError("Unbalanced $( ... )")
-            inner = command[i + 2 : j - 1]
-            rc, stdout_bytes = _capture_stdout(
-                inner, work_dir, timeout, depth + 1, deadline, subst_count,
-            )
-            result = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
-            result = result[:MAX_SUBST_OUTPUT]
-            sentinel = f"\x01A{next_arg_id}\x01"
-            next_arg_id += 1
-            expansion.arg_values[sentinel] = result
-            output.append(sentinel)
-            i = j
-            continue
-
-        # ---- here-string: <<< (3-char, before <<- and <<) ----
-        if command[i : i + 3] == '<<<':
-            output.append('<<<')
-            i += 3
-            # skip whitespace after <<<
-            while i < n and command[i] in (' ', '\t'):
-                i += 1
-            # read the word (quote-aware)
-            word_chars: list[str] = []
-            wq: Optional[str] = None
-            single_quoted = False
-            while i < n:
-                ch = command[i]
-                if wq is not None:
-                    word_chars.append(ch)
-                    if ch == wq:
-                        wq = None
-                    i += 1
-                elif ch in ("'", '"'):
-                    if ch == "'":
-                        single_quoted = True
-                    wq = ch
-                    word_chars.append(ch)
-                    i += 1
-                elif ch == '\n':
-                    break
-                else:
-                    word_chars.append(ch)
-                    i += 1
-            raw_word = "".join(word_chars)
-            body_word = _strip_quotes(raw_word) if raw_word else ""
-
-            if not single_quoted:
-                body_word = _expand_subst_in_text(
-                    body_word, work_dir, timeout, depth + 1, deadline, subst_count,
-                )
-
-            body = body_word + "\n"
-            body = body[:MAX_HEREDOC_BODY]
-            sentinel = f"\x01H{next_hd_id}\x01"
-            next_hd_id += 1
-            expansion.heredoc_bodies[sentinel] = body
-            output.append(" " + sentinel)
-            continue
-
-        # ---- heredoc: <<- (3-char, before <<) ----
-        if command[i : i + 3] == '<<-':
-            output.append('<<-')
-            i += 3
-            # skip whitespace after <<-
-            while i < n and command[i] in (' ', '\t'):
-                i += 1
-            # read delimiter word (quote-aware)
-            delim_chars: list[str] = []
-            dq: Optional[str] = None
-            delim_quoted = False
-            while i < n:
-                ch = command[i]
-                if dq is not None:
-                    delim_chars.append(ch)
-                    if ch == dq:
-                        dq = None
-                    i += 1
-                elif ch in ("'", '"'):
-                    delim_quoted = True
-                    dq = ch
-                    delim_chars.append(ch)
-                    i += 1
-                elif ch in (' ', '\t', '\n', ';', '|', '&'):
-                    break
-                else:
-                    delim_chars.append(ch)
-                    i += 1
-            delimiter = _strip_quotes("".join(delim_chars))
-
-            # Skip to end of current line
-            while i < n and command[i] != '\n':
-                i += 1
-            if i < n:
-                i += 1  # consume newline
-
-            # Collect body lines until delimiter
-            body_lines: list[str] = []
-            found = False
-            while i < n:
-                line_start = i
-                while i < n and command[i] != '\n':
-                    i += 1
-                line = command[line_start:i]
-                if i < n:
-                    i += 1  # consume newline
-
-                # Strip leading TABs from line for comparison
-                tab_count = 0
-                for ch_val in line:
-                    if ch_val == '\t':
-                        tab_count += 1
-                    else:
-                        break
-                stripped_line = line[tab_count:]
-
-                if stripped_line == delimiter:
-                    found = True
-                    break
-
-                body_lines.append(line[tab_count:])
-
-            if not found:
-                raise ValueError(f"heredoc delimiter {delimiter!r} not found")
-
-            body = "\n".join(body_lines) + "\n"
-            body = body[:MAX_HEREDOC_BODY]
-
-            if not delim_quoted:
-                body = _expand_subst_in_text(
-                    body, work_dir, timeout, depth + 1, deadline, subst_count,
-                )
-
-            sentinel = f"\x01H{next_hd_id}\x01"
-            next_hd_id += 1
-            expansion.heredoc_bodies[sentinel] = body
-            output.append(" " + sentinel)
-            continue
-
-        # ---- heredoc: << (2-char, after <<- and <<<) ----
-        if command[i : i + 2] == '<<':
-            output.append('<<')
-            i += 2
-            # skip whitespace after <<
-            while i < n and command[i] in (' ', '\t'):
-                i += 1
-            # read delimiter word (quote-aware)
-            delim_chars = []
-            dq = None
-            delim_quoted = False
-            while i < n:
-                ch = command[i]
-                if dq is not None:
-                    delim_chars.append(ch)
-                    if ch == dq:
-                        dq = None
-                    i += 1
-                elif ch in ("'", '"'):
-                    delim_quoted = True
-                    dq = ch
-                    delim_chars.append(ch)
-                    i += 1
-                elif ch in (' ', '\t', '\n', ';', '|', '&'):
-                    break
-                else:
-                    delim_chars.append(ch)
-                    i += 1
-            delimiter = _strip_quotes("".join(delim_chars))
-
-            # Skip to end of current line
-            while i < n and command[i] != '\n':
-                i += 1
-            if i < n:
-                i += 1  # consume newline
-
-            # Collect body lines until delimiter
-            body_lines = []
-            found = False
-            while i < n:
-                line_start = i
-                while i < n and command[i] != '\n':
-                    i += 1
-                line = command[line_start:i]
-                if i < n:
-                    i += 1  # consume newline
-
-                if line == delimiter:
-                    found = True
-                    break
-
-                body_lines.append(line)
-
-            if not found:
-                raise ValueError(f"heredoc delimiter {delimiter!r} not found")
-
-            body = "\n".join(body_lines) + "\n"
-            body = body[:MAX_HEREDOC_BODY]
-
-            if not delim_quoted:
-                body = _expand_subst_in_text(
-                    body, work_dir, timeout, depth + 1, deadline, subst_count,
-                )
-
-            sentinel = f"\x01H{next_hd_id}\x01"
-            next_hd_id += 1
-            expansion.heredoc_bodies[sentinel] = body
-            output.append(" " + sentinel)
-            continue
-
-        # ---- regular character ----
-        output.append(c)
-        i += 1
-
-    if quote is not None:
-        raise ValueError("Unbalanced quotes in command")
-
-    return "".join(output), expansion
+    def _capture(inner: str) -> tuple[int, bytes]:
+        return _capture_stdout(inner, work_dir, timeout, depth + 1,
+                               deadline, subst_count)
+    cleaned, expansion, program = _parser_parse_command(
+        command, _capture, work_dir, timeout, depth, deadline, subst_count,
+    )
+    return cleaned, expansion, program
 
 
 # ---------------------------------------------------------------------------
@@ -1921,16 +1294,18 @@ def _start_reaper() -> None:
 
 
 def _run_background(
-    segments: list[str],
+    segments,
     work_dir: Path,
     expansion: Optional[Expansion] = None,
 ) -> tuple[int, str]:
     """Launch a pipe-connected pipeline in the background and return immediately.
 
-    Each segment is built through ``_build_invocation`` (same allowlist/sandbox
-    checks as ``_run_pipeline``).  Intermediate stages' stdout feeds the next
-    stage's stdin exactly as in a foreground pipeline; all stderr, plus the
-    last stage's stdout, are redirected to a timestamped log file under
+    Each element of *segments* may be a ``str`` (legacy) or a
+    :class:`parser.CommandNode` (AST-native).  Each segment is built through
+    ``_build_invocation`` (same allowlist/sandbox checks as
+    ``_run_pipeline``).  Intermediate stages' stdout feeds the next stage's
+    stdin exactly as in a foreground pipeline; all stderr, plus the last
+    stage's stdout, are redirected to a timestamped log file under
     ``work_dir`` so the parent never blocks on pipe buffers.
 
     Returns ``(0, message)`` with the PID and log path.
@@ -1951,9 +1326,10 @@ def _run_background(
         if i > 0:
             for r in redirects:
                 if r.fd == 0:
+                    seg_str = _serialize_command(seg) if isinstance(seg, CommandNode) else seg
                     return 1, (
                         f"heredoc/here-string/input-redirect not allowed on "
-                        f"non-first pipeline stage: {seg}"
+                        f"non-first pipeline stage: {seg_str}"
                     )
         invocations.append((sandbox_args, env, redirects))
 
@@ -1964,9 +1340,10 @@ def _run_background(
     for i, (_sa, _env, redirects) in enumerate(invocations[:-1]):
         for r in redirects:
             if r.fd == 1:
+                seg_str = _serialize_command(segments[i]) if isinstance(segments[i], CommandNode) else segments[i]
                 return 1, (
                     f"Cannot redirect stdout of intermediate pipe stage: "
-                    f"{segments[i]}"
+                    f"{seg_str}"
                 )
 
     log_path = work_dir / f".bg-{int(time.time() * 1000)}.log"
@@ -2146,13 +1523,68 @@ def shell_run(
         return err
 
     # Expand $(...) heredocs and here-strings BEFORE splitting.
+    # Also parse into an AST so the execution path consumes it directly
+    # without re-lexing the cleaned string.
     try:
-        expanded, expansion = _expand_command(command, work_dir, timeout, depth=0)
+        expanded, expansion, program = _expand_command(command, work_dir, timeout, depth=0)
     except ValueError as e:
         return str(e)
 
-    # Split into allowlist-checked pipelines on ; / && / || / &, with each
-    # pipeline being a list of `|`-separated stages.
+    # Walk the AST directly (Option B: single-parse path).
+    # Fall back to the legacy string-based _split_command only when the
+    # AST is unavailable (program is None).
+    if program is not None:
+        chains = program_to_chain(program)
+        if not chains:
+            return "Empty command."
+
+        # Single-command fast path — preserves the exact prior behaviour.
+        if len(chains) == 1 and chains[0][0] is None and len(chains[0][1]) == 1:
+            if chains[0][2]:
+                _rc, out = _run_background(chains[0][1], work_dir, expansion=expansion)
+                return out if out else "(no output)"
+            _rc, out = _run_segment(chains[0][1][0], work_dir, timeout,
+                                    expansion=expansion)
+            return out if out else "(no output)"
+
+        # Multi-pipeline chain: run each pipeline through the sandbox, applying
+        # `&&` / `||` short-circuit semantics based on the previous pipeline's
+        # exit code.
+        outputs: list[str] = []
+        prev_rc = 0
+        ran_any = False
+
+        for op, cmd_nodes, backgrounded in chains:
+            joined = _serialize_pipeline_from_cmds(cmd_nodes)
+            if op == "&&" and ran_any and prev_rc != 0:
+                outputs.append(f"(skipped: previous command exited {prev_rc}) — {joined}")
+                continue
+            if op == "||" and ran_any and prev_rc == 0:
+                outputs.append("(skipped: previous command succeeded) — " + joined)
+                continue
+
+            if backgrounded:
+                _rc, out = _run_background(cmd_nodes, work_dir, expansion=expansion)
+                ran_any = True
+                # Leave prev_rc unchanged — backgrounded exit code is unknown.
+            elif len(cmd_nodes) == 1:
+                rc, out = _run_segment(cmd_nodes[0], work_dir, timeout,
+                                       expansion=expansion)
+                prev_rc = rc
+                ran_any = True
+            else:
+                rc, out = _run_pipeline(cmd_nodes, work_dir, timeout,
+                                        expansion=expansion)
+                prev_rc = rc
+                ran_any = True
+            if out:
+                outputs.append(out)
+
+        if not outputs:
+            return "(no output)"
+        return "\n".join(outputs)
+
+    # ---- Legacy fallback (program is None) ----
     try:
         pipelines = _split_command(expanded)
     except ValueError as e:
