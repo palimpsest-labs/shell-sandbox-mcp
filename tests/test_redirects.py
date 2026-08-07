@@ -910,6 +910,51 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         self.assertIsNotNone(captured_stdins[0])
         self.assertIn(f"[stdin <- {infile}]", out)
 
+    def test_background_stdin_not_inherited(self) -> None:
+        """Backgrounded first stage with no input redirect must NOT inherit the
+        MCP server's stdin.
+
+        Regression: a backgrounded command that reads stdin (e.g. `cat &`,
+        `grep &`) previously got stdin=None, which inherits the server's stdio
+        pipe. It then consumed bytes of the NEXT JSON-RPC request, corrupting
+        the protocol frame and wedging the server until restart. It must now be
+        /dev/null instead."""
+        captured_stdins = []
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                captured_stdins.append(kwargs.get("stdin"))
+                self.stdout = kwargs.get("stdout")
+                self.stderr = kwargs.get("stderr")
+                self.stdin = kwargs.get("stdin")
+                self.pid = 9999
+
+            def poll(self):
+                return 0
+            def wait(self):
+                return 0
+
+        server.subprocess.Popen = FakePopen
+        server._start_reaper = lambda: None
+
+        def fake_build(command, work_dir, expansion=None):
+            return server.Invocation(
+                str(server.BUSYBOX_BIN.resolve()),
+                [str(server.BUSYBOX_BIN.resolve()), "cat"],
+                None,
+                {},
+                [],
+            )
+
+        server._build_invocation = fake_build
+        rc, out = server._run_background(
+            ["cat"], self.root,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Backgrounded PID", out)
+        # No input redirect → stdin must be DEVNULL, never None (inherit).
+        self.assertIs(captured_stdins[0], subprocess.DEVNULL)
+
 
 # ---------------------------------------------------------------------------
 # Heredoc / here-string / command substitution tests (moved from test_expand.py)

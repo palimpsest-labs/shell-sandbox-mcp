@@ -718,7 +718,13 @@ def _launch_background(
             elif i == 0 and plan.first_stdin_file is not None:
                 stage_stdin = plan.first_stdin_file
             else:
-                stage_stdin = None
+                # Backgrounded children must NOT inherit the MCP server's
+                # stdin (the stdio pipe that carries the next JSON-RPC
+                # request).  If a backgrounded command reads stdin (e.g.
+                # `cat &`, `grep &`, `head &`), it would consume the next
+                # request's bytes, corrupting the protocol frame and wedging
+                # the server until restart.  Redirect to /dev/null instead.
+                stage_stdin = _stdlib_subprocess.DEVNULL
             p = srv.subprocess.Popen(
                 sandbox_args,
                 stdin=stage_stdin,
