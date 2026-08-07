@@ -17,7 +17,8 @@ clean:
 	rm -f bin/sandbox.aarch64.elf bin/sandbox.com.dbg
 
 # Install common test/development packages into the sandbox-local .py-site
-# so they are importable by the vendored cosmo python.  Uses --user so pip
-# installs into the sandbox workspace rather than the host site-packages.
+# so they are importable by the vendored musl python (the sandbox `python3`).
+# Uses --user so pip installs into the sandbox workspace rather than the host
+# site-packages.
 sandbox-deps:
 	python3 -m pip install --user --disable-pip-version-check pytest mcp

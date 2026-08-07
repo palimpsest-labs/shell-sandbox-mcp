@@ -11,7 +11,7 @@ There are TWO test runners. Pick based on which files you are testing.
 
 The full suite imports `shell_sandbox_mcp.server`, which imports `mcp` at module
 level. `mcp` cannot run inside the sandbox (its Rust `pydantic-core` dependency is
-incompatible with the Cosmopolitan python), so the full suite must run on the host
+not available to the sandboxed python), so the full suite must run on the host
 venv, OUTSIDE the sandbox shell:
 
 ```bash
@@ -25,7 +25,8 @@ sandbox tool itself).
 ### 2. Sandbox runner — subset (no `mcp` needed)
 
 Tests that import ONLY `shell_sandbox_mcp.parser`, `.config`, `.policy`, or
-`.executor` (not `.server`) run fine inside the sandbox via the cosmo python:
+`.executor` (not `.server`) run fine inside the sandbox via the `python3`
+command:
 
 ```bash
 # one-time: install pytest into the sandbox-local site dir
@@ -44,17 +45,21 @@ Which files need `mcp` (i.e. must run on the host): anything importing
 
 ## Sandbox Python environment
 
-- The sandbox `python3` command is a vendored Cosmopolitan static build at
-  `bin/cosmo/python` (Python 3.12). It runs with `-S`, so `.pth` files are NOT
-  processed and the sandbox-local site dir is exposed purely via `PYTHONPATH`.
+- The sandbox `python3` command is a **vendored musl CPython 3.12.11** at
+  `bin/python-musl/install/bin/python3.12` (built in-sandbox with the Bootlin
+  musl toolchain, LFS-tracked). It is dynamically linked against the staged
+  `ld-musl` loader + `libc.so` under `bin/python-musl/install/lib/rtlib/`. It
+  is real CPython — site.py and `.pth` files work normally, and it can
+  `dlopen` native `.so` extensions (including ones compiled with the musl gcc).
 - `pip install --user <pkg>` installs into `<cwd>/.py-site/lib/python<ver>/site-packages`
   and is importable by `python3`. This is the supported way to add packages inside
   the sandbox.
 - The project's own package (`src/`) is automatically added to `PYTHONPATH`, so
   `import shell_sandbox_mcp` works inside the sandbox without an editable install.
-- The cosmo python has NO `ensurepip`, so `python3 -m venv <dir>` (with pip
-  bootstrap) FAILS. Use `python3 -m venv --without-pip <dir>` instead; the venv
-  python is then fully functional (its own site-packages + `src/` both importable).
+- The vendored musl python was built with `--without-ensurepip`, so it has NO
+  bundled pip. Use `python3 -m venv --without-pip <dir>` to create a venv; the
+  venv python is then fully functional (its own site-packages + `src/` both
+  importable). Bootstrap pip separately if needed (e.g. get-pip.py).
 - `pip install --user mcp` will NOT work in the sandbox (native deps). Don't try.
 
 ## Misc

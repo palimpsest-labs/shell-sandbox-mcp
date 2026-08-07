@@ -164,9 +164,9 @@ tests asserting tuple shape need updating.
 `tests/helpers.py` if a test imports a helper from another class.
 
 ### B2 — Magic constants & latent bug
-- **Latent bug:** `server.py:661` hardcodes `lib/python3.12/site-packages` for the python3
-  sandbox-local site dir. Will break silently when the cosmo python bumps. Derive from
-  `sys.version_info` or the cosmo python's `--version`.
+- **Latent bug (FIXED):** server.py hardcoded `lib/python3.12/site-packages` for the python3
+  sandbox-local site dir. Now derived dynamically from the vendored python's
+  `_python_version()` (was the cosmo python, now the musl python's version).
 - `MAX_SUBST_DEPTH/COUNT/OUTPUT/HEREDOC_BODY` defined in parser.py:36–39 then re-imported in
   server.py:65 "for backward compatibility" and re-referenced in `shell_list`'s docstring.
   Define once in `config.py`, import everywhere.

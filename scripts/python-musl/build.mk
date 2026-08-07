@@ -9,7 +9,7 @@
 #   make -f scripts/python-musl/build.mk verify        # run + compile+import a .so ext
 #
 # Fetch+extract of the source is done OUTSIDE this makefile (needs inet+dns which the
-# `make` promise set lacks) via the allowlisted top-level `python3` (cosmo python):
+# `make` promise set lacks) via the allowlisted top-level `python3`:
 #   python3 scripts/python-musl/fetch.py
 
 SHELL := /bin/bash

@@ -395,7 +395,7 @@ class BuildInvocationRedirectTest(unittest.TestCase):
         self.assertIn("only support fds 1 and 2", inv.message)
 
 # ---------------------------------------------------------------------------
-# _run_segment with redirects (stubbed subprocess — cosmo python can't fork)
+# _run_segment with redirects (stubbed subprocess — sandbox python can't fork)
 # ---------------------------------------------------------------------------
 
 
