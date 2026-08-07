@@ -79,14 +79,16 @@ class RedirectPlan:
 def _extract_redirects(
     segment,
     expansion=None,
+    work_dir=None,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """Tokenize a command segment, extracting redirect operators.
 
     Thin wrapper around :func:`parser.extract_redirects`.  Accepts either a
     ``str`` (legacy path — lexes inline) or a :class:`parser.CommandNode`
     (AST-native path — uses the pre-parsed AST directly without re-lexing).
+    *work_dir*, when given, enables glob/pathname expansion.
     """
-    return _parser_extract_redirects(segment, expansion)
+    return _parser_extract_redirects(segment, expansion, work_dir)
 
 
 def _resolve_fd_targets(

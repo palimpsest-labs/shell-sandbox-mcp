@@ -111,6 +111,7 @@ from .policy import (  # noqa: F401
 from .builtins import (  # noqa: F401
     _apply_timeout_builtin,
     _try_cd,
+    _try_for_loop,
 )
 
 # ---------------------------------------------------------------------------
@@ -203,6 +204,15 @@ def shell_run(
     implemented in pure Python and does not spawn a subprocess, so it does
     not need a ``vfork``-capable pledge.
 
+    ``for VAR [in WORD…] [;] do BODY done`` iterates over the word list,
+    re-parsing the body with ``$VAR`` bound to each word's current value.
+    The ``in`` clause is optional; when omitted the loop runs zero iterations
+    (the sandbox has no positional parameters).  ``$()``, ``$VAR``,
+    ``cd``, ``timeout``, pipes, and redirects all work inside the body.
+    ``cd`` inside the body does NOT persist across iterations or out of the
+    loop.  The for-loop must be the **entire command string** — it cannot
+    appear mid-chain with ``;``, ``&&``, or ``||``.
+
     Args:
         command: The command to run (e.g., "git status", "ls | grep foo",
             "cd build && make test")
@@ -222,6 +232,13 @@ def shell_run(
     err = _validate_cwd(work_dir, raw_cwd)
     if err:
         return err
+
+    # for-loop builtin — detect and execute the entire command as a for-loop
+    # before expansion so the body is re-parsed per iteration with the loop
+    # variable bound.  Returns None when the command is NOT a for-loop.
+    loop = _try_for_loop(command, work_dir, timeout, depth=0)
+    if loop is not None:
+        return loop[0]
 
     # Expand $(...) heredocs and here-strings BEFORE splitting.
     # Also parse into an AST so the execution path consumes it directly
@@ -287,6 +304,12 @@ def shell_list() -> str:
     lines.append("    directory is validated against the same containment rules as the")
     lines.append(f"    initial cwd ({', '.join(DEFAULT_ALLOWED_DIRS)}). Bare 'cd' with no")
     lines.append("    argument is rejected (no $HOME concept in the sandbox).")
+    lines.append("")
+    lines.append("    'for VAR [in WORD…] [;] do BODY done' iterates over the word list,")
+    lines.append("    re-parsing the body with $VAR bound to each word. $(), $VAR, cd,")
+    lines.append("    timeout, pipes, and redirects all work inside the body. cd inside")
+    lines.append("    the body does NOT persist across iterations. The for-loop must be")
+    lines.append("    the entire command (not mid-chain with ;, &&, or ||).")
     lines.append("")
     lines.append(f"Sandbox binary: {SANDBOX_BIN.resolve()}")
     lines.append(f"Allowed directories: {', '.join(DEFAULT_ALLOWED_DIRS)}")

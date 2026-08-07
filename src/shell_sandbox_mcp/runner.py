@@ -69,6 +69,7 @@ class Runner:
             # per-pipeline timeout override applies to the correct pipeline.
             nodes, eff_to, terr = srv._apply_timeout_builtin(
                 cmd_nodes, self.expansion, backgrounded, timeout,
+                work_dir=self.work_dir,
             )
             if terr is not None:
                 self.outputs.append(terr)

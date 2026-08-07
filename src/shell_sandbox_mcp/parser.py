@@ -12,7 +12,7 @@ Public API
 - ParseError, Redirect, Expansion
 - parse_command(text, capture_fn, ...) → (cleaned, expansion, program)
 - split_legacy(text) → list[(op|None, [stages], bg)]
-- extract_redirects(segment, expansion) → (args, redirects, err)
+- extract_redirects(segment, expansion=None, work_dir=None) → (args, redirects, err)
 - serialize_program(program) → str
 - program_to_chain(program) → list[(op|None, [CommandNode], bg)]
 - Lexer, Token, TokenKind, CommandNode, PipelineNode, AndOrNode, ProgramNode (AST)
@@ -21,6 +21,7 @@ Public API
 from __future__ import annotations
 
 import enum
+import glob as _glob
 import os
 import re
 import subprocess
@@ -1014,12 +1015,13 @@ def _build_ast(
 
         current_text: list[str] = []
         current_raw: list[str] = []
+        in_quotes = False   # True while accumulating text inside '...' or "..."
 
         def flush() -> None:
             if current_text or current_raw:
                 t = "".join(current_text)
                 r = "".join(current_raw)
-                parts.append(WordPart(text=t, raw=r if r else t))
+                parts.append(WordPart(text=t, raw=r if r else t, is_quoted=in_quotes))
                 current_text.clear()
                 current_raw.clear()
 
@@ -1029,6 +1031,7 @@ def _build_ast(
                 # Single quote — fully literal, no $() expansion
                 flush()
                 current_raw.append(c)
+                in_quotes = True
                 i += 1
                 while i < n2 and raw[i] != "'":
                     current_text.append(raw[i])
@@ -1037,10 +1040,13 @@ def _build_ast(
                 if i < n2:
                     current_raw.append("'")
                     i += 1
+                flush()
+                in_quotes = False
                 continue
             if c == '"':
                 flush()
                 current_raw.append(c)
+                in_quotes = True
                 i += 1
                 while i < n2 and raw[i] != '"':
                     ch = raw[i]
@@ -1160,6 +1166,8 @@ def _build_ast(
                 if i < n2:
                     current_raw.append('"')
                     i += 1
+                flush()
+                in_quotes = False
                 continue
             # Backslash outside quotes: escape next character.
             # In _lex_word, \$ keeps the backslash so _split_word_parts
@@ -1687,6 +1695,7 @@ def _strip_quotes(s: str) -> str:
 def extract_redirects(
     segment,
     expansion: Optional[Expansion] = None,
+    work_dir: Optional[Path] = None,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """Tokenize a command segment, extracting redirect operators.
 
@@ -1694,12 +1703,15 @@ def extract_redirects(
     (AST-native path).  Returns ``(args, redirects, None)`` on success, or
     ``([], [], error_msg)`` on error.
 
+    *work_dir*, when given, enables glob/pathname expansion on unquoted
+    metacharacters in command args (not redirect targets).
+
     All error strings match the original ``_extract_redirects`` exactly.
     """
     if isinstance(segment, str):
-        return _extract_from_string(segment, expansion)
+        return _extract_from_string(segment, expansion, work_dir)
     elif isinstance(segment, CommandNode):
-        return _extract_from_node(segment, expansion)
+        return _extract_from_node(segment, expansion, work_dir)
     else:
         return [], [], f"Unsupported segment type: {type(segment).__name__}"
 
@@ -1707,6 +1719,7 @@ def extract_redirects(
 def _extract_from_string(
     segment: str,
     expansion: Optional[Expansion] = None,
+    work_dir: Optional[Path] = None,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """AST-projected path: lex *segment* and route through the AST.
 
@@ -1734,7 +1747,7 @@ def _extract_from_string(
     if not chain or not chain[0][1]:
         return [], [], None
 
-    return _extract_from_node(chain[0][1][0], expansion)
+    return _extract_from_node(chain[0][1][0], expansion, work_dir)
 
 
 def _has_unbalanced_quotes(text: str) -> bool:
@@ -1763,9 +1776,35 @@ def _expand_tilde(s: str) -> str:
     return str(Path(s).expanduser()) if s.startswith("~") else s
 
 
+def _expand_glob_arg(pattern: str, work_dir: Path) -> list[str]:
+    """Expand a single command arg containing glob metacharacters.
+
+    The pattern is resolved against ``work_dir`` (or used absolute), globbed,
+    and each match is filtered to stay within allowed roots (work_dir + extra
+    redirect roots). Returns the matched path strings (absolute), or [] if no
+    matches survive containment. Caller falls back to the literal arg when this
+    returns [].
+    """
+    from .containment import _contained_in_any
+    from .config import EXTRA_REDIRECT_ROOTS
+    if work_dir is None:
+        return []
+    p = _expand_tilde(pattern)   # tilde expansion precedes pathname expansion
+    pat = os.path.join(str(work_dir), p) if not p.startswith("/") else p
+    matches = _glob.glob(pat)
+    out = []
+    for m in matches:
+        cand = _contained_in_any(m, [work_dir, *EXTRA_REDIRECT_ROOTS])
+        if cand is not None:
+            out.append(str(cand))
+    out.sort()   # deterministic order (glob order is filesystem-dependent)
+    return out
+
+
 def _extract_from_node(
     cmd: CommandNode,
     expansion: Optional[Expansion] = None,
+    work_dir: Optional[Path] = None,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """AST-native path: project a CommandNode to (args, redirects, err).
 
@@ -1777,14 +1816,36 @@ def _extract_from_node(
 
     for w in cmd.words:
         resolved = ""
+        pattern = ""
+        glob_active = False
         for p in w.parts:
             if p.is_arg_sentinel and expansion is not None:
                 val = expansion.arg_for(p)
-                resolved += val if val is not None else p.text
+                val = val if val is not None else p.text
+                resolved += val
+                if p.is_quoted:
+                    pattern += _glob.escape(val)
+                else:
+                    pattern += val
+                    if any(c in val for c in "*?["):
+                        glob_active = True
             else:
                 resolved += p.text
+                if p.is_quoted:
+                    pattern += _glob.escape(p.text)
+                else:
+                    pattern += p.text
+                    if any(c in p.text for c in "*?["):
+                        glob_active = True
         if resolved:
-            args.append(_expand_tilde(resolved))
+            if work_dir is not None and glob_active:
+                matches = _expand_glob_arg(pattern, work_dir)
+                if matches:
+                    args.extend(matches)          # sorted/unique order from glob
+                else:
+                    args.append(_expand_tilde(resolved))   # POSIX: unmatched glob stays literal
+            else:
+                args.append(_expand_tilde(resolved))
 
     for rs in cmd.redirects:
         target_text = ""

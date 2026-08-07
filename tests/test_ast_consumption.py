@@ -94,7 +94,7 @@ class ASTConsumptionTest(unittest.TestCase):
         """_extract_redirects receives CommandNode via AST projection."""
         received_types: list[type] = []
 
-        def spy_extract(segment, expansion=None):
+        def spy_extract(segment, expansion=None, work_dir=None):
             received_types.append(type(segment))
             # Return valid empty result
             return ["echo", "hi"], [], None

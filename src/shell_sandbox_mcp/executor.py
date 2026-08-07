@@ -79,7 +79,7 @@ def _build_invocation(
     """
     from .parser import Redirect  # for type annotation only
     srv = _get_server()
-    args, raw_redirects, parse_err = srv._extract_redirects(command, expansion)
+    args, raw_redirects, parse_err = srv._extract_redirects(command, expansion, work_dir)
     if parse_err is not None:
         return InvocationError(parse_err)
 
