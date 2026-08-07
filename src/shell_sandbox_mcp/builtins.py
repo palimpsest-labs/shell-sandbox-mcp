@@ -208,6 +208,21 @@ def _split_assignment_prefix(
     return prefix, remaining, None
 
 
+_BUILTIN_STAGE_NAMES = ("export", "unset", "set", "shift", "source", ".")
+
+
+def _classify_builtin(cmd, expansion, work_dir) -> Optional[str]:
+    """Return the builtin name if *cmd*'s first arg is one of the 5 variable
+    builtins (or ``.``), else None.  Does NOT execute — safe to call as a
+    probe.
+    """
+    srv = _get_server()
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    if not args:
+        return None
+    return args[0] if args[0] in _BUILTIN_STAGE_NAMES else None
+
+
 # ---------------------------------------------------------------------------
 # Variable/assignment builtins — export, unset, set, shift, source / .
 # ---------------------------------------------------------------------------

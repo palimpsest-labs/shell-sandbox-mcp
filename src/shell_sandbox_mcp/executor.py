@@ -288,7 +288,8 @@ class _PlanError:
     message: str
 
 
-def _build_pipeline_plan(segments, work_dir, expansion, mode, *, shell_env=None, stage_env_overrides=None):
+def _build_pipeline_plan(segments, work_dir, expansion, mode, *, shell_env=None, stage_env_overrides=None,
+                         injected_first_stdin_bytes=None, start_index=0):
     """Shared pre-launch: build invocations, validate, resolve fd targets.
 
     Returns a :class:`PipelinePlan` on success, ``None`` when all segments
@@ -299,6 +300,11 @@ def _build_pipeline_plan(segments, work_dir, expansion, mode, *, shell_env=None,
     *shell_env*, when provided, is the base subprocess environment (exported
     vars only).  *stage_env_overrides*, when provided, is a list of per-stage
     override dicts that are merged on top of *shell_env* (or ``_base_env()``).
+
+    *injected_first_stdin_bytes*, when non-None, feeds bytes to the first
+    stage's stdin (unless that stage already has a heredoc/here-string/input
+    redirect).  *start_index* is the logical index of the first segment within
+    the enclosing pipeline (used for heredoc-on-non-first checks).
     """
     if mode not in ("foreground", "background"):
         raise ValueError(
@@ -331,7 +337,7 @@ def _build_pipeline_plan(segments, work_dir, expansion, mode, *, shell_env=None,
                 f"Local binary no longer valid inside working directory: {binary}"
             )
         # Reject heredoc/here-string/input-redirect on non-first stages
-        if i > 0:
+        if (start_index + i) > 0:
             for r in redirects:
                 if r.fd == 0:
                     seg_str = (
@@ -413,12 +419,24 @@ def _build_pipeline_plan(segments, work_dir, expansion, mode, *, shell_env=None,
                 last_shared_read_fd = plan.shared_read_fd
 
             if i == 0:
-                # Background mode intentionally drops stdin_bytes (heredoc
-                # bodies are not written to background children).
-                if mode == "foreground" and plan.stdin_bytes is not None:
-                    first_stdin_bytes = plan.stdin_bytes
-                if plan.stdin_file is not None:
-                    first_stdin_file = plan.stdin_file
+                # Injected stdin bytes (from upstream builtin output).
+                # Rejected when the stage already has a heredoc / here-string /
+                # input redirect, or when in background mode.
+                if injected_first_stdin_bytes is not None:
+                    if plan.stdin_bytes is not None or plan.stdin_file is not None:
+                        return _PlanError(
+                            "cannot inject stdin: stage already has "
+                            "heredoc/here-string/input redirect"
+                        )
+                    if mode == "foreground":
+                        first_stdin_bytes = injected_first_stdin_bytes
+                else:
+                    # Background mode intentionally drops stdin_bytes (heredoc
+                    # bodies are not written to background children).
+                    if mode == "foreground" and plan.stdin_bytes is not None:
+                        first_stdin_bytes = plan.stdin_bytes
+                    if plan.stdin_file is not None:
+                        first_stdin_file = plan.stdin_file
 
     except OSError as e:
         for fh in all_to_close:
@@ -846,6 +864,8 @@ def _run_pipeline_core(
     *,
     shell_env: Optional[dict[str, str]] = None,
     stage_env_overrides: Optional[list[dict[str, str]]] = None,
+    injected_first_stdin_bytes: Optional[bytes] = None,
+    start_index: int = 0,
 ) -> tuple[int, bytes, bytes, list[str]]:
     """Run a pipe-connected sequence of segments concurrently (raw bytes).
 
@@ -854,7 +874,9 @@ def _run_pipeline_core(
     the combined stderr from all stages.
     """
     plan = _build_pipeline_plan(segments, work_dir, expansion, "foreground",
-                                shell_env=shell_env, stage_env_overrides=stage_env_overrides)
+                                shell_env=shell_env, stage_env_overrides=stage_env_overrides,
+                                injected_first_stdin_bytes=injected_first_stdin_bytes,
+                                start_index=start_index)
     if plan is None:
         return 0, b"", b"", []
     if isinstance(plan, _PlanError):
@@ -872,6 +894,8 @@ def _run_pipeline(
     *,
     shell_env=None,
     stage_env_overrides=None,
+    injected_first_stdin_bytes=None,
+    start_index=0,
 ) -> tuple[int, str]:
     """Run a pipe-connected sequence of segments concurrently in the sandbox.
 
@@ -890,6 +914,8 @@ def _run_pipeline(
     rc, stdout_bytes, stderr_bytes, report = srv._run_pipeline_core(
         segments, work_dir, timeout, expansion=expansion,
         shell_env=shell_env, stage_env_overrides=stage_env_overrides,
+        injected_first_stdin_bytes=injected_first_stdin_bytes,
+        start_index=start_index,
     )
     return rc, _format_output(rc, stdout_bytes, stderr_bytes, report)
 

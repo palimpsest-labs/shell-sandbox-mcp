@@ -253,11 +253,15 @@ def shell_run(
       The file must be within the working directory or ``/tmp``.  Recursion
       is capped at ``MAX_SOURCE_DEPTH`` (8).
 
-    **Limitation:** variable-assignment builtins (``export``, ``unset``,
-    ``set``, ``shift``, ``source``/``.``) are only intercepted when they
-    appear as a single-command pipeline segment (no pipes).  In a
-    multi-stage pipeline they fall through to normal command resolution
-    and will be rejected by the allowlist.
+    **Limitation:** these builtins are not supported in backgrounded
+    pipelines (``&``); such commands are rejected with
+    ``"builtin not supported in backgrounded pipeline (&)"``.  ``cd`` is
+    only intercepted as a single-command pipeline segment.  When a builtin
+    like ``export``/``set`` runs as a pipeline stage, its mutation persists
+    to the shell store for LATER chain segments (``export Y=2 | cat; echo
+    $Y`` → Y set), but it does NOT propagate into the subprocess env of
+    other stages IN THE SAME pipeline — each subprocess stage's env is
+    snapshotted from the exported vars at pipeline start.
 
     By default this tool returns a plain string: the per-pipeline outputs
     joined with newlines (or ``"(no output)"`` when nothing was produced),

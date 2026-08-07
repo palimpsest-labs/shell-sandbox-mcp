@@ -1996,12 +1996,12 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
 
 
 def segment_needs_variable_state(seg_text: str) -> bool:
-    """Return True if *seg_text*'s first WORD (skipping whitespace, newlines,
-    redirect operators AND their target words) matches ``^[A-Za-z_][A-Za-z0-9_]*=``
-    OR is one of ``{"export","unset","set","shift","source","."}``.
+    """Return True if *seg_text* contains a variable assignment or a builtin
+    (``export``, ``unset``, ``set``, ``shift``, ``source``, ``.``) in ANY
+    pipeline stage position (including after ``|``).
 
-    Uses :class:`Lexer` to extract the first word so redirect operators
-    (``2>``, ``>>``, ``<``, etc.) and their targets are skipped.
+    Uses :class:`Lexer` so redirect operators (``2>``, ``>>``, ``<``, etc.)
+    and their targets are skipped at each pipe boundary.
     """
     try:
         tokens = Lexer(seg_text).tokenize()
@@ -2015,8 +2015,16 @@ def segment_needs_variable_state(seg_text: str) -> bool:
     })
 
     expect_redirect_target = False
+    skip_stage = False  # True after first non-builtin/assignment word of a stage
     for t in tokens:
         if t.kind in (TokenKind.WS, TokenKind.NEWLINE):
+            continue
+        if t.kind == TokenKind.PIPE:
+            # Reset state at pipe boundary — check the first word of each stage
+            expect_redirect_target = False
+            skip_stage = False
+            continue
+        if skip_stage:
             continue
         if t.kind in _REDIRECT_KINDS:
             # Skip the redirect operator; the next non-WS token is its target
@@ -2033,9 +2041,15 @@ def segment_needs_variable_state(seg_text: str) -> bool:
             # Check builtin names
             if t.value in _BUILTIN_NAMES:
                 return True
-            return False
-        # SUBST ($(…)) or VARREF ($VAR) at first word position — not our gate
-        return False
+            # First non-redirect word of this stage — not a builtin/assignment,
+            # skip rest of this stage
+            skip_stage = True
+            continue
+        # SUBST ($(…)) or VARREF ($VAR) at first word position — a non-builtin/
+        # assignment first word, so skip the rest of this stage (the pipe-reset
+        # logic above re-enables detection for later stages after ``|``).
+        skip_stage = True
+        continue
     return False
 
 

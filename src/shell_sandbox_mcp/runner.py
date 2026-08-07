@@ -438,6 +438,33 @@ class Runner:
                     self.stages.append({"command": joined, "output": "", "rc": 0})
                     continue
 
+            # Per-stage builtin handling in multi-stage pipelines.
+            # Single-stage builtins are handled above (byte-for-byte preserved).
+            # Pure-subprocess pipelines fall through to the bg/single/pipeline
+            # dispatch below.
+            from .builtins import _classify_builtin
+            kinds = [_classify_builtin(n, expansion, self.work_dir) for n in nodes]
+            if any(kinds):
+                if bg:
+                    err = "builtin not supported in backgrounded pipeline (&)"
+                    self.outputs.append(err)
+                    self.stages.append({"command": joined, "output": err, "rc": 1})
+                    self.prev_rc = 1
+                    self.ran_any = True
+                    continue
+                if len(nodes) > 1:
+                    rc, out = self._run_mixed_pipeline(
+                        nodes, kinds, stage_env_overrides, expansion, eff_to, timeout, depth,
+                    )
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    if out:
+                        self.outputs.append(out)
+                    continue
+                # Single-stage builtin already handled above — fall through
+                # (should not happen; defense in depth)
+
             # Build stage environment: base = exported vars; per-stage overrides
             base = store.env_for_subprocess()
 
@@ -481,3 +508,124 @@ class Runner:
                 text=text,
             )
         return text
+
+    def _run_mixed_pipeline(self, nodes, kinds, stage_env_overrides, expansion,
+                            eff_to, timeout, depth):
+        """Walk *nodes* left-to-right, grouping consecutive subprocess stages
+        into mini-pipelines separated by builtin barriers.
+
+        Returns ``(final_rc, output_string)``.
+
+        *eff_to* is the per-pipeline effective timeout (after
+        :func:`_apply_timeout_builtin` stripping); *timeout* is the original
+        call timeout (used by ``source``).
+        """
+        srv = _get_server()
+        store = self.variables
+        n = len(nodes)
+        pending_stdin_bytes: Optional[bytes] = None
+        collected_stderr = bytearray()
+        final_stdout_bytes = b""
+        final_rc = 0
+        last_was_builtin = False
+        last_builtin_out = ""
+        base = store.env_for_subprocess()
+
+        i = 0
+        while i < n:
+            if kinds[i] is None:
+                # Subprocess stage(s) — collect consecutive subprocess nodes.
+                j = i + 1
+                while j < n and kinds[j] is None:
+                    j += 1
+                sub_nodes = nodes[i:j]
+                sub_overrides = (stage_env_overrides[i:j]
+                                 if stage_env_overrides else None)
+                is_last_run = (j == n)
+
+                rc, stdout_b, stderr_b, report = srv._run_pipeline_core(
+                    sub_nodes, self.work_dir, eff_to, expansion=expansion,
+                    shell_env=base, stage_env_overrides=sub_overrides,
+                    injected_first_stdin_bytes=pending_stdin_bytes,
+                    start_index=i,
+                )
+                final_rc = rc
+                if stderr_b:
+                    collected_stderr.extend(stderr_b)
+                if is_last_run:
+                    final_stdout_bytes = stdout_b
+                # else: intermediate subprocess stdout is consumed by
+                # _launch_pipeline_foreground (captured to PIPE internally,
+                # no block); we just drop it here.
+
+                pending_stdin_bytes = None
+                last_was_builtin = False
+                i = j
+            else:
+                # Builtin stage.
+                name = kinds[i]
+                out, rc = self._exec_pipeline_builtin(
+                    name, nodes[i], expansion, timeout, depth,
+                )
+                pending_stdin_bytes = (out or "").encode("utf-8", errors="replace")
+                final_rc = rc
+                last_was_builtin = True
+                last_builtin_out = out
+                i += 1
+
+        # Compose final output string.
+        if last_was_builtin:
+            # Builtin-last: output already has "Exit code: N" applied by
+            # _exec_pipeline_builtin.  Append collected stderr if any.
+            out = last_builtin_out
+            if collected_stderr:
+                stderr_text = collected_stderr.decode("utf-8", errors="replace")
+                out = out + "\n" + stderr_text if out else stderr_text
+            return final_rc, out
+        else:
+            # Subprocess-last: use standard _format_output.
+            out = srv._format_output(
+                final_rc, final_stdout_bytes, bytes(collected_stderr), [],
+            )
+            return final_rc, out
+
+    def _exec_pipeline_builtin(self, name, node, expansion, timeout, depth):
+        """Execute a single builtin stage in a pipeline.
+
+        Returns ``(output_string, rc)`` with ``"Exit code: N"`` formatting
+        already applied (same as the single-stage builtin path).
+        """
+        from .builtins import (
+            _try_export,
+            _try_unset,
+            _try_set,
+            _try_shift,
+            _try_source,
+        )
+        store = self.variables
+
+        def _builtin_result(rc_val: int, out_val: str) -> tuple[str, int]:
+            """Format builtin output: prepend 'Exit code: N' when rc != 0."""
+            if rc_val != 0 and not out_val:
+                return f"Exit code: {rc_val}", rc_val
+            return out_val or "", rc_val
+
+        if name == "export":
+            handled, out, rc = _try_export(node, expansion, self.work_dir, store)
+        elif name == "unset":
+            handled, out, rc = _try_unset(node, expansion, self.work_dir, store)
+        elif name == "set":
+            handled, out, rc = _try_set(node, expansion, self.work_dir, store)
+        elif name == "shift":
+            handled, out, rc = _try_shift(node, expansion, self.work_dir, store)
+        elif name in ("source", "."):
+            handled, out, rc = _try_source(
+                node, expansion, self.work_dir, store, timeout, depth,
+            )
+        else:
+            return f"unknown builtin: {name}", 1
+
+        if not handled:
+            return f"builtin not handled: {name}", 1
+
+        return _builtin_result(rc, out)

@@ -145,8 +145,8 @@ class SegmentNeedsStateTest(unittest.TestCase):
         self.assertFalse(segment_needs_variable_state("echo hello"))
 
     def test_pipe_with_assign_in_stage2(self) -> None:
-        # Per-segment detection: the first word of the segment is `cmd`, not `VAR=x`
-        self.assertFalse(segment_needs_variable_state("cmd | VAR=x cmd2"))
+        # Assignment in a non-first pipeline stage is now detected
+        self.assertTrue(segment_needs_variable_state("cmd | VAR=x cmd2"))
 
     def test_redirect_before_assign(self) -> None:
         # Redirect token at start is skipped; first word is VAR=x → True
@@ -154,6 +154,21 @@ class SegmentNeedsStateTest(unittest.TestCase):
 
     def test_redirect_before_normal_cmd(self) -> None:
         self.assertFalse(segment_needs_variable_state("2>err echo ok"))
+
+    def test_subst_first_word_same_stage_negative(self) -> None:
+        # SUBST at first-word position is a non-builtin/assignment first word;
+        # the later X=1 in the SAME stage must not be treated as first-word.
+        self.assertFalse(segment_needs_variable_state("$(echo export) X=1"))
+
+    def test_subst_first_word_then_stage2_positive(self) -> None:
+        # Pipe-reset re-enables detection for a later stage.
+        self.assertTrue(segment_needs_variable_state("$(cmd) | export X=1"))
+
+    def test_varref_first_word_same_stage_negative(self) -> None:
+        self.assertFalse(segment_needs_variable_state("$VAR X=1"))
+
+    def test_varref_first_word_then_stage2_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("$VAR | set X=1"))
 
 
 # ============================================================================
