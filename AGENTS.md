@@ -5,43 +5,30 @@ using the sandbox's Python tooling.
 
 ## How to run the test suite
 
-There are TWO test runners. Pick based on which files you are testing.
-
-### 1. Host runner — FULL suite (needs `mcp`)
-
-The full suite imports `shell_sandbox_mcp.server`, which imports `mcp` at module
-level. `mcp` cannot run inside the sandbox (its Rust `pydantic-core` dependency is
-not available to the sandboxed python), so the full suite must run on the host
-venv, OUTSIDE the sandbox shell:
+The full suite runs **inside the sandbox** via the vendored `python3` command.
+`mcp` and its Rust `pydantic-core` dependency are vendored into the sandbox-local
+site dir (`.py-site/`), so everything (including tests that import
+`shell_sandbox_mcp.server`) works under the sandboxed python:
 
 ```bash
-PYTHONPATH=src <venv>/bin/python -m unittest discover -s tests -v
+# full suite (unittest form — ~67s; background it, it exceeds the ~60s MCP call cap)
+python3 -m unittest discover -s tests -v
+
+# or pytest (faster output; counts subtests separately from test methods)
+python3 -m pytest tests/ -q
 ```
 
-Use the host venv that has `mcp` installed. The MCP server venv at
-`~/.vibe/mcp-venvs/palimpsest/bin/python` is one such python (it also runs the
-sandbox tool itself).
+The in-sandbox runner is authoritative. The old "host venv is required because
+`mcp` can't run in-sandbox" split is obsolete — it predates vendoring
+`ssl`/`zlib` + `mcp` into `.py-site/`.
 
-### 2. Sandbox runner — subset (no `mcp` needed)
-
-Tests that import ONLY `shell_sandbox_mcp.parser`, `.config`, `.policy`, or
-`.executor` (not `.server`) run fine inside the sandbox via the `python3`
-command:
+If you ever need the host venv (e.g. a fresh checkout before `.py-site` is
+provisioned), the MCP server venv at `~/.vibe/mcp-venvs/palimpsest/bin/python`
+has `mcp` installed:
 
 ```bash
-# one-time: install pytest into the sandbox-local site dir
-python3 -m pip install --user --disable-pip-version-check pytest
-
-# run the non-mcp subset
-python3 -m pytest tests/test_parser_*.py -q
+PYTHONPATH=src ~/.vibe/mcp-venvs/palimpsest/bin/python -m unittest discover -s tests -v
 ```
-
-Which files need `mcp` (i.e. must run on the host): anything importing
-`from shell_sandbox_mcp import server` — e.g. `test_sandbox.py`, `test_policy.py`,
-`test_executor.py`, `test_containment.py`, `test_redirects.py`,
-`test_env_allowlist.py`, `test_builtins_*.py`, `test_e2e.py`,
-`test_ast_consumption.py`, `test_python_env.py`. The pure-parser tests
-(`test_parser_*.py`) do NOT need `mcp`.
 
 ## Sandbox Python environment
 
@@ -60,11 +47,15 @@ Which files need `mcp` (i.e. must run on the host): anything importing
   bundled pip. Use `python3 -m venv --without-pip <dir>` to create a venv; the
   venv python is then fully functional (its own site-packages + `src/` both
   importable). Bootstrap pip separately if needed (e.g. get-pip.py).
-- `pip install --user mcp` will NOT work in the sandbox (native deps). Don't try.
+- `pip install --user mcp` works in-sandbox now that `ssl`/`zlib` (and the Rust
+  `pydantic-core` wheel) are vendored. It installs into `.py-site/` and is
+  importable by `python3`. (Older CPython sandboxes without those vendored deps
+  could not build/load `mcp`; this is no longer a limitation.)
 
 ## Misc
 
 - `make` builds `bin/sandbox` via the vendored Cosmopolitan toolchain.
-- `make sandbox-deps` runs `pip install --user pytest mcp` for host-side test deps.
+- `make sandbox-deps` runs `pip install --user pytest mcp` — historically for
+  host-side deps, now effectively provisioning the sandbox-local `.py-site/`.
 - Security: the sandbox confines the filesystem to the working directory + `/tmp`
   via unveil. Commands are allowlisted in `src/shell_sandbox_mcp/policy.py`.
