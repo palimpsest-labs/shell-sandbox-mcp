@@ -2,8 +2,8 @@
 """Shell Sandbox MCP Server — safe shell command execution via pledge + busybox.
 
 Tools:
-  shell_run(command, cwd, timeout) — run a command in a pledge sandbox
-  shell_list                          — list allowed commands
+  shell_run(command, cwd, timeout, structured) — run a command in a pledge sandbox
+  shell_list                                   — list allowed commands
 """
 
 import subprocess
@@ -157,7 +157,8 @@ def shell_run(
     command: str,
     cwd: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
-) -> str:
+    structured: bool = False,
+) -> "str | dict":
     """Run a shell command in a pledge sandbox.
 
     Commands are executed via the pledge-wrapped sandbox binary with
@@ -213,13 +214,48 @@ def shell_run(
     loop.  The for-loop must be the **entire command string** — it cannot
     appear mid-chain with ``;``, ``&&``, or ``||``.
 
+    By default this tool returns a plain string: the per-pipeline outputs
+    joined with newlines (or ``"(no output)"`` when nothing was produced),
+    with ``"Exit code: N"`` lines embedded for non-zero exits.  Set
+    ``structured=True`` to instead receive a JSON object:
+
+    .. code-block:: python
+
+        {
+          "rc": <int, final exit code of the last executed pipeline>,
+          "skipped": <bool, true if any &&/|| chain was skipped>,
+          "stages": [
+            {"command": <serialized command>, "output": <str>, "rc": <int or null>}
+          ],
+          "output": <str, same joined text as the default return>,
+        }
+
+    ``output`` is identical to the default string return for back-compat
+    within the payload.  ``stages`` records one entry per pipeline (or
+    builtin interception): ``rc`` is null for skipped chains and backgrounded
+    pipelines (whose exit code is unknown by design), and is left unchanged
+    by a trailing backgrounded command.
+
+    When ``structured=True`` a dict is returned on ALL paths — including
+    error/early-return paths (invalid path, cwd validation failure, parse or
+    expansion error, empty command, for-loop).  On such paths ``stages`` is
+    empty and ``rc`` is 1 (or the for-loop's exit code) with ``skipped`` False.
+
     Args:
         command: The command to run (e.g., "git status", "ls | grep foo",
             "cd build && make test")
         cwd:     Working directory (must be within allowed paths)
         timeout: Timeout in seconds (default 30, max 300)
+        structured: When True, return a structured JSON object (see above)
+            instead of the plain string.  Default False (string return).
     """
     timeout = min(timeout, MAX_TIMEOUT)
+
+    def _structured_error(rc: int, text: str) -> "str | dict":
+        """Return a structured error dict when requested, else the bare string."""
+        if structured:
+            return {"rc": rc, "skipped": False, "stages": [], "output": text}
+        return text
 
     # Validate cwd first — resolve once, use for validation, resolution and
     # execution. Required before resolving so local binaries can be located.
@@ -227,18 +263,18 @@ def shell_run(
     try:
         work_dir = Path(raw_cwd).expanduser().resolve()
     except Exception:
-        return f"Invalid path: {raw_cwd}"
+        return _structured_error(1, f"Invalid path: {raw_cwd}")
 
     err = _validate_cwd(work_dir, raw_cwd)
     if err:
-        return err
+        return _structured_error(1, err)
 
     # for-loop builtin — detect and execute the entire command as a for-loop
     # before expansion so the body is re-parsed per iteration with the loop
     # variable bound.  Returns None when the command is NOT a for-loop.
     loop = _try_for_loop(command, work_dir, timeout, depth=0)
     if loop is not None:
-        return loop[0]
+        return _structured_error(loop[1], loop[0])
 
     # Expand $(...) heredocs and here-strings BEFORE splitting.
     # Also parse into an AST so the execution path consumes it directly
@@ -246,7 +282,7 @@ def shell_run(
     try:
         expanded, expansion, program = _expand_command(command, work_dir, timeout, depth=0)
     except (ParseError, ValueError) as e:
-        return str(e)
+        return _structured_error(1, str(e))
 
     # Walk the AST directly (Option B: single-parse path).  The AST is now the
     # ONLY execution path — the legacy string-based split_legacy fallback
@@ -256,15 +292,17 @@ def shell_run(
         # failed after the scanner succeeded (see parser.parse_command). Surface
         # a clean error string rather than crashing. Do NOT route to the
         # legacy splitter.
-        return "Command parse error."
+        return _structured_error(1, "Command parse error.")
     chains = program_to_chain(program)
     if not chains:
-        return "Empty command."
+        return _structured_error(1, "Empty command.")
 
     # Delegate chain walking (single-command fast path AND `;` / `&&` / `||`
     # multi-pipeline chains) to the Runner, which owns the mutable per-call
     # work_dir / prev_rc / outputs state.
     runner = Runner(work_dir=work_dir, default_timeout=timeout, expansion=expansion)
+    if structured:
+        return runner.run_chain(chains, timeout, structured=True).to_dict()
     return runner.run_chain(chains, timeout)
 
 

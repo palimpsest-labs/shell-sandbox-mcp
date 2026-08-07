@@ -17,7 +17,41 @@ from pathlib import Path
 from .executor import _get_server
 from .parser import Expansion
 
-__all__ = ["Runner"]
+__all__ = ["Runner", "Result"]
+
+
+@dataclass
+class Result:
+    """Structured result of a ``run_chain`` call.
+
+    Produced when ``run_chain(..., structured=True)``.  ``text`` is identical
+    to the default string return, so callers get both the raw joined output
+    and the per-stage breakdown.
+
+    Attributes:
+        rc:      The final exit code — the rc of the last pipeline that
+                 actually ran.  Backgrounded pipelines leave ``prev_rc``
+                 unchanged by design, so a trailing ``&`` does not affect it.
+        skipped: True if any ``&&``/``||`` chain was short-circuited.
+        stages:  Per-stage dicts ``{"command", "output", "rc"}``.  ``rc`` is
+                 ``None`` for stages that did not run (skipped chains,
+                 backgrounded pipelines).
+        text:    The joined output string (same as the default return).
+    """
+
+    rc: int
+    skipped: bool
+    stages: list
+    text: str
+
+    def to_dict(self) -> dict:
+        """Return the JSON-serializable dict shape for ``structured=True``."""
+        return {
+            "rc": self.rc,
+            "skipped": self.skipped,
+            "stages": self.stages,
+            "output": self.text,
+        }
 
 
 @dataclass
@@ -32,7 +66,10 @@ class Runner:
         expansion:       The expansion context produced by ``_expand_command``.
         prev_rc:         Exit code of the most recently run pipeline.
         ran_any:         Whether at least one pipeline has run.
+        skipped:         Whether any ``&&``/``||`` chain was short-circuited.
         outputs:         Accumulated per-pipeline output strings.
+        stages:          Per-stage dicts (see :class:`Result`) for structured
+                         results.
     """
 
     work_dir: Path
@@ -40,29 +77,40 @@ class Runner:
     expansion: Expansion
     prev_rc: int = 0
     ran_any: bool = False
+    skipped: bool = False
     outputs: list[str] = field(default_factory=list)
+    stages: list = field(default_factory=list)
 
-    def run_chain(self, chains: list, timeout: int) -> str:
+    def run_chain(self, chains: list, timeout: int, structured: bool = False) -> "str | Result":
         """Walk a parsed chain and return the joined output string.
 
         *chains* is the list of ``(op, cmd_nodes, backgrounded)`` tuples from
         ``program_to_chain``.  A length-1 chain produces identical output to
         the former single-command fast path.  Returns ``"(no output)"`` when
         nothing was produced.
+
+        When *structured* is True, returns a :class:`Result` carrying the
+        final rc, whether any chain was skipped, a per-stage breakdown, and
+        the same joined text as the default string return.  The default
+        (False) return is byte-for-byte identical to the previous behaviour.
         """
         srv = _get_server()
 
         for op, cmd_nodes, backgrounded in chains:
             joined = srv._serialize_pipeline_from_cmds(cmd_nodes)
             if op == "&&" and self.ran_any and self.prev_rc != 0:
-                self.outputs.append(
+                self.skipped = True
+                skip_text = (
                     f"(skipped: previous command exited {self.prev_rc}) — {joined}"
                 )
+                self.outputs.append(skip_text)
+                self.stages.append({"command": joined, "output": skip_text, "rc": None})
                 continue
             if op == "||" and self.ran_any and self.prev_rc == 0:
-                self.outputs.append(
-                    "(skipped: previous command succeeded) — " + joined
-                )
+                self.skipped = True
+                skip_text = "(skipped: previous command succeeded) — " + joined
+                self.outputs.append(skip_text)
+                self.stages.append({"command": joined, "output": skip_text, "rc": None})
                 continue
 
             # timeout builtin: intercept before cd/allowlist dispatch so the
@@ -73,6 +121,7 @@ class Runner:
             )
             if terr is not None:
                 self.outputs.append(terr)
+                self.stages.append({"command": joined, "output": terr, "rc": 1})
                 self.prev_rc = 1
                 self.ran_any = True
                 continue
@@ -84,6 +133,7 @@ class Runner:
                 new_dir, cd_err = srv._try_cd(nodes[0], self.work_dir, self.expansion)
                 if cd_err is not None:
                     self.outputs.append(cd_err)
+                    self.stages.append({"command": joined, "output": cd_err, "rc": 1})
                     self.prev_rc = 1
                     self.ran_any = True
                     continue
@@ -91,6 +141,7 @@ class Runner:
                     self.work_dir = new_dir
                     self.prev_rc = 0
                     self.ran_any = True
+                    self.stages.append({"command": joined, "output": "", "rc": 0})
                     continue
 
             if backgrounded:
@@ -99,21 +150,34 @@ class Runner:
                 )
                 self.ran_any = True
                 # Leave prev_rc unchanged — backgrounded exit code is unknown.
+                self.stages.append({"command": joined, "output": out, "rc": None})
             elif len(nodes) == 1:
                 rc, out = srv._run_segment(
                     nodes[0], self.work_dir, eff_to, expansion=self.expansion,
                 )
                 self.prev_rc = rc
                 self.ran_any = True
+                self.stages.append({"command": joined, "output": out, "rc": rc})
             else:
                 rc, out = srv._run_pipeline(
                     nodes, self.work_dir, eff_to, expansion=self.expansion,
                 )
                 self.prev_rc = rc
                 self.ran_any = True
+                self.stages.append({"command": joined, "output": out, "rc": rc})
             if out:
                 self.outputs.append(out)
 
         if not self.outputs:
-            return "(no output)"
-        return "\n".join(self.outputs)
+            text = "(no output)"
+        else:
+            text = "\n".join(self.outputs)
+
+        if structured:
+            return Result(
+                rc=self.prev_rc,
+                skipped=self.skipped,
+                stages=self.stages,
+                text=text,
+            )
+        return text
