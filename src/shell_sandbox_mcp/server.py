@@ -56,7 +56,7 @@ from .config import (  # noqa: F401
     SANDBOX_WRAPPER,
     _ENV_ALLOWLIST,
     _base_env,
-    _cosmo_py_version,
+    _python_version,
 )
 
 # ---------------------------------------------------------------------------

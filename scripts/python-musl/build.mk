@@ -20,7 +20,11 @@ MUSL   := $(ROOT)/bin/musl-toolchain/bin
 SR     := $(ROOT)/bin/musl-toolchain/x86_64-buildroot-linux-musl/sysroot/lib
 BLD    := $(ROOT)/build/python-musl
 SRC    := $(BLD)/src/Python-3.12.11
-INST   := $(BLD)/install
+# Install into the VENDORED tree under bin/python-musl/ (LFS-tracked) so the
+# built interpreter is a stable, committed first-class command. The binary's
+# PT_INTERP + rpath are baked to $(RT), so rebuilding with this prefix makes
+# the vendored loader path self-consistent.
+INST   := $(ROOT)/bin/python-musl/install
 RT     := $(INST)/lib/rtlib
 PY     := $(INST)/bin/python3.12
 
@@ -93,4 +97,6 @@ verify: install
 	@echo "VERIFY OK"
 
 clean:
-	rm -rf $(BLD)/src $(BLD)/install $(BLD)/.build-done
+	rm -rf $(BLD)/src $(BLD)/.build-done $(BLD)/configure.log $(BLD)/build.log $(BLD)/install.log
+	# Note: $(INST) is the vendored tree under bin/python-musl/ and is NOT
+	# touched by clean. To re-vendor from scratch: rm -rf bin/python-musl/install.

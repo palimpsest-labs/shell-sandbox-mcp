@@ -18,7 +18,7 @@ from .config import (
     SANDBOX_BIN,
     SANDBOX_WRAPPER,
     _base_env,
-    _cosmo_py_version,
+    _python_version,
 )
 from .parser import (
     CommandNode,
@@ -143,7 +143,7 @@ def _build_invocation(
             # Venv case: site_dir_name is an absolute path to the venv root.
             # The venv tree already exists; just ensure its site-packages dir
             # is present so pip/imports work.
-            site_packages = site_base / "lib" / f"python{_cosmo_py_version()}" / "site-packages"
+            site_packages = site_base / "lib" / f"python{_python_version()}" / "site-packages"
             site_packages.mkdir(parents=True, exist_ok=True)
             unveil_env["PYTHONUSERBASE"] = str(site_base)
             unveil_env["PYTHONPATH"] = str(site_packages)
@@ -155,7 +155,7 @@ def _build_invocation(
                 site_base.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 return InvocationError(f"Error creating python site dir {site_base}: {e}")
-            site_packages = site_base / "lib" / f"python{_cosmo_py_version()}" / "site-packages"
+            site_packages = site_base / "lib" / f"python{_python_version()}" / "site-packages"
             site_packages.mkdir(parents=True, exist_ok=True)
             unveil_env["PYTHONUSERBASE"] = str(site_base)
             unveil_env["PYTHONPATH"] = str(site_packages)

@@ -8,7 +8,13 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .config import BUSYBOX_BIN, COSMO_TOOLCHAIN, MUSL_TOOLCHAIN, REPO_ROOT
+from .config import (
+    BUSYBOX_BIN,
+    COSMO_TOOLCHAIN,
+    MUSL_TOOLCHAIN,
+    PYTHON_MUSL_INSTALL,
+    REPO_ROOT,
+)
 from .containment import _contained_path
 
 
@@ -143,6 +149,17 @@ def _musl_toolchain_bin() -> str:
     return str((MUSL_TOOLCHAIN / "bin").resolve())
 
 
+def _python_musl_paths(work_dir: Optional[Path] = None) -> list[str]:
+    """Return the paths that must be unveiled read-execute for the vendored
+    musl CPython interpreter to run: the entire install tree (binary +
+    stdlib .py + lib-dynload .so) and its rtlib (ld-musl loader + libc.so
+    that the dynamic linker maps). The interpreter's PT_INTERP and rpath
+    point inside this tree, so all of it must be visible to the kernel
+    loader.
+    """
+    return [str(PYTHON_MUSL_INSTALL.resolve())]
+
+
 COMMANDS = {
     "git": {
         "binary": "/usr/bin/git",
@@ -250,7 +267,7 @@ COMMANDS = {
         "path_prefix": _musl_toolchain_bin,
     },
     "python3": {
-        "binary": str(REPO_ROOT / "bin" / "cosmo" / "python"),
+        "binary": str(PYTHON_MUSL_INSTALL / "bin" / "python3.12"),
         # fattr/chown: pip must set file mtimes (utime) and ownership when
         # unpacking wheels/sdists during `pip install` — without them package
         # extraction fails with "Operation not permitted" at tarfile.utime.
@@ -259,18 +276,15 @@ COMMANDS = {
         # that shell out to python).
         "promises": "stdio rpath wpath cpath inet dns recvfd fattr chown proc prot_exec",
         "description": (
-            "Python 3 interpreter (Cosmopolitan static build). Runs with "
-            "-S so PYTHONPATH (a sandbox-local site dir inside the cwd) "
-            "is honored; supports pip/network installs. "
-            "Use `pip install --user <pkg>` to install into .py-site "
-            "(the supported path). The cosmo python has no ensurepip, so "
-            "use `python3 -m venv --without-pip <dir>` to create a venv "
-            "(pip bootstrap is unsupported)."
+            "Python 3.12.11 interpreter (vendored musl CPython, dynamically "
+            "linked against the staged ld-musl loader under "
+            "bin/python-musl/install/lib/rtlib/). Real CPython — supports "
+            "ctypes dlopen, .pth files, and standard site.py processing. "
+            "Use `pip install --user <pkg>` to install into .py-site (the "
+            "supported path)."
         ),
-        # Prepend -S: the cosmo python's patched site module wipes PYTHONPATH
-        # entries, so we disable it and rely on PYTHONPATH for the sandbox-
-        # local site-packages dir.
-        "prepend_args": ["-S"],
+        # No prepend_args: real CPython reads PYTHONPATH through site.py and
+        # honors .pth files, so we don't need the cosmo -S bypass anymore.
         # A per-invocation sandbox-local site base dir, created under the
         # cwd and exposed via PYTHONPATH/PYTHONUSERBASE. `pip install --user`
         # installs into <dir>/lib/python3.12/site-packages, and imports pick
@@ -279,10 +293,14 @@ COMMANDS = {
         "site_dir_name": ".py-site",
         # Extra dirs (relative to cwd) appended to PYTHONPATH so the
         # project's own package is importable without an editable install.
-        # .pth files are not processed under -S, so PYTHONPATH is the only
-        # channel. Appended AFTER site-packages so user-installed packages
-        # take precedence.
+        # Appended AFTER site-packages so user-installed packages take
+        # precedence.
         "pythonpath_extra": ["src"],
+        # Reveal the entire vendored tree rx so the kernel loader can map
+        # ld-musl + libc.so + python3.12 + lib-dynload/*.so + stdlib .py
+        # (the interpreter is dynamically linked, unlike the self-contained
+        # cosmo APE).
+        "extra_unveil_rx": _python_musl_paths,
     },
     "file": {
         "binary": str(REPO_ROOT / "bin" / "cosmo" / "file"),
@@ -342,10 +360,10 @@ def _detect_venv_root(cmd_name: str, work_dir: Path) -> Optional[Path]:
 def _maybe_venv_cfg(
     cmd_name: str, work_dir: Path, resolved_binary: str,
 ) -> Optional[dict]:
-    """If *resolved_binary* is the allowlisted cosmo python AND *cmd_name*
-    (resolved against *work_dir*) lives inside a venv (detected by a
-    ``pyvenv.cfg`` in the parent of the ``bin/`` directory), return a cfg
-    that gives the venv python the ``-S`` + venv-site-packages treatment.
+    """If *resolved_binary* is the allowlisted vendored musl python AND
+    *cmd_name* (resolved against *work_dir*) lives inside a venv (detected
+    by a ``pyvenv.cfg`` in the parent of the ``bin/`` directory), return a
+    cfg that gives the venv python the venv-site-packages treatment.
 
     Returns ``None`` when this is not a venv python.
     """
@@ -363,12 +381,12 @@ def _maybe_venv_cfg(
         "description": f"Venv python: {cmd_name}",
         # is_local_binary is deliberately omitted so the TOCTOU containment
         # re-check in _build_pipeline_plan is skipped.  The binary is the
-        # trusted cosmo python; the venv symlink may resolve outside the
-        # work_dir, which would fail _binary_still_contained.
-        "prepend_args": ["-S"],
+        # trusted vendored musl python; the venv symlink may resolve outside
+        # the work_dir, which would fail _binary_still_contained.
         "site_dir_name": str(venv_root.resolve()),
         "is_venv": True,
         "pythonpath_extra": COMMANDS["python3"].get("pythonpath_extra", []),
+        "extra_unveil_rx": COMMANDS["python3"].get("extra_unveil_rx"),
     }
 
 
@@ -376,16 +394,16 @@ def _resolve_venv_fallback(
     cmd_name: str, work_dir: Path,
 ) -> Optional[dict]:
     """When ``_resolve_local_binary`` fails (containment rejects the resolved
-    cosmo python because it lives outside the work tree), check whether
-    *cmd_name* still looks like a venv python whose symlink target is the
-    cosmo python.  Returns a cfg using the allowlisted cosmo python path
-    directly, or ``None``.
+    vendored musl python because it lives outside the work tree), check
+    whether *cmd_name* still looks like a venv python whose symlink target
+    is the vendored musl python.  Returns a cfg using the allowlisted
+    python path directly, or ``None``.
     """
     venv_root = _detect_venv_root(cmd_name, work_dir)
     if venv_root is None:
         return None
 
-    # Resolve the final target to verify it really is the cosmo python.
+    # Resolve the final target to verify it really is the vendored musl python.
     raw = Path(cmd_name)
     candidate = raw if raw.is_absolute() else (work_dir / raw)
     try:
@@ -401,10 +419,10 @@ def _resolve_venv_fallback(
         "binary": python3_binary,
         "promises": COMMANDS["python3"]["promises"],
         "description": f"Venv python: {cmd_name}",
-        "prepend_args": ["-S"],
         "site_dir_name": str(venv_root.resolve()),
         "is_venv": True,
         "pythonpath_extra": COMMANDS["python3"].get("pythonpath_extra", []),
+        "extra_unveil_rx": COMMANDS["python3"].get("extra_unveil_rx"),
     }
 
 
@@ -466,7 +484,7 @@ def _resolve_command(
             return binary, args, cfg
 
         # Venv fallback: _resolve_local_binary failed (containment check
-        # rejected the resolved cosmo python outside the work_dir), but
+        # rejected the resolved vendored musl python outside the work_dir), but
         # the path may still be a valid venv python.
         cfg = _resolve_venv_fallback(cmd_name, work_dir)
         if cfg is not None:

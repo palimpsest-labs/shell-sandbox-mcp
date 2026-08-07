@@ -16,30 +16,30 @@ from shell_sandbox_mcp.server import (
     COMMANDS,
     Invocation,
     _build_invocation,
-    _cosmo_py_version,
     _maybe_venv_cfg,
+    _python_version,
     _resolve_command,
     _resolve_venv_fallback,
 )
 
 
 # ---------------------------------------------------------------------------
-# _cosmo_py_version — dynamic python version (B2 fix)
+# _python_version — dynamic python version (B2 fix)
 # ---------------------------------------------------------------------------
 
 
-class CosmoPyVersionTest(unittest.TestCase):
-    """Test that _cosmo_py_version queries the binary once and caches."""
+class PythonVersionTest(unittest.TestCase):
+    """Test that _python_version queries the binary once and caches."""
 
     def test_returns_version_and_is_cached(self) -> None:
         """Mock subprocess.run; assert cached result and single call."""
         # Clear any cached value from earlier imports.
-        _cosmo_py_version.cache_clear()
+        _python_version.cache_clear()
 
         with patch("shell_sandbox_mcp.config.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="3.12\n")
-            v1 = _cosmo_py_version()
-            v2 = _cosmo_py_version()
+            v1 = _python_version()
+            v2 = _python_version()
 
             self.assertEqual(v1, "3.12")
             self.assertEqual(v2, "3.12")
@@ -47,13 +47,13 @@ class CosmoPyVersionTest(unittest.TestCase):
 
     def test_raises_runtime_error_on_failure(self) -> None:
         """If the subprocess fails, a RuntimeError propagates."""
-        _cosmo_py_version.cache_clear()
+        _python_version.cache_clear()
 
         with patch("shell_sandbox_mcp.config.subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.CalledProcessError(1, "cmd")
             with self.assertRaises(RuntimeError) as ctx:
-                _cosmo_py_version()
-            self.assertIn("Failed to determine cosmo python version",
+                _python_version()
+            self.assertIn("Failed to determine python version",
                           str(ctx.exception))
 
 
@@ -73,20 +73,20 @@ class MaybeVenvCfgTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_returns_none_for_non_cosmo_binary(self) -> None:
-        """A resolved binary that is NOT the cosmo python returns None."""
+    def test_returns_none_for_non_musl_binary(self) -> None:
+        """A resolved binary that is NOT the vendored musl python returns None."""
         cfg = _maybe_venv_cfg("some/tool", self.root, "/usr/bin/python3")
         self.assertIsNone(cfg)
 
     def test_returns_none_when_no_pyvenv_cfg(self) -> None:
-        """A cosmo python invoked without a venv layout returns None."""
-        # Create a plain directory with a fake python binary (cosmo path).
+        """The vendored musl python invoked without a venv layout returns None."""
+        # Create a plain directory with a fake python binary (musl path).
         # No pyvenv.cfg present, so it should not be treated as a venv.
         cfg = _maybe_venv_cfg("bin/python", self.root, self._python3_binary)
         self.assertIsNone(cfg)
 
     def test_detects_venv_with_pyvenv_cfg(self) -> None:
-        """A cosmo python inside a venv (with pyvenv.cfg) gets a venv cfg."""
+        """The vendored musl python inside a venv (with pyvenv.cfg) gets a venv cfg."""
         # Create a minimal venv layout.
         venv_root = self.root / ".venv"
         venv_bin = venv_root / "bin"
@@ -96,7 +96,7 @@ class MaybeVenvCfgTest(unittest.TestCase):
         resolved_binary = self._python3_binary
         cfg = _maybe_venv_cfg(".venv/bin/python", self.root, resolved_binary)
         self.assertIsNotNone(cfg)
-        self.assertEqual(cfg["prepend_args"], ["-S"])
+        self.assertNotIn("prepend_args", cfg)
         self.assertTrue(cfg.get("is_venv"))
         self.assertEqual(
             Path(cfg["site_dir_name"]).resolve(),
@@ -138,11 +138,11 @@ class ResolveVenvFallbackTest(unittest.TestCase):
         cfg = _resolve_venv_fallback("some/dir/python", self.root)
         self.assertIsNone(cfg)
 
-    def test_returns_cfg_when_venv_points_to_cosmo(self) -> None:
-        """When the symlink resolves to cosmo python, returns a venv cfg."""
+    def test_returns_cfg_when_venv_points_to_musl(self) -> None:
+        """When the symlink resolves to the vendored musl python, returns a venv cfg."""
         python3_path = Path(self._python3_binary).resolve()
 
-        # Create venv layout with bin/python as a symlink to cosmo python.
+        # Create venv layout with bin/python as a symlink to the musl python.
         venv_root = self.root / ".venv"
         venv_bin = venv_root / "bin"
         venv_bin.mkdir(parents=True)
@@ -153,27 +153,27 @@ class ResolveVenvFallbackTest(unittest.TestCase):
 
         cfg = _resolve_venv_fallback(".venv/bin/python", self.root)
         self.assertIsNotNone(cfg)
-        self.assertEqual(cfg["prepend_args"], ["-S"])
+        self.assertNotIn("prepend_args", cfg)
         self.assertTrue(cfg.get("is_venv"))
         self.assertEqual(
             Path(cfg["site_dir_name"]).resolve(),
             venv_root.resolve(),
         )
-        # binary must be the allowlisted cosmo python (not the resolved
-        # path that may live outside the work_dir).
+        # binary must be the allowlisted vendored musl python (not the
+        # resolved path that may live outside the work_dir).
         self.assertEqual(
             Path(cfg["binary"]).resolve(),
             Path(self._python3_binary).resolve(),
         )
 
-    def test_returns_none_when_target_not_cosmo(self) -> None:
+    def test_returns_none_when_target_not_musl(self) -> None:
         """If the symlink points somewhere else, fallback returns None."""
         venv_root = self.root / ".venv"
         venv_bin = venv_root / "bin"
         venv_bin.mkdir(parents=True)
         (venv_root / "pyvenv.cfg").write_text("home = /usr/bin\n")
         venv_python = venv_bin / "python"
-        venv_python.symlink_to("/usr/bin/python3")  # not cosmo python
+        venv_python.symlink_to("/usr/bin/python3")  # not the musl python
 
         cfg = _resolve_venv_fallback(".venv/bin/python", self.root)
         self.assertIsNone(cfg)
@@ -190,17 +190,17 @@ class BuildInvocationPythonPathExtraTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        # _build_invocation uses executor._cosmo_py_version (a separate
-        # module-level name binding from server._cosmo_py_version), so we
+        # _build_invocation uses executor._python_version (a separate
+        # module-level name binding from server._python_version), so we
         # must patch the executor binding.  Also clear the shared lru_cache
         # so we don't depend on test ordering / cached values from
-        # CosmoPyVersionTest.
-        _cosmo_py_version.cache_clear()
-        self._orig_pyver = executor._cosmo_py_version
-        executor._cosmo_py_version = lambda: "3.12"
+        # PythonVersionTest.
+        _python_version.cache_clear()
+        self._orig_pyver = executor._python_version
+        executor._python_version = lambda: "3.12"
 
     def tearDown(self) -> None:
-        executor._cosmo_py_version = self._orig_pyver
+        executor._python_version = self._orig_pyver
         self._tmp.cleanup()
 
     def test_pythonpath_includes_src_when_present(self) -> None:
@@ -238,7 +238,7 @@ class BuildInvocationPythonPathExtraTest(unittest.TestCase):
         self.assertIn(".py-site", parts[0])
 
     def test_site_packages_uses_dynamic_version(self) -> None:
-        """site-packages path uses the version from _cosmo_py_version."""
+        """site-packages path uses the version from _python_version."""
         inv = _build_invocation("python3 -c 'import sys'", self.root)
         self.assertIsInstance(inv, Invocation)
         self.assertIsNotNone(inv.env)
@@ -283,7 +283,7 @@ class ResolveCommandVenvTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_venv_python_gets_prepend_args(self) -> None:
-        """A venv/bin/python command resolves with -S in prepend_args."""
+        """A venv/bin/python command resolves without prepend_args."""
         python3_path = Path(COMMANDS["python3"]["binary"]).resolve()
 
         # Create a venv layout.
@@ -302,8 +302,8 @@ class ResolveCommandVenvTest(unittest.TestCase):
         self.assertIsNotNone(cfg)
         self.assertTrue(cfg.get("is_venv"),
                         f"Expected is_venv=True, got cfg={cfg}")
-        self.assertEqual(cfg.get("prepend_args"), ["-S"])
-        # The binary must be the allowlisted cosmo python.
+        self.assertNotIn("prepend_args", cfg)
+        # The binary must be the allowlisted vendored musl python.
         self.assertEqual(
             Path(binary).resolve(),
             python3_path,

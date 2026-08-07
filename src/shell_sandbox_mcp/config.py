@@ -22,6 +22,10 @@ SANDBOX_WRAPPER = REPO_ROOT / "bin" / "run-sandbox"
 BUSYBOX_BIN = REPO_ROOT / "bin" / "busybox"
 COSMO_TOOLCHAIN = REPO_ROOT / "bin" / "cosmo-toolchain"
 MUSL_TOOLCHAIN = REPO_ROOT / "bin" / "musl-toolchain"
+# Vendored musl CPython 3.12.11 interpreter (built in-sandbox, LFS-tracked).
+# This is the sandbox's `python3` command.
+PYTHON_MUSL_INSTALL = REPO_ROOT / "bin" / "python-musl" / "install"
+PYTHON_MUSL_BIN = PYTHON_MUSL_INSTALL / "bin" / "python3.12"
 DEFAULT_ALLOWED_DIRS = [
     str(Path.home() / "projects"),
     "/tmp",
@@ -40,24 +44,24 @@ MAX_OUTPUT = 1_000_000  # 1 MB
 
 
 @functools.lru_cache(maxsize=1)
-def _cosmo_py_version() -> str:
-    """Return the Python major.minor version string for the vendored cosmo
-    python binary, e.g. ``"3.12"``.  Queried once per process and cached so
+def _python_version() -> str:
+    """Return the Python major.minor version string for the vendored musl
+    CPython binary, e.g. ``"3.12"``.  Queried once per process and cached so
     repeated calls are free.
 
-    Raises :class:`RuntimeError` if the cosmo python binary is missing or
+    Raises :class:`RuntimeError` if the vendored python binary is missing or
     the subprocess fails for any reason.
     """
-    binary = REPO_ROOT / "bin" / "cosmo" / "python"
+    binary = PYTHON_MUSL_BIN
     try:
         out = subprocess.run(
-            [str(binary), "-S", "-c",
+            [str(binary), "-c",
              "import sys; print('%d.%d' % sys.version_info[:2])"],
             capture_output=True, text=True, timeout=10, check=True,
         )
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to determine cosmo python version from {binary}: {exc}"
+            f"Failed to determine python version from {binary}: {exc}"
         ) from exc
     return out.stdout.strip()
 

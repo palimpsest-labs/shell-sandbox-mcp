@@ -5,6 +5,10 @@ bin/cosmo-toolchain/** filter=lfs diff=lfs merge=lfs -text
 bin/musl-toolchain/** filter=lfs diff=lfs merge=lfs -text
 # Vendored static APE binaries.
 bin/cosmo/** filter=lfs diff=lfs merge=lfs -text
+# Vendored musl CPython 3.12.11 interpreter (built in-sandbox, committed so
+# the sandbox's `python3` command is reproducible without re-running the
+# long CPython build).
+bin/python-musl/** filter=lfs diff=lfs merge=lfs -text
 bin/busybox filter=lfs diff=lfs merge=lfs -text
 bin/sandbox filter=lfs diff=lfs merge=lfs -text
 bin/sandbox.aarch64.elf filter=lfs diff=lfs merge=lfs -text
