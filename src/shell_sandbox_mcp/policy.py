@@ -98,6 +98,8 @@ def _stage_git_global_config() -> str:
          "--replace-all", "credential.helper", str(_GIT_CRED_SHIM.resolve())],
         check=True,
     )
+    # 0o600 (NOT 0o666): this file holds the git credential shim, so it is a
+    # secret. Force 0600 explicitly, deliberately ignoring the process umask.
     os.chmod(tmp, 0o600)
     os.replace(tmp, cfg)  # atomic
     return str(cfg)

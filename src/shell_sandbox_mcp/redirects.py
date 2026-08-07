@@ -100,6 +100,9 @@ def _resolve_fd_targets(
             flags = os.O_WRONLY | os.O_CREAT
             flags |= os.O_TRUNC if r.op == ">" else os.O_APPEND
             flags |= os.O_NOFOLLOW
+            # Contrast with the secret 0o600 in policy.py: a redirect target is
+            # NOT secret, so use 0o666 — the mode is masked by the process umask
+            # at open, so a restrictive umask still applies.
             fd = os.open(r.target_path, flags, 0o666)
             fh = os.fdopen(fd, "wb" if r.op == ">" else "ab")
             files_to_close.append(fh)

@@ -10,8 +10,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .parser import MAX_HEREDOC_BODY, MAX_SUBST_COUNT, MAX_SUBST_DEPTH, MAX_SUBST_OUTPUT
-
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -41,6 +39,12 @@ EXTRA_REDIRECT_ROOTS = [
 DEFAULT_TIMEOUT = 30
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 1_000_000  # 1 MB
+
+# Limits for command substitution / heredoc expansion (parser + executor).
+MAX_SUBST_DEPTH = 8
+MAX_SUBST_COUNT = 256
+MAX_SUBST_OUTPUT = 64_000   # 64 KB
+MAX_HEREDOC_BODY = 256_000  # 256 KB
 
 
 @functools.lru_cache(maxsize=1)

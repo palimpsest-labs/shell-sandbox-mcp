@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Optional
 
+from .config import MAX_HEREDOC_BODY, MAX_SUBST_COUNT, MAX_SUBST_DEPTH, MAX_SUBST_OUTPUT
+
 
 # ---------------------------------------------------------------------------
 # Sentinel patterns (moved from server.py; same values)
@@ -33,11 +35,6 @@ SENTINEL_ARG = re.compile(r"\x01A(\d+)\x01")
 SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
 _BRACED_VAR_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 _VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-MAX_SUBST_DEPTH = 8
-MAX_SUBST_COUNT = 256
-MAX_SUBST_OUTPUT = 64_000
-MAX_HEREDOC_BODY = 256_000
 
 
 # ---------------------------------------------------------------------------
