@@ -4,5 +4,13 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+# Sandbox-local pip user site (pip --user installs here) + pip bootstrap helper
+.py-site/
+get-pip.py
+# Backgrounded-command output logs
+.bg-*.log
+# OpenSSL source clone (regenerable from git); only the built deps/openssl
+# tree (bin/python-musl/deps/openssl) is committed.
+bin/python-musl/deps/openssl-src/
 bin/sandbox.aarch64.elf
 bin/sandbox.com.dbg

@@ -58,7 +58,45 @@ CONF_ENV := CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' READELF='$(REA
 
 JOBS := 2   # sandbox shares the host (os.cpu_count()==4); be polite
 
-.PHONY: rtlib configure build install verify clean
+# --- vendored static musl OpenSSL (built once; _ssl/_hashlib link against it) ---
+OPENSSL_PREFIX := $(ROOT)/bin/python-musl/deps/openssl
+OPENSSL_STAMP  := $(OPENSSL_PREFIX)/.openssl-built
+OPENSSL_SRC    := $(ROOT)/bin/python-musl/deps/openssl-src
+OPENSSL_VER    := 3.0.21
+
+# --- vendored static musl zlib (needed for the _zlib extension + pip bootstrap) ---
+ZLIB_PREFIX := $(ROOT)/bin/python-musl/deps/zlib
+ZLIB_STAMP  := $(ZLIB_PREFIX)/.zlib-built
+
+.PHONY: rtlib openssl zlib configure build install verify clean
+
+# Fetch + build the static musl OpenSSL (once). The source clone needs inet/dns,
+# which the `make` promise set lacks, so it must be cloned from a TOP-LEVEL
+# `git` call first:
+#   git clone --depth 1 --branch openssl-$(OPENSSL_VER) \
+#       https://github.com/openssl/openssl.git $(OPENSSL_SRC)
+# Then this target builds it (make recipes run via /bin/bash with proc prot_exec,
+# so perl/make subprocesses work).
+openssl:
+	@if [ ! -f $(OPENSSL_STAMP) ]; then \
+	    [ -d $(OPENSSL_SRC) ] || { \
+	        echo "OpenSSL source missing. Run (top-level): git clone --depth 1 --branch openssl-$(OPENSSL_VER) https://github.com/openssl/openssl.git $(OPENSSL_SRC)"; \
+	        exit 1; \
+	    }; \
+	    bash $(ROOT)/scripts/python-musl/build-openssl.sh && touch $(OPENSSL_STAMP); \
+	fi
+
+# Build the static musl zlib (once). Source must be fetched + extracted to
+# $(ROOT)/build/python-musl/zlib-src/zlib-1.3.2 first (via a top-level python3
+# download + busybox tar, since the musl python lacks zlib to unpack itself).
+zlib:
+	@if [ ! -f $(ZLIB_STAMP) ]; then \
+	    [ -d $(ROOT)/build/python-musl/zlib-src/zlib-1.3.2 ] || { \
+	        echo "zlib source missing. See scripts/python-musl/build-zlib.sh for the fetch/extract steps."; \
+	        exit 1; \
+	    }; \
+	    bash $(ROOT)/scripts/python-musl/build-zlib.sh && touch $(ZLIB_STAMP); \
+	fi
 
 rtlib:
 	@mkdir -p $(RT)
@@ -67,10 +105,18 @@ rtlib:
 	@chmod 0755 $(RT)/ld-musl-x86_64.so.1 $(RT)/libc.so
 	@echo "rtlib staged at $(RT)"
 
-configure: rtlib
+configure: rtlib openssl zlib
 	@cd $(SRC) && $(CONF_ENV) ./configure \
+	    --build=x86_64-linux-musl \
+	    --host=x86_64-linux-musl \
 	    --prefix=$(INST) \
 	    --without-ensurepip \
+	    --with-openssl=$(OPENSSL_PREFIX) \
+	    OPENSSL_LDFLAGS='-L$(OPENSSL_PREFIX)/lib -lssl -lcrypto' \
+	    OPENSSL_LIBS='-lssl -lcrypto' \
+	    OPENSSL_INCLUDES='-I$(OPENSSL_PREFIX)/include' \
+	    CPPFLAGS='-I$(ZLIB_PREFIX)/include' \
+	    LDFLAGS='$(LDFLAGS) -L$(ZLIB_PREFIX)/lib' \
 	    ac_cv_buggy_getaddrinfo=no \
 	    > $(BLD)/configure.log 2>&1
 	@echo "configure done (see $(BLD)/configure.log)"
