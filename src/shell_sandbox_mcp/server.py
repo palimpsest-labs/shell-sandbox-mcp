@@ -30,6 +30,8 @@ from .parser import (  # noqa: F401
     extract_redirects as _parser_extract_redirects,
     parse_command as _parser_parse_command,
     program_to_chain,
+    segment_needs_variable_state,
+    split_chains,
     split_legacy,
 )
 
@@ -110,8 +112,14 @@ from .policy import (  # noqa: F401
 
 from .builtins import (  # noqa: F401
     _apply_timeout_builtin,
+    _split_assignment_prefix,
     _try_cd,
+    _try_export,
     _try_for_loop,
+    _try_set,
+    _try_shift,
+    _try_source,
+    _try_unset,
 )
 
 # ---------------------------------------------------------------------------
@@ -141,6 +149,12 @@ from .executor import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 from .runner import Runner  # noqa: F401
+
+# ---------------------------------------------------------------------------
+# Re-export variables symbols
+# ---------------------------------------------------------------------------
+
+from .variables import VariableStore  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # MCP server
@@ -214,6 +228,37 @@ def shell_run(
     loop.  The for-loop must be the **entire command string** — it cannot
     appear mid-chain with ``;``, ``&&``, or ``||``.
 
+    ``VAR=value`` as a standalone statement sets a shell variable for the
+    remainder of the same ``shell_run`` call (e.g. ``VAR=hello; echo $VAR``).
+    Shell variables are NOT passed to subprocess environments unless exported
+    with ``export``.
+
+    ``VAR=x cmd`` sets *VAR* in the subprocess environment for *cmd* only
+    (env-prefix).  The variable is available to *cmd* but the assignment
+    does NOT persist as a shell variable after the command finishes.
+
+    Builtins for variable management:
+    - ``export [VAR[=value]]`` — mark variables exported.  ``export VAR=x``
+      sets and exports; ``export VAR`` marks existing VAR (or ``""``) as
+      exported.  No args prints sorted ``name=value`` of exported vars.
+    - ``unset VAR [...]`` — remove variables from the store.  Silent if
+      the variable does not exist.
+    - ``set [name=value ...]`` — ``set VAR=x`` stores locally (NOT exported).
+      Flags starting ``-`` or ``+`` (e.g. ``set -e``) are silently ignored.
+      No args prints sorted ``name=value`` of ALL vars.
+    - ``shift [n]`` — always returns rc=1 (no positional parameters in the
+      sandbox); non-numeric arg produces an error.
+    - ``source file`` / ``. file`` — execute *file* as a shell script with
+      the shared variable store so mutations persist (POSIX ``source``).
+      The file must be within the working directory or ``/tmp``.  Recursion
+      is capped at ``MAX_SOURCE_DEPTH`` (8).
+
+    **Limitation:** variable-assignment builtins (``export``, ``unset``,
+    ``set``, ``shift``, ``source``/``.``) are only intercepted when they
+    appear as a single-command pipeline segment (no pipes).  In a
+    multi-stage pipeline they fall through to normal command resolution
+    and will be rejected by the allowlist.
+
     By default this tool returns a plain string: the per-pipeline outputs
     joined with newlines (or ``"(no output)"`` when nothing was produced),
     with ``"Exit code: N"`` lines embedded for non-zero exits.  Set
@@ -275,6 +320,22 @@ def shell_run(
     loop = _try_for_loop(command, work_dir, timeout, depth=0)
     if loop is not None:
         return _structured_error(loop[1], loop[0])
+
+    # Variable assignment + builtins gate: lex-only detection to decide
+    # whether to take the per-chain re-expansion path (Approach A).  If NO
+    # segment starts with an assignment word or one of the new builtins,
+    # take the existing single-expand path unchanged — byte-for-byte identical.
+    segments = split_chains(command)
+    needs_state = any(segment_needs_variable_state(seg) for _, seg, _ in segments)
+
+    if needs_state:
+        runner = Runner(
+            work_dir=work_dir, default_timeout=timeout,
+            variables=VariableStore(),
+        )
+        if structured:
+            return runner.run_command(command, timeout, structured=True).to_dict()
+        return runner.run_command(command, timeout)
 
     # Expand $(...) heredocs and here-strings BEFORE splitting.
     # Also parse into an AST so the execution path consumes it directly

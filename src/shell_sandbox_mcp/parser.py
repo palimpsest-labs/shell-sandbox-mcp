@@ -46,6 +46,11 @@ _SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
 _BRACED_VAR_GUARD = re.compile(r"^\$\{(?:[A-Za-z_]|#)")
 _VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+# Variable assignment and builtin detection helpers (used by split_chains /
+# segment_needs_variable_state).  Module-level so the detection is cheap.
+_ASSIGN_WORD_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+_BUILTIN_NAMES = {"export", "unset", "set", "shift", "source", "."}
+
 
 def _find_braced_end(text: str, start: int) -> Optional[int]:
     """Return the index after the ``}`` matching the ``{`` at *start*.
@@ -408,7 +413,7 @@ class Lexer:
         self._pos += n
 
     def _emit(self, kind: TokenKind, value: str, **kw) -> None:
-        kw.setdefault("pos", self._pos - len(value))
+        kw.setdefault("pos", self._pos)
         self._tokens.append(Token(kind=kind, value=value, **kw))
 
     # ------------------------------------------------------------------
@@ -1910,6 +1915,128 @@ def program_to_chain(
             chain.backgrounded,
         ))
     return result
+
+
+# ---------------------------------------------------------------------------
+# split_chains — lex-only chain split for per-chain re-expansion
+# ---------------------------------------------------------------------------
+
+
+def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
+    """Split *command* into chain segments at top-level separators.
+
+    Returns ``[(operator, segment_text, bg), ...]`` where *segment_text*
+    is the raw verbatim text (preserving ``$VAR`` / ``$(...)`` / heredoc
+    bodies), *operator* is ``None`` for the first segment or after a
+    newline/``&``, else one of ``';'``, ``'&&'``, ``'||'``, and *bg* is
+    True when the segment was closed by ``&`` (backgrounded).
+
+    Uses the :class:`Lexer` to find top-level separator tokens.  Because
+    the Lexer absorbs ``$(...)`` and heredoc bodies internally, any
+    ``SEMI`` / ``AND_AND`` / ``OR_OR`` / ``BG`` / ``NEWLINE`` token in
+    the stream is guaranteed to be at the top level.
+    """
+    _SEPARATOR_KINDS = frozenset({
+        TokenKind.SEMI, TokenKind.AND_AND, TokenKind.OR_OR,
+        TokenKind.BG, TokenKind.NEWLINE,
+    })
+
+    tokens = Lexer(command).tokenize()
+
+    # Collect (start_pos, end_pos, kind) for each separator
+    separators: list[tuple[int, int, TokenKind]] = []
+    for t in tokens:
+        if t.kind in _SEPARATOR_KINDS:
+            separators.append((t.pos, t.pos + len(t.value), t.kind))
+
+    if not separators:
+        stripped = command.strip()
+        if not stripped:
+            return []
+        return [(None, stripped, False)]
+
+    result: list[tuple[Optional[str], str, bool]] = []
+    prev_end = 0
+    next_op: Optional[str] = None
+
+    for sep_start, sep_end, kind in separators:
+        # Segment text BEFORE this separator
+        seg_text = command[prev_end:sep_start].strip()
+
+        # Is this segment backgrounded? (closed by &)
+        bg = (kind == TokenKind.BG)
+
+        if seg_text:
+            result.append((next_op, seg_text, bg))
+            next_op = None  # consumed
+
+        # Determine the operator for the NEXT segment
+        if kind == TokenKind.SEMI:
+            next_op = ";"
+        elif kind == TokenKind.AND_AND:
+            next_op = "&&"
+        elif kind == TokenKind.OR_OR:
+            next_op = "||"
+        elif kind in (TokenKind.BG, TokenKind.NEWLINE):
+            next_op = None
+
+        prev_end = sep_end
+
+    # Final segment (after the last separator)
+    last_seg = command[prev_end:].strip()
+    if last_seg:
+        result.append((next_op, last_seg, False))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# segment_needs_variable_state — cheap lex-only detection gate
+# ---------------------------------------------------------------------------
+
+
+def segment_needs_variable_state(seg_text: str) -> bool:
+    """Return True if *seg_text*'s first WORD (skipping whitespace, newlines,
+    redirect operators AND their target words) matches ``^[A-Za-z_][A-Za-z0-9_]*=``
+    OR is one of ``{"export","unset","set","shift","source","."}``.
+
+    Uses :class:`Lexer` to extract the first word so redirect operators
+    (``2>``, ``>>``, ``<``, etc.) and their targets are skipped.
+    """
+    try:
+        tokens = Lexer(seg_text).tokenize()
+    except (ParseError, ValueError):
+        return True  # on lex failure, let the real parser produce the error
+
+    _REDIRECT_KINDS = frozenset({
+        TokenKind.R_OUT, TokenKind.R_APPEND, TokenKind.R_IN,
+        TokenKind.R_FD_DUP, TokenKind.R_HEREDOC,
+        TokenKind.R_HEREDOC_STRIP, TokenKind.R_HERESTRING,
+    })
+
+    expect_redirect_target = False
+    for t in tokens:
+        if t.kind in (TokenKind.WS, TokenKind.NEWLINE):
+            continue
+        if t.kind in _REDIRECT_KINDS:
+            # Skip the redirect operator; the next non-WS token is its target
+            expect_redirect_target = True
+            continue
+        if expect_redirect_target:
+            # This token is the redirect target (WORD, SUBST, or VARREF) — skip it
+            expect_redirect_target = False
+            continue
+        if t.kind == TokenKind.WORD:
+            # Check assignment: VAR=value
+            if _ASSIGN_WORD_RE.match(t.value):
+                return True
+            # Check builtin names
+            if t.value in _BUILTIN_NAMES:
+                return True
+            return False
+        # SUBST ($(…)) or VARREF ($VAR) at first word position — not our gate
+        return False
+    return False
 
 
 # ---------------------------------------------------------------------------

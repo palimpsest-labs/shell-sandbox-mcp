@@ -11,11 +11,17 @@ All executor helpers are looked up lazily at call time via
 etc. keep firing.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Optional
 
 from .executor import _get_server
 from .parser import Expansion
+
+if TYPE_CHECKING:
+    from .variables import VariableStore
 
 __all__ = ["Runner", "Result"]
 
@@ -64,6 +70,11 @@ class Runner:
         default_timeout: The call's overall timeout (post clamp), used when a
                          pipeline has no per-pipeline ``timeout N`` builtin.
         expansion:       The expansion context produced by ``_expand_command``.
+        variables:       The variable store for ``VAR=value``, ``export``,
+                         ``unset``, ``set``, ``shift``, and ``source``/``.``
+                         builtins.  Lazily imported to avoid circular imports.
+        command:         The original command string (set by ``run_command``
+                         for re-expansion).
         prev_rc:         Exit code of the most recently run pipeline.
         ran_any:         Whether at least one pipeline has run.
         skipped:         Whether any ``&&``/``||`` chain was short-circuited.
@@ -74,7 +85,9 @@ class Runner:
 
     work_dir: Path
     default_timeout: int
-    expansion: Expansion
+    expansion: Optional[Expansion] = None
+    variables: Optional["VariableStore"] = None
+    command: str = ""
     prev_rc: int = 0
     ran_any: bool = False
     skipped: bool = False
@@ -161,6 +174,293 @@ class Runner:
             else:
                 rc, out = srv._run_pipeline(
                     nodes, self.work_dir, eff_to, expansion=self.expansion,
+                )
+                self.prev_rc = rc
+                self.ran_any = True
+                self.stages.append({"command": joined, "output": out, "rc": rc})
+            if out:
+                self.outputs.append(out)
+
+        if not self.outputs:
+            text = "(no output)"
+        else:
+            text = "\n".join(self.outputs)
+
+        if structured:
+            return Result(
+                rc=self.prev_rc,
+                skipped=self.skipped,
+                stages=self.stages,
+                text=text,
+            )
+        return text
+
+    def run_command(
+        self, command: str, timeout: int, structured: bool = False, depth: int = 0,
+    ) -> "str | Result":
+        """Per-chain re-expansion path for variable assignment + builtins.
+
+        Unlike :meth:`run_chain` (which walks a pre-parsed AST with a single
+        expansion context), this method re-expands each chain segment with the
+        current ``variables`` store so ``$VAR`` references pick up earlier
+        assignments.  Called by the ``shell_run`` tool when the command
+        contains ``VAR=value`` or any of the new builtins
+        (``export``, ``unset``, ``set``, ``shift``, ``source``/``.``).
+
+        *depth* is the nesting level (used by ``source`` to detect recursion).
+        """
+        from .parser import split_chains, program_to_chain, ParseError
+        from .variables import VariableStore
+        from .builtins import (
+            _split_assignment_prefix,
+            _try_export,
+            _try_unset,
+            _try_set,
+            _try_shift,
+            _try_source,
+        )
+
+        srv = _get_server()
+
+        # Ensure we have a variable store.
+        store = self.variables if self.variables is not None else VariableStore()
+        self.variables = store
+
+        self.command = command
+
+        segments = split_chains(command)
+        if not segments:
+            text = "(no output)"
+            if structured:
+                return Result(rc=0, skipped=False, stages=[], text=text)
+            return text
+
+        for op, seg_text, bg in segments:
+            # && / || short-circuit (mirror run_chain)
+            joined = seg_text  # approximate — the real serialized form is computed later
+            if op == "&&" and self.ran_any and self.prev_rc != 0:
+                self.skipped = True
+                skip_text = (
+                    f"(skipped: previous command exited {self.prev_rc}) — {joined}"
+                )
+                self.outputs.append(skip_text)
+                self.stages.append({"command": joined, "output": skip_text, "rc": None})
+                continue
+            if op == "||" and self.ran_any and self.prev_rc == 0:
+                self.skipped = True
+                skip_text = "(skipped: previous command succeeded) — " + joined
+                self.outputs.append(skip_text)
+                self.stages.append({"command": joined, "output": skip_text, "rc": None})
+                continue
+
+            # Re-expand with the current variable store.
+            env = store.env_for_expansion()
+            try:
+                expanded, expansion, program = srv._expand_command(
+                    seg_text, self.work_dir, timeout, depth, env=env,
+                )
+            except (ParseError, ValueError) as e:
+                self.outputs.append(str(e))
+                self.stages.append({"command": joined, "output": str(e), "rc": 1})
+                self.prev_rc = 1
+                self.ran_any = True
+                continue
+
+            if program is None:
+                self.outputs.append("Command parse error.")
+                self.stages.append({"command": joined, "output": "Command parse error.", "rc": 1})
+                self.prev_rc = 1
+                self.ran_any = True
+                continue
+
+            chains = program_to_chain(program)
+            if not chains:
+                continue  # empty body — no output, rc unchanged
+
+            # Take the first chain only (run_command processes one segment at a time)
+            _op2, cmd_nodes, _bg2 = chains[0]
+            if not cmd_nodes:
+                continue
+
+            # Per-stage detection: assignment prefix, builtins, cd, timeout
+            prefix_maps: list[dict[str, str]] = []    # all prefixes (for pure-assignment branch)
+            remaining_nodes: list = []                 # stages with commands to run
+            stage_env_overrides: list[dict[str, str]] = []  # per-stage env overrides (aligned with remaining_nodes)
+            pure_assignments: list[dict[str, str]] = []     # prefixes from pure-assignment stages
+            all_pure_assignment = True
+
+            for node in cmd_nodes:
+                prefix, remaining, err = _split_assignment_prefix(
+                    node, expansion, self.work_dir,
+                )
+                if err is not None:
+                    self.outputs.append(err)
+                    self.stages.append({"command": joined, "output": err, "rc": 1})
+                    self.prev_rc = 1
+                    self.ran_any = True
+                    break
+                if prefix is not None:
+                    prefix_maps.append(prefix)
+                    if remaining is not None:
+                        # env-prefix: VAR=x cmd — prefix goes to stage_env_overrides only
+                        remaining_nodes.append(remaining)
+                        stage_env_overrides.append(dict(prefix))
+                        all_pure_assignment = False
+                    else:
+                        # pure assignment: VAR=x with no command
+                        pure_assignments.append(dict(prefix))
+                else:
+                    # No assignment prefix at all for this stage
+                    remaining_nodes.append(node)
+                    stage_env_overrides.append({})
+                    all_pure_assignment = False
+
+            # If we broke out of the loop due to an error, continue
+            if self.ran_any and self.prev_rc == 1 and self.stages:
+                continue
+
+            # All pure assignment? Handle separately.
+            if all_pure_assignment and not remaining_nodes:
+                if len(cmd_nodes) == 1:
+                    # Single-segment pure assignment
+                    for k, v in prefix_maps[0].items():
+                        store.set_local(k, v)
+                    self.prev_rc = 0
+                    self.ran_any = True
+                    self.stages.append({"command": joined, "output": "", "rc": 0})
+                else:
+                    # Multi-stage pure assignment → error
+                    err = "assignment prefix requires a command in a pipeline"
+                    self.outputs.append(err)
+                    self.stages.append({"command": joined, "output": err, "rc": 1})
+                    self.prev_rc = 1
+                    self.ran_any = True
+                continue
+
+            # Merge ONLY pure-assignment prefixes into the store.
+            # Env-prefix assignments (VAR=x cmd) do NOT persist past cmd.
+            for pm in pure_assignments:
+                for k, v in pm.items():
+                    store.set_local(k, v)
+
+            # Builtin interception (single-stage non-bg only)
+            if not bg and len(remaining_nodes) == 1:
+                cmd_node = remaining_nodes[0]
+
+                def _builtin_result(rc_val: int, out_val: str) -> tuple[str, int]:
+                    """Format builtin output: prepend 'Exit code: N' when rc != 0."""
+                    if rc_val != 0 and not out_val:
+                        return f"Exit code: {rc_val}", rc_val
+                    return out_val, rc_val
+
+                # Try export
+                handled, out, rc = _try_export(cmd_node, expansion, self.work_dir, store)
+                if handled:
+                    out, rc = _builtin_result(rc, out)
+                    if out:
+                        self.outputs.append(out)
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    continue
+
+                # Try unset
+                handled, out, rc = _try_unset(cmd_node, expansion, self.work_dir, store)
+                if handled:
+                    out, rc = _builtin_result(rc, out)
+                    if out:
+                        self.outputs.append(out)
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    continue
+
+                # Try set
+                handled, out, rc = _try_set(cmd_node, expansion, self.work_dir, store)
+                if handled:
+                    out, rc = _builtin_result(rc, out)
+                    if out:
+                        self.outputs.append(out)
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    continue
+
+                # Try shift
+                handled, out, rc = _try_shift(cmd_node, expansion, self.work_dir, store)
+                if handled:
+                    out, rc = _builtin_result(rc, out)
+                    if out:
+                        self.outputs.append(out)
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    continue
+
+                # Try source / .
+                handled, out, rc = _try_source(
+                    cmd_node, expansion, self.work_dir, store, timeout, depth,
+                )
+                if handled:
+                    out, rc = _builtin_result(rc, out)
+                    if out:
+                        self.outputs.append(out)
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    continue
+
+            # timeout builtin
+            nodes, eff_to, terr = srv._apply_timeout_builtin(
+                remaining_nodes, expansion, bg, timeout,
+                work_dir=self.work_dir,
+            )
+            if terr is not None:
+                self.outputs.append(terr)
+                self.stages.append({"command": joined, "output": terr, "rc": 1})
+                self.prev_rc = 1
+                self.ran_any = True
+                continue
+
+            # cd builtin
+            if not bg and len(nodes) == 1:
+                new_dir, cd_err = srv._try_cd(nodes[0], self.work_dir, expansion)
+                if cd_err is not None:
+                    self.outputs.append(cd_err)
+                    self.stages.append({"command": joined, "output": cd_err, "rc": 1})
+                    self.prev_rc = 1
+                    self.ran_any = True
+                    continue
+                if new_dir is not None:
+                    self.work_dir = new_dir
+                    self.prev_rc = 0
+                    self.ran_any = True
+                    self.stages.append({"command": joined, "output": "", "rc": 0})
+                    continue
+
+            # Build stage environment: base = exported vars; per-stage overrides
+            base = store.env_for_subprocess()
+
+            if bg:
+                _rc, out = srv._run_background(
+                    nodes, self.work_dir, expansion=expansion,
+                    shell_env=base, stage_env_overrides=stage_env_overrides if stage_env_overrides else None,
+                )
+                self.ran_any = True
+                self.stages.append({"command": joined, "output": out, "rc": None})
+            elif len(nodes) == 1:
+                rc, out = srv._run_segment(
+                    nodes[0], self.work_dir, eff_to, expansion=expansion,
+                    shell_env=base,
+                    stage_env_overrides=[stage_env_overrides[0]] if stage_env_overrides else None,
+                )
+                self.prev_rc = rc
+                self.ran_any = True
+                self.stages.append({"command": joined, "output": out, "rc": rc})
+            else:
+                rc, out = srv._run_pipeline(
+                    nodes, self.work_dir, eff_to, expansion=expansion,
+                    shell_env=base, stage_env_overrides=stage_env_overrides if stage_env_overrides else None,
                 )
                 self.prev_rc = rc
                 self.ran_any = True

@@ -67,6 +67,8 @@ def _build_invocation(
     command,
     work_dir: Path,
     expansion: Optional[Expansion] = None,
+    *,
+    shell_env: Optional[dict[str, str]] = None,
 ) -> "Invocation | InvocationError | EmptyInvocation":
     """Parse, resolve, and build the sandbox invocation for one segment.
 
@@ -76,6 +78,10 @@ def _build_invocation(
     Returns an :class:`InvocationError` when the command is rejected, carrying
     the error message.  Returns an :class:`EmptyInvocation` for an empty
     command (nothing to run).
+
+    *shell_env*, when provided, replaces the default
+    :func:`config._base_env` as the base environment.  This allows the
+    variable-store path to supply an exported-vars-only env for subprocesses.
     """
     from .parser import Redirect  # for type annotation only
     srv = _get_server()
@@ -194,7 +200,7 @@ def _build_invocation(
     if cfg.get("no_pledge"):
         unveil_env["SANDBOX_NO_PLEDGE"] = "1"
 
-    env: dict[str, str] = _base_env()          # always allowlisted base
+    env: dict[str, str] = dict(shell_env) if shell_env is not None else _base_env()  # allowlisted base
     env.update(unveil_env)                      # SANDBOX_*, PYTHON*, GIT_*
 
     # Optionally prepend a directory to PATH (e.g. so build commands resolve a
@@ -282,13 +288,17 @@ class _PlanError:
     message: str
 
 
-def _build_pipeline_plan(segments, work_dir, expansion, mode):
+def _build_pipeline_plan(segments, work_dir, expansion, mode, *, shell_env=None, stage_env_overrides=None):
     """Shared pre-launch: build invocations, validate, resolve fd targets.
 
     Returns a :class:`PipelinePlan` on success, ``None`` when all segments
     were empty (no work), or :class:`_PlanError` on failure.
 
     *mode* must be ``"foreground"`` or ``"background"``.
+
+    *shell_env*, when provided, is the base subprocess environment (exported
+    vars only).  *stage_env_overrides*, when provided, is a list of per-stage
+    override dicts that are merged on top of *shell_env* (or ``_base_env()``).
     """
     if mode not in ("foreground", "background"):
         raise ValueError(
@@ -299,7 +309,15 @@ def _build_pipeline_plan(segments, work_dir, expansion, mode):
     # ── step 1: build invocations ──────────────────────────────────────
     invocations: list = []
     for i, seg in enumerate(segments):
-        inv = srv._build_invocation(seg, work_dir, expansion=expansion)
+        per_stage_env = dict(shell_env) if shell_env is not None else None
+        if stage_env_overrides is not None and i < len(stage_env_overrides):
+            per_stage_env = dict(per_stage_env) if per_stage_env is not None else _base_env()
+            per_stage_env.update(stage_env_overrides[i])
+        if per_stage_env is not None:
+            inv = srv._build_invocation(seg, work_dir, expansion=expansion,
+                                         shell_env=per_stage_env)
+        else:
+            inv = srv._build_invocation(seg, work_dir, expansion=expansion)
         if isinstance(inv, EmptyInvocation):
             continue
         if isinstance(inv, InvocationError):
@@ -749,6 +767,9 @@ def _run_segment_core(
     work_dir: Path,
     timeout: int,
     expansion: Optional[Expansion] = None,
+    *,
+    shell_env: Optional[dict[str, str]] = None,
+    stage_env_overrides: Optional[list[dict[str, str]]] = None,
 ) -> tuple[int, bytes, bytes, list[str]]:
     """Run a single operator-free command segment in the sandbox (raw bytes).
 
@@ -757,7 +778,8 @@ def _run_segment_core(
     stderr_bytes, report_lines)``.  ``stdout_bytes`` and ``stderr_bytes``
     are the captured output (may be empty but never ``None``).
     """
-    plan = _build_pipeline_plan([command], work_dir, expansion, "foreground")
+    plan = _build_pipeline_plan([command], work_dir, expansion, "foreground",
+                                shell_env=shell_env, stage_env_overrides=stage_env_overrides)
     if plan is None:
         return 0, b"", b"", []
     if isinstance(plan, _PlanError):
@@ -792,7 +814,8 @@ def _format_output(
     return "\n".join(output)
 
 
-def _run_segment(command, work_dir: Path, timeout: int, expansion: Optional[Expansion] = None) -> tuple[int, str]:
+def _run_segment(command, work_dir: Path, timeout: int, expansion: Optional[Expansion] = None,
+                  *, shell_env=None, stage_env_overrides=None) -> tuple[int, str]:
     """Run a single operator-free command segment in the sandbox.
 
     *command* may be a ``str`` (legacy) or a :class:`parser.CommandNode`
@@ -805,6 +828,7 @@ def _run_segment(command, work_dir: Path, timeout: int, expansion: Optional[Expa
     srv = _get_server()
     rc, stdout_bytes, stderr_bytes, report = srv._run_segment_core(
         command, work_dir, timeout, expansion=expansion,
+        shell_env=shell_env, stage_env_overrides=stage_env_overrides,
     )
     return rc, _format_output(rc, stdout_bytes, stderr_bytes, report)
 
@@ -819,6 +843,9 @@ def _run_pipeline_core(
     work_dir: Path,
     timeout: int,
     expansion: Optional[Expansion] = None,
+    *,
+    shell_env: Optional[dict[str, str]] = None,
+    stage_env_overrides: Optional[list[dict[str, str]]] = None,
 ) -> tuple[int, bytes, bytes, list[str]]:
     """Run a pipe-connected sequence of segments concurrently (raw bytes).
 
@@ -826,7 +853,8 @@ def _run_pipeline_core(
     ``stdout_bytes`` is the last stage's captured stdout; ``stderr_bytes`` is
     the combined stderr from all stages.
     """
-    plan = _build_pipeline_plan(segments, work_dir, expansion, "foreground")
+    plan = _build_pipeline_plan(segments, work_dir, expansion, "foreground",
+                                shell_env=shell_env, stage_env_overrides=stage_env_overrides)
     if plan is None:
         return 0, b"", b"", []
     if isinstance(plan, _PlanError):
@@ -841,6 +869,9 @@ def _run_pipeline(
     work_dir: Path,
     timeout: int,
     expansion: Optional[Expansion] = None,
+    *,
+    shell_env=None,
+    stage_env_overrides=None,
 ) -> tuple[int, str]:
     """Run a pipe-connected sequence of segments concurrently in the sandbox.
 
@@ -858,6 +889,7 @@ def _run_pipeline(
     srv = _get_server()
     rc, stdout_bytes, stderr_bytes, report = srv._run_pipeline_core(
         segments, work_dir, timeout, expansion=expansion,
+        shell_env=shell_env, stage_env_overrides=stage_env_overrides,
     )
     return rc, _format_output(rc, stdout_bytes, stderr_bytes, report)
 
@@ -1079,6 +1111,9 @@ def _run_background(
     segments,
     work_dir: Path,
     expansion: Optional[Expansion] = None,
+    *,
+    shell_env=None,
+    stage_env_overrides=None,
 ) -> tuple[int, str]:
     """Launch a pipe-connected pipeline in the background and return immediately.
 
@@ -1092,7 +1127,8 @@ def _run_background(
 
     Returns ``(0, message)`` with the PID and log path.
     """
-    plan = _build_pipeline_plan(segments, work_dir, expansion, "background")
+    plan = _build_pipeline_plan(segments, work_dir, expansion, "background",
+                                shell_env=shell_env, stage_env_overrides=stage_env_overrides)
     if plan is None:
         return 0, ""
     if isinstance(plan, _PlanError):
