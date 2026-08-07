@@ -21,6 +21,7 @@ Public API
 from __future__ import annotations
 
 import enum
+import fnmatch as _fnmatch
 import glob as _glob
 import os
 import re
@@ -38,8 +39,40 @@ from .config import MAX_HEREDOC_BODY, MAX_SUBST_COUNT, MAX_SUBST_DEPTH, MAX_SUBS
 
 _SENTINEL_ARG = re.compile(r"\x01A(\d+)\x01")
 _SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
-_BRACED_VAR_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+# Prefix guard: any ${X... where X starts a variable name (or '#' for the
+# ${#VAR} length operator).  The full braced span is brace-counted later in
+# _lex_varref_braced / _find_braced_end, so this only has to recognise the
+# opening form.  Special params (${10}, ${}, $#, ...) fall through to literal.
+_BRACED_VAR_GUARD = re.compile(r"^\$\{(?:[A-Za-z_]|#)")
 _VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _find_braced_end(text: str, start: int) -> Optional[int]:
+    """Return the index after the ``}`` matching the ``{`` at *start*.
+
+    Quote-aware: ``{``/``}`` inside single or double quotes do not affect
+    depth (matching ``_lex_subst``'s treatment of ``$( ... )``).  Returns
+    ``None`` when the braces are unbalanced.  *start* must index a ``{``.
+    """
+    depth = 1
+    i = start + 1
+    n = len(text)
+    quote: Optional[str] = None
+    while i < n:
+        c = text[i]
+        if quote is not None:
+            if c == quote:
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +449,7 @@ class Lexer:
         # --- ${VAR} / $VAR (variable reference) ---
         if c == '$':
             nxt = self._peek(1)
-            if nxt == '{' and _BRACED_VAR_RE.match(self._cmd[self._pos:]):
+            if nxt == '{' and _BRACED_VAR_GUARD.match(self._cmd[self._pos:]):
                 self._lex_varref_braced()
                 return
             if nxt and (nxt.isalpha() or nxt == '_'):
@@ -637,7 +670,7 @@ class Lexer:
                 nxt = self._cmd[i + 1]
                 if nxt == '(':
                     break
-                if nxt == '{' and _BRACED_VAR_RE.match(self._cmd[i:]):
+                if nxt == '{' and _BRACED_VAR_GUARD.match(self._cmd[i:]):
                     break
                 if nxt and (nxt.isalpha() or nxt == '_'):
                     break
@@ -696,14 +729,20 @@ class Lexer:
         self._tokens.append(Token(TokenKind.VARREF, name, start))
 
     def _lex_varref_braced(self) -> None:
-        """Lex a ${VAR} token — read the identifier between braces."""
+        """Lex a ${...} token — brace-count to the matching ``}``.
+
+        The token value is the *raw* text between the braces (e.g.
+        ``"HOME"``, ``"HOME:-/root"``, ``"#HOME"``).  Operator parsing and
+        expansion happen later in ``_expand_param`` during AST build.
+        """
         start = self._pos
-        m = _BRACED_VAR_RE.match(self._cmd[self._pos:])
-        assert m is not None  # precondition: matches ^\$\{[A-Za-z_][A-Za-z0-9_]*\}
-        full = m.group(0)
-        name = full[2:-1]  # strip ${ and }
-        self._pos += m.end()
-        self._tokens.append(Token(TokenKind.VARREF, name, start))
+        assert self._cmd[start] == '$' and self._cmd[start + 1] == '{'
+        end = _find_braced_end(self._cmd, start + 1)
+        if end is None:
+            raise ParseError("Unbalanced ${...}")
+        raw = self._cmd[start + 2 : end - 1]  # strip ${ and }
+        self._pos = end
+        self._tokens.append(Token(TokenKind.VARREF, raw, start))
 
     # ------------------------------------------------------------------
     # here-string  <<< word
@@ -940,6 +979,263 @@ def _build_ast(
     if subst_count is None:
         subst_count = [0]
 
+    def _prefix_len(value: str, pattern: str, longest: bool) -> int:
+        """Return how many leading chars of *value* match *pattern*.
+
+        Uses fnmatch-style glob (not regex).  When *longest* is True returns
+        the longest matching prefix length (``##``); otherwise the shortest
+        (``#``).  Returns 0 when nothing matches (remove nothing).
+        """
+        ks = range(len(value), -1, -1) if longest else range(0, len(value) + 1)
+        for k in ks:
+            if _fnmatch.fnmatchcase(value[:k], pattern):
+                return k
+        return 0
+
+    def _suffix_len(value: str, pattern: str, longest: bool) -> int:
+        """Return how many trailing chars of *value* match *pattern*.
+
+        Shortest (``%``) / longest (``%%``) suffix glob match.  0 if none.
+        """
+        n = len(value)
+        ks = range(n, -1, -1) if longest else range(0, n + 1)
+        for k in ks:
+            if _fnmatch.fnmatchcase(value[n - k:], pattern):
+                return k
+        return 0
+
+    def _expand_dollar(text: str, i: int, out: list[str], d: int) -> int:
+        """Expand ``$VAR`` / ``${...}`` / ``$(...)`` at *i* (points at ``$``).
+
+        Appends the result to *out* and returns the index of the char after
+        the consumed span.  Used by :func:`_expand_operand` for recursive
+        expansion inside a parameter-expansion operand.
+        """
+        n2 = len(text)
+        if i + 1 >= n2:
+            out.append('$')
+            return i + 1
+        nxt = text[i + 1]
+        if nxt == '(':
+            if i + 2 < n2 and text[i + 2] == '(':
+                raise ParseError("Arithmetic expansion $((...)) is not supported")
+            j = i + 2
+            pd = 1
+            q: Optional[str] = None
+            while j < n2 and pd > 0:
+                cj = text[j]
+                if q is not None:
+                    if cj == q:
+                        q = None
+                elif cj in ("'", '"'):
+                    q = cj
+                elif cj == '(':
+                    pd += 1
+                elif cj == ')':
+                    pd -= 1
+                j += 1
+            if pd != 0:
+                raise ValueError("Unbalanced $( ... )")
+            inner = text[i + 2 : j - 1]
+            if d + 1 > MAX_SUBST_DEPTH:
+                raise ValueError(
+                    f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
+                )
+            subst_count[0] += 1
+            if subst_count[0] > MAX_SUBST_COUNT:
+                raise ValueError(
+                    f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
+                )
+            _rc, stdout_bytes = capture_fn(inner)
+            val = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
+            out.append(val[:MAX_SUBST_OUTPUT])
+            return j
+        if nxt == '{':
+            if _BRACED_VAR_GUARD.match(text, i):
+                end = _find_braced_end(text, i + 1)
+                if end is None:
+                    raise ParseError("Unbalanced ${...}")
+                inner = text[i + 2 : end - 1]
+                subst_count[0] += 1
+                if subst_count[0] > MAX_SUBST_COUNT:
+                    raise ValueError(
+                        f"Parameter expansion count limit ({MAX_SUBST_COUNT}) exceeded"
+                    )
+                out.append(_expand_param(inner, d + 1))
+                return end
+            out.append('$')
+            return i + 1
+        if nxt.isalpha() or nxt == '_':
+            m = _VAR_NAME_RE.match(text, i + 1)
+            assert m is not None
+            out.append(env.get(m.group(0), "") if env else "")
+            return m.end()
+        out.append('$')
+        return i + 1
+
+    def _expand_operand(text: str, d: int) -> str:
+        """Recursively expand a ``${...}`` operand (default/alternate/pattern).
+
+        Supports ``$VAR``, ``${...}`` (recursive), ``$(...)`` (via
+        *capture_fn*), backslash escapes, and single/double-quote grouping.
+        Quote markers are stripped; content inside single quotes is literal.
+        """
+        out: list[str] = []
+        i, n2 = 0, len(text)
+        quote: Optional[str] = None   # "'" or '"' while inside a quote
+        while i < n2:
+            c = text[i]
+            if quote == "'":
+                if c == "'":
+                    quote = None
+                else:
+                    out.append(c)
+                i += 1
+                continue
+            if quote == '"':
+                if c == '"':
+                    quote = None
+                    i += 1
+                    continue
+                if c == '\\' and i + 1 < n2 and text[i + 1] in ('"', '$', '\\'):
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == '$':
+                    i = _expand_dollar(text, i, out, d)
+                    continue
+                out.append(c)
+                i += 1
+                continue
+            if c == "'":
+                quote = "'"
+                i += 1
+                continue
+            if c == '"':
+                quote = '"'
+                i += 1
+                continue
+            if c == '\\' and i + 1 < n2:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '$':
+                i = _expand_dollar(text, i, out, d)
+                continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    def _expand_param(raw: str, d: int = 0) -> str:
+        """Resolve a POSIX parameter expansion from the raw braced text.
+
+        ``raw`` is the text between ``${`` and the matching ``}``.  Plain
+        variable names resolve straight to the env value (byte-for-byte
+        backward compatible).  Operator forms (``:-``, ``:=``, ``:?``,
+        ``:+``, ``#``-length, ``#/##``/``%/%%`` removal, ``:offset[:len]``
+        substring, ``,``/``,,``/``^``/``^^`` case modification) are parsed
+        and resolved here.  Unparseable forms fall through to the literal
+        ``${raw}`` text.
+        """
+        if d > MAX_SUBST_DEPTH:
+            raise ValueError(
+                f"Parameter expansion depth limit ({MAX_SUBST_DEPTH}) exceeded"
+            )
+
+        # Plain-name fast path (backward compatible).
+        if _VAR_NAME_RE.fullmatch(raw):
+            return env.get(raw, "") if env else ""
+
+        # ${#VAR} — string length.
+        if raw.startswith('#'):
+            name = raw[1:]
+            if _VAR_NAME_RE.fullmatch(name):
+                val = env.get(name, "") if env else ""
+                return str(len(val))
+            return "${" + raw + "}"
+
+        m = _VAR_NAME_RE.match(raw)
+        if m is None:
+            return "${" + raw + "}"
+        name = m.group(0)
+        rest = raw[m.end():]
+        value = env.get(name, "") if env else ""
+        if not rest:
+            return value
+
+        # Default / assign / error / alternate (colon operators).
+        # NOTE: `${VAR:=default}` is treated identically to `${VAR:-default}`.
+        # The sandbox env is read-only per call, so no assignment is possible;
+        # we document the equivalence rather than attempt to mutate env.
+        if rest.startswith(':-') or rest.startswith(':='):
+            operand = rest[2:]
+            if not value:
+                return _expand_operand(operand, d)
+            return value
+        if rest.startswith(':?'):
+            msg = rest[2:]
+            if not value:
+                if msg:
+                    msg = _expand_operand(msg, d)
+                else:
+                    msg = "parameter not set or null"
+                raise ValueError(msg)
+            return value
+        if rest.startswith(':+'):
+            operand = rest[2:]
+            if value:
+                return _expand_operand(operand, d)
+            return ""
+
+        # ${VAR:offset[:len]} — substring (non-negative offsets; clamped).
+        if rest.startswith(':'):
+            segs = rest[1:].split(':', 1)
+            off_str = segs[0]
+            len_str = segs[1] if len(segs) > 1 else ""
+            if off_str == "" or not off_str.isdigit():
+                return "${" + raw + "}"   # unknown operator → literal
+            offset = int(off_str)
+            vlen = len(value)
+            start_idx = min(offset, vlen)          # offset beyond length → empty
+            if len_str == "":
+                return value[start_idx:]
+            if not len_str.isdigit():
+                return "${" + raw + "}"            # unknown operator → literal
+            length = int(len_str)
+            end_idx = min(start_idx + length, vlen)  # clamp length
+            return value[start_idx:end_idx]
+
+        # Prefix removal — ${VAR#pat} (shortest) / ${VAR##pat} (longest).
+        if rest.startswith('##'):
+            pat = _expand_operand(rest[2:], d)
+            return value[_prefix_len(value, pat, longest=True):]
+        if rest.startswith('#'):
+            pat = _expand_operand(rest[1:], d)
+            return value[_prefix_len(value, pat, longest=False):]
+
+        # Suffix removal — ${VAR%pat} (shortest) / ${VAR%%pat} (longest).
+        if rest.startswith('%%'):
+            pat = _expand_operand(rest[2:], d)
+            k = _suffix_len(value, pat, longest=True)
+            return value[: len(value) - k]
+        if rest.startswith('%'):
+            pat = _expand_operand(rest[1:], d)
+            k = _suffix_len(value, pat, longest=False)
+            return value[: len(value) - k]
+
+        # Case modification — all / first char.
+        if rest in ('^^', '^', ',,', ','):
+            if rest == '^^':
+                return value.upper()
+            if rest == '^':
+                return value[:1].upper() + value[1:] if value else ""
+            if rest == ',,':
+                return value.lower()
+            if rest == ',':
+                return value[:1].lower() + value[1:] if value else ""
+
+        return "${" + raw + "}"   # unknown operator → literal
+
     def _emit_arg_sentinel(raw_src: str, name: str, *, is_subst: bool) -> str:
         """Assign the next arg-sentinel ID and, in populate mode, resolve the value.
 
@@ -966,7 +1262,12 @@ def _build_ast(
                 value: str = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
                 value = value[:MAX_SUBST_OUTPUT]
             else:
-                value = env.get(name, "") if env else ""
+                # VARREF: plain variable names resolve straight from env;
+                # anything else is a parameter expansion operator form.
+                if _VAR_NAME_RE.fullmatch(name):
+                    value = env.get(name, "") if env else ""
+                else:
+                    value = _expand_param(name, depth)
             expansion._set_arg_for(sentinel, value)
 
         return sentinel
@@ -1104,11 +1405,12 @@ def _build_ast(
                     # Detect $VAR / ${VAR} inside double quotes
                     elif ch == '$' and raw[i + 1] != '(':
                         nxt2 = raw[i + 1]
-                        if nxt2 == '{' and _BRACED_VAR_RE.match(raw[i:]):
+                        if nxt2 == '{' and _BRACED_VAR_GUARD.match(raw[i:]):
                             flush()
-                            m = _BRACED_VAR_RE.match(raw[i:])
-                            assert m is not None
-                            raw_subst = m.group(0)
+                            end = _find_braced_end(raw, i + 1)
+                            if end is None:
+                                raise ParseError("Unbalanced ${...}")
+                            raw_subst = raw[i:end]
                             var_name = raw_subst[2:-1]  # strip ${ and }
                             sentinel = _emit_arg_sentinel(raw_subst, var_name, is_subst=False)
                             wp = WordPart(
@@ -1116,7 +1418,7 @@ def _build_ast(
                                 is_sentinel=True, is_quoted=True,
                             )
                             parts.append(wp)
-                            i += m.end()
+                            i = end
                         elif nxt2 and (nxt2.isalpha() or nxt2 == '_'):
                             flush()
                             m = _VAR_NAME_RE.match(raw, i + 1)

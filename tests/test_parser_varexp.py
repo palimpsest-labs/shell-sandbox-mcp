@@ -7,7 +7,8 @@ Validates that:
 - Single-quoted '$VAR' is literal.
 - Escaped \$VAR (unquoted and dq) is literal.
 - Special params ($$ $? $0 $1 $@) are literal.
-- Braced-default ${VAR:-x} is literal.
+- Braced-default ${VAR:-x} expands (new parameter-expansion operators live in
+  test_parser_param_exp.py; plain ${VAR} stays a straight env lookup).
 - $$ is literal, $(( is still rejected.
 - $ at EOL is literal.
 - var-then-subst ordering: $A$(echo b).
@@ -267,17 +268,17 @@ class SpecialParamTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Braced-default forms — literal
+# Braced-default forms — expanded (operators implemented; see param_exp tests)
 # ---------------------------------------------------------------------------
 
-class BracedDefaultLiteralTest(unittest.TestCase):
-    """${VAR:-x} default form is NOT expanded (stays literal)."""
+class BracedDefaultExpansionTest(unittest.TestCase):
+    """${VAR:-x} default operator is now expanded, not literal."""
 
-    def test_braced_default_literal(self) -> None:
-        _assert_both_equal(self, "echo ${VAR:-x}", ["echo", "${VAR:-x}"])
+    def test_braced_default_expands(self) -> None:
+        _assert_both_equal(self, "echo ${VAR:-x}", ["echo", "x"])
 
-    def test_braced_default_in_dq_literal(self) -> None:
-        _assert_both_equal(self, 'echo "${VAR:-x}"', ["echo", "${VAR:-x}"])
+    def test_braced_default_in_dq_expands(self) -> None:
+        _assert_both_equal(self, 'echo "${VAR:-x}"', ["echo", "x"])
 
 
 # ---------------------------------------------------------------------------
