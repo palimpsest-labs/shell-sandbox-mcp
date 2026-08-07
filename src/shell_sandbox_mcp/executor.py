@@ -27,7 +27,6 @@ from .parser import (
     _expand_subst_in_text as _parser_expand_subst_in_text,
     _serialize_command,
     parse_command as _parser_parse_command,
-    split_legacy,
 )
 
 
@@ -1023,20 +1022,6 @@ def _expand_command(
         env=base_env,
     )
     return cleaned, expansion, program
-
-
-# ---------------------------------------------------------------------------
-# Legacy split wrapper
-# ---------------------------------------------------------------------------
-
-
-def _split_command(command: str) -> list[tuple[Optional[str], list[str], bool]]:
-    """Split a command string into a chain of pipe-connected pipelines.
-
-    Thin wrapper around :func:`parser.split_legacy`.
-    """
-    srv = _get_server()
-    return srv.split_legacy(command)
 
 
 # ---------------------------------------------------------------------------

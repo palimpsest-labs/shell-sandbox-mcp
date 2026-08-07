@@ -1373,7 +1373,7 @@ def serialize_program(program: ProgramNode) -> str:
             parts.append(chain.operator)
             parts.append(" ")
 
-        parts.append(_serialize_pipeline(chain.pipeline))
+        parts.append(_serialize_pipeline(chain.pipeline, sentinel=True))
 
         if chain.backgrounded:
             parts.append(" &")
@@ -1381,37 +1381,36 @@ def serialize_program(program: ProgramNode) -> str:
     return "".join(parts)
 
 
-def _serialize_pipeline(pipeline: PipelineNode) -> str:
-    """Serialize a pipeline using sentinel form for use in serialize_program."""
+def _serialize_pipeline(pipeline: PipelineNode, sentinel: bool = False) -> str:
+    """Serialize a pipeline, joining its commands with `` | ``.
 
-    def _ser_cmd(cmd: CommandNode) -> str:
-        output: list[str] = []
-        for w in cmd.words:
-            s = w.serialized()
-            if s:
-                output.append(s)
-        for rs in cmd.redirects:
-            if rs.op == ">&":
-                output.append(rs.raw_operator if rs.raw_operator else ">&")
-            elif rs.op in ("<<", "<<-", "<<<"):
-                op = rs.raw_operator if rs.raw_operator else rs.op
-                output.append(op + " " + rs.target.serialized())
-            else:
-                op = rs.raw_operator if rs.raw_operator else rs.op
-                sep = "" if rs.glued_target else " "
-                output.append(op + sep + rs.target.serialized())
-        return " ".join(output)
-
-    cmd_strs = [_ser_cmd(cmd) for cmd in pipeline.commands]
+    Each command is serialized via :func:`_serialize_command`.  When
+    *sentinel* is True (used by :func:`serialize_program`), commands use the
+    sentinel form; otherwise the human-readable display form is used.
+    Empty command strings are dropped (matching the empty-drop semantics).
+    """
+    cmd_strs = [_serialize_command(cmd, sentinel=sentinel) for cmd in pipeline.commands]
     return " | ".join(s for s in cmd_strs if s)
 
 
-def _serialize_command(cmd: CommandNode) -> str:
-    """Return a human-readable display string for *cmd*."""
+def _serialize_command(cmd: CommandNode, sentinel: bool = False) -> str:
+    """Return a display string for *cmd*.
+
+    When *sentinel* is True, words and redirect targets use the sentinel form
+    (for :func:`serialize_program`); otherwise the human-readable display form
+    is used (for :func:`cmd_to_display` and :func:`split_legacy`).
+    """
+    if sentinel:
+        word_serialize = lambda w: w.serialized()  # noqa: E731
+        target_serialize = lambda t: t.serialized()  # noqa: E731
+    else:
+        word_serialize = lambda w: w.display_serialized()  # noqa: E731
+        target_serialize = lambda t: t.display_serialized()  # noqa: E731
+
     output: list[str] = []
 
     for w in cmd.words:
-        s = w.display_serialized()
+        s = word_serialize(w)
         if s:
             output.append(s)
 
@@ -1420,17 +1419,17 @@ def _serialize_command(cmd: CommandNode) -> str:
             output.append(rs.raw_operator if rs.raw_operator else ">&")
         elif rs.op in ("<<", "<<-", "<<<"):
             op = rs.raw_operator if rs.raw_operator else rs.op
-            output.append(op + " " + rs.target.display_serialized())
+            output.append(op + " " + target_serialize(rs.target))
         else:
             op = rs.raw_operator if rs.raw_operator else rs.op
             sep = "" if rs.glued_target else " "
-            output.append(op + sep + rs.target.display_serialized())
+            output.append(op + sep + target_serialize(rs.target))
 
     return " ".join(output)
 
 
 # ---------------------------------------------------------------------------
-# split_legacy — reimplementation of _split_command
+# split_legacy — reimplementation of legacy split
 # ---------------------------------------------------------------------------
 
 def split_legacy(command: str) -> list[tuple[Optional[str], list[str], bool]]:

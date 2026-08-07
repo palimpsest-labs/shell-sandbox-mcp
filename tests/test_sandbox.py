@@ -35,96 +35,96 @@ from shell_sandbox_mcp.server import (
 )
 
 # ---------------------------------------------------------------------------
-# _split_command
+# split_legacy
 # ---------------------------------------------------------------------------
 
 
 class SplitCommandTest(unittest.TestCase):
     def test_no_operator_single_segment(self) -> None:
         self.assertEqual(
-            server._split_command("ls -la"),
+            server.split_legacy("ls -la"),
             [(None, ["ls -la"], False)],
         )
 
     def test_semicolon_splits(self) -> None:
         self.assertEqual(
-            server._split_command("echo hi; echo bye"),
+            server.split_legacy("echo hi; echo bye"),
             [(None, ["echo hi"], False), (";", ["echo bye"], False)],
         )
 
     def test_and_and_splits(self) -> None:
         self.assertEqual(
-            server._split_command("make && make test"),
+            server.split_legacy("make && make test"),
             [(None, ["make"], False), ("&&", ["make test"], False)],
         )
 
     def test_or_or_splits(self) -> None:
         self.assertEqual(
-            server._split_command("false || echo fallback"),
+            server.split_legacy("false || echo fallback"),
             [(None, ["false"], False), ("||", ["echo fallback"], False)],
         )
 
     def test_mixed_operators(self) -> None:
         self.assertEqual(
-            server._split_command("a && b; c || d"),
+            server.split_legacy("a && b; c || d"),
             [(None, ["a"], False), ("&&", ["b"], False), (";", ["c"], False), ("||", ["d"], False)],
         )
 
     def test_operator_inside_quotes_preserved(self) -> None:
         self.assertEqual(
-            server._split_command('echo "a; b"'),
+            server.split_legacy('echo "a; b"'),
             [(None, ['echo "a; b"'], False)],
         )
         self.assertEqual(
-            server._split_command("printf 'a && b'; ls"),
+            server.split_legacy("printf 'a && b'; ls"),
             [(None, ["printf 'a && b'"], False), (";", ["ls"], False)],
         )
 
     def test_whitespace_and_empty_segments_dropped(self) -> None:
         self.assertEqual(
-            server._split_command("  a   ;;  b  "),
+            server.split_legacy("  a   ;;  b  "),
             [(None, ["a"], False), (";", ["b"], False)],
         )
 
     def test_empty_command(self) -> None:
-        self.assertEqual(server._split_command(""), [])
-        self.assertEqual(server._split_command("   "), [])
+        self.assertEqual(server.split_legacy(""), [])
+        self.assertEqual(server.split_legacy("   "), [])
 
     def test_only_operator_is_empty(self) -> None:
-        self.assertEqual(server._split_command(";"), [])
+        self.assertEqual(server.split_legacy(";"), [])
 
     def test_single_pipe_splits_into_stages(self) -> None:
         self.assertEqual(
-            server._split_command("ls | wc"),
+            server.split_legacy("ls | wc"),
             [(None, ["ls", "wc"], False)],
         )
 
     def test_multi_stage_pipeline(self) -> None:
         self.assertEqual(
-            server._split_command("a | b | c"),
+            server.split_legacy("a | b | c"),
             [(None, ["a", "b", "c"], False)],
         )
 
     def test_pipe_inside_quotes_preserved(self) -> None:
         self.assertEqual(
-            server._split_command('echo "a|b" | wc'),
+            server.split_legacy('echo "a|b" | wc'),
             [(None, ['echo "a|b"', "wc"], False)],
         )
         self.assertEqual(
-            server._split_command("printf 'a | b'"),
+            server.split_legacy("printf 'a | b'"),
             [(None, ["printf 'a | b'"], False)],
         )
 
     def test_pipe_distinguished_from_or_or(self) -> None:
         # '||' is the chaining OR operator, not a pipe
         self.assertEqual(
-            server._split_command("false || echo fallback | wc"),
+            server.split_legacy("false || echo fallback | wc"),
             [(None, ["false"], False), ("||", ["echo fallback", "wc"], False)],
         )
 
     def test_pipe_and_chain_mix(self) -> None:
         self.assertEqual(
-            server._split_command("a | b && c | d ; e"),
+            server.split_legacy("a | b && c | d ; e"),
             [
                 (None, ["a", "b"], False),
                 ("&&", ["c", "d"], False),
@@ -134,20 +134,20 @@ class SplitCommandTest(unittest.TestCase):
 
     def test_pipe_at_start_drops_empty_lead(self) -> None:
         self.assertEqual(
-            server._split_command("| ls"),
+            server.split_legacy("| ls"),
             [(None, ["ls"], False)],
         )
 
     def test_pipe_at_end_drops_empty_tail(self) -> None:
         self.assertEqual(
-            server._split_command("ls |"),
+            server.split_legacy("ls |"),
             [(None, ["ls"], False)],
         )
 
     def test_triple_pipe_treated_as_or_or_plus_empty_stage(self) -> None:
         # 'a ||| b' parses as 'a || b' (the middle empty stage is dropped).
         self.assertEqual(
-            server._split_command("a ||| b"),
+            server.split_legacy("a ||| b"),
             [(None, ["a"], False), ("||", ["b"], False)],
         )
 
@@ -155,11 +155,11 @@ class SplitCommandTest(unittest.TestCase):
         # Bare '&' marks the current pipeline as backgrounded and resets the
         # operator for the next pipeline (acting like ';' semantically).
         self.assertEqual(
-            server._split_command("a & b"),
+            server.split_legacy("a & b"),
             [(None, ["a"], True), (None, ["b"], False)],
         )
         self.assertEqual(
-            server._split_command("echo hi & ls"),
+            server.split_legacy("echo hi & ls"),
             [(None, ["echo hi"], True), (None, ["ls"], False)],
         )
 
@@ -168,14 +168,14 @@ class SplitCommandTest(unittest.TestCase):
         # the pipeline is marked backgrounded, and the next pipeline runs
         # unconditionally (prev_op reset by '&').
         self.assertEqual(
-            server._split_command("a && b & c"),
+            server.split_legacy("a && b & c"),
             [(None, ["a"], False), ("&&", ["b"], True), (None, ["c"], False)],
         )
 
     def test_double_ampersand_stays_and_operator(self) -> None:
         # '&&' is still the AND chaining operator, not backgrounding.
         self.assertEqual(
-            server._split_command("a && b"),
+            server.split_legacy("a && b"),
             [(None, ["a"], False), ("&&", ["b"], False)],
         )
 
@@ -183,27 +183,27 @@ class SplitCommandTest(unittest.TestCase):
         # The '&' inside `2>&1` / `1>&2` is part of a redirect operator, not a
         # backgrounding operator, so the whole segment must stay intact.
         self.assertEqual(
-            server._split_command("echo hi 2>&1"),
+            server.split_legacy("echo hi 2>&1"),
             [(None, ["echo hi 2>&1"], False)],
         )
         self.assertEqual(
-            server._split_command("cmd 1>&2"),
+            server.split_legacy("cmd 1>&2"),
             [(None, ["cmd 1>&2"], False)],
         )
         # Backgrounding still works when '&' is NOT preceded by '>' + digit.
         self.assertEqual(
-            server._split_command("grep x 2>err &"),
+            server.split_legacy("grep x 2>err &"),
             [(None, ["grep x 2>err"], True)],
         )
 
     def test_ampersand_inside_quotes_preserved(self) -> None:
         # '&' inside quotes is literal text, not a backgrounding operator.
         self.assertEqual(
-            server._split_command('echo "a & b"'),
+            server.split_legacy('echo "a & b"'),
             [(None, ['echo "a & b"'], False)],
         )
         self.assertEqual(
-            server._split_command("printf 'x & y'"),
+            server.split_legacy("printf 'x & y'"),
             [(None, ["printf 'x & y'"], False)],
         )
 

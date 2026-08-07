@@ -132,7 +132,6 @@ from .executor import (  # noqa: F401
     _run_segment,
     _run_segment_core,
     _serialize_pipeline_from_cmds,
-    _split_command,
     _start_reaper,
 )
 
@@ -227,13 +226,13 @@ def shell_run(
         return str(e)
 
     # Walk the AST directly (Option B: single-parse path).  The AST is now the
-    # ONLY execution path — the legacy string-based _split_command fallback
+    # ONLY execution path — the legacy string-based split_legacy fallback
     # was removed in U2.
     if program is None:
         # Defensive: parse_command returns program=None only if AST building
         # failed after the scanner succeeded (see parser.parse_command). Surface
-        # a clean error string rather than crashing. Do NOT route to
-        # _split_command.
+        # a clean error string rather than crashing. Do NOT route to the
+        # legacy splitter.
         return "Command parse error."
     chains = program_to_chain(program)
     if not chains:
