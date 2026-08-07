@@ -11,8 +11,6 @@ from shell_sandbox_mcp.parser import (
     Expansion,
     ParseError,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     extract_redirects,
     parse_command,
     program_to_chain,
@@ -352,18 +350,28 @@ class DifferentialExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(err, "Input redirect missing target file")
 
     def test_input_redirect_then_heredoc_rejected(self) -> None:
-        expansion = Expansion(arg_values={}, heredoc_bodies={"\x01H0\x01": "body\n"})
-        args, redirs, err = extract_redirects(
-            "cmd < file << \x01H0\x01", expansion=expansion,
-        )
+        # Parse a heredoc to get a real expansion + cleaned string
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, _prog = parse_command(
+                "cat <<EOF\nbody\nEOF", lambda i: (0, b""), wd, 30, 0,
+            )
+        # Build test cmd: replace "cat" with "cmd < file"
+        heredoc_tail = cleaned[len("cat "):]  # "<< \x01H0\x01" at runtime
+        test_cmd = "cmd < file " + heredoc_tail
+        args, redirs, err = extract_redirects(test_cmd, expansion=exp)
         self.assertIsNotNone(err)
         self.assertIn("Multiple stdin redirects", err)
 
     def test_heredoc_then_input_rejected(self) -> None:
-        expansion = Expansion(arg_values={}, heredoc_bodies={"\x01H0\x01": "body\n"})
-        args, redirs, err = extract_redirects(
-            "cmd << \x01H0\x01 < file", expansion=expansion,
-        )
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, _prog = parse_command(
+                "cat <<EOF\nbody\nEOF", lambda i: (0, b""), wd, 30, 0,
+            )
+        heredoc_tail = cleaned[len("cat "):]
+        test_cmd = "cmd " + heredoc_tail + " < file"
+        args, redirs, err = extract_redirects(test_cmd, expansion=exp)
         self.assertIsNotNone(err)
         self.assertIn("Multiple stdin redirects", err)
 
@@ -399,6 +407,27 @@ class DifferentialExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(redirs[0].raw_target, "out.txt")
 
 
+# ---------------------------------------------------------------------------
+# AST helpers for opaque lookups
+# ---------------------------------------------------------------------------
+
+def _find_hd_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for rs in cmd.redirects:
+        for p in rs.target.parts:
+            if p.is_hd_sentinel:
+                return p
+    return None
+
+def _find_arg_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for w in cmd.words:
+        for p in w.parts:
+            if p.is_arg_sentinel:
+                return p
+    return None
+
+
 class DifferentialExpandCommandTest(unittest.TestCase):
     """Mirrors test_sandbox.ExpandCommandTest — heredoc/here-string/subst cases."""
 
@@ -422,89 +451,77 @@ class DifferentialExpandCommandTest(unittest.TestCase):
 
     def test_unquoted_heredoc(self) -> None:
         cmd = "cat <<EOF\nhello\nworld\nEOF"
-        expanded, exp, _prog = self._parse(cmd)
+        expanded, exp, prog = self._parse(cmd)
         self.assertIn("<<", expanded)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertIn(sentinel, exp.heredoc_bodies)
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\nworld\n")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello\nworld\n")
 
     def test_single_quoted_delimiter_no_expansion(self) -> None:
         cmd = "cat <<'EOF'\n$(echo hi)\nEOF"
-        expanded, exp, _prog = self._parse(cmd, {"echo hi": "hi"})
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        expanded, exp, prog = self._parse(cmd, {"echo hi": "hi"})
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
     def test_unquoted_heredoc_expands_dollar_paren(self) -> None:
         cmd = "cat <<EOF\n$(echo hello)\nEOF"
-        expanded, exp, _prog = self._parse(cmd, {"echo hello": "hello"})
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        expanded, exp, prog = self._parse(cmd, {"echo hello": "hello"})
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
 
     def test_escaped_dollar_paren_in_heredoc_not_expanded(self) -> None:
         cmd = "cat <<EOF\n\\$(echo hi)\nEOF"
-        expanded, exp, _prog = self._parse(cmd, {"echo hi": "hi"})
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "\\$(echo hi)\n")
+        expanded, exp, prog = self._parse(cmd, {"echo hi": "hi"})
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "\\$(echo hi)\n")
 
     def test_heredoc_tab_strip(self) -> None:
         cmd = "cat <<-EOF\n\t\thello\n\tEOF"
-        expanded, exp, _prog = self._parse(cmd)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
+        expanded, exp, prog = self._parse(cmd)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
         self.assertIn("<<-", expanded)
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
 
     def test_herestring_unquoted(self) -> None:
         cmd = "cat <<<hello"
-        expanded, exp, _prog = self._parse(cmd)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        expanded, exp, prog = self._parse(cmd)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
         self.assertIn("<<<", expanded)
 
     def test_herestring_quoted(self) -> None:
         cmd = "cat <<<'hello world'"
-        expanded, exp, _prog = self._parse(cmd)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello world\n")
+        expanded, exp, prog = self._parse(cmd)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello world\n")
 
     def test_herestring_expands_dollar_paren_unless_single_quoted(self) -> None:
         # Unquoted here-string with $()
         cmd = "cat <<<$(echo hi)"
-        expanded, exp, _prog = self._parse(cmd, {"echo hi": "hi"})
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hi\n")
+        expanded, exp, prog = self._parse(cmd, {"echo hi": "hi"})
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hi\n")
 
         # Single-quoted here-string with $() — no expansion
         cmd2 = "cat <<<'$(echo hi)'"
-        expanded2, exp2, _prog2 = self._parse(cmd2, {"echo hi": "SHOULD_NOT"})
-        m2 = SENTINEL_HD.search(expanded2)
-        self.assertIsNotNone(m2)
-        sentinel2 = f"\x01H{m2.group(1)}\x01"
-        self.assertEqual(exp2.heredoc_bodies[sentinel2], "$(echo hi)\n")
+        expanded2, exp2, prog2 = self._parse(cmd2, {"echo hi": "SHOULD_NOT"})
+        part2 = _find_hd_sentinel(prog2)
+        self.assertIsNotNone(part2)
+        self.assertEqual(exp2.heredoc_for(part2), "$(echo hi)\n")
 
     def test_command_substitution_sentinel(self) -> None:
         cmd = "echo $(echo hello)"
-        expanded, exp, _prog = self._parse(cmd, {"echo hello": "hello"})
-        m = SENTINEL_ARG.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertIn(sentinel, exp.arg_values)
-        self.assertEqual(exp.arg_values[sentinel], "hello")
+        expanded, exp, prog = self._parse(cmd, {"echo hello": "hello"})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.arg_for(part), "hello")
         self.assertTrue(expanded.startswith("echo "))
 
     def test_nested_command_substitution(self) -> None:
@@ -515,7 +532,7 @@ class DifferentialExpandCommandTest(unittest.TestCase):
             captured.append(inner)
             return 0, inner.encode()
 
-        expanded, exp, _prog = parse_command(cmd, fake_capture, self.work_dir, 30, 0)
+        expanded, exp, prog = parse_command(cmd, fake_capture, self.work_dir, 30, 0)
         self.assertIn("echo $(echo inner)", captured)
 
     def test_unbalanced_dollar_paren_error(self) -> None:
@@ -531,20 +548,20 @@ class DifferentialExpandCommandTest(unittest.TestCase):
 
     def test_quotes_inside_heredoc_body_preserved(self) -> None:
         cmd = "cat <<EOF\nline with \"quotes\" and 'apostrophes'\nEOF"
-        expanded, exp, _prog = self._parse(cmd)
-        m = SENTINEL_HD.search(expanded)
-        sentinel = f"\x01H{m.group(1)}\x01"
+        expanded, exp, prog = self._parse(cmd)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
         self.assertEqual(
-            exp.heredoc_bodies[sentinel],
+            exp.heredoc_for(part),
             "line with \"quotes\" and 'apostrophes'\n",
         )
 
     def test_double_quoted_delimiter_no_expansion(self) -> None:
         cmd = 'cat <<"EOF"\n$(echo hi)\nEOF'
-        expanded, exp, _prog = self._parse(cmd, {"echo hi": "hi"})
-        m = SENTINEL_HD.search(expanded)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        expanded, exp, prog = self._parse(cmd, {"echo hi": "hi"})
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
 
 @unittest.skip("tautological post-A1: both string and AST paths now route through _build_ast")
@@ -577,7 +594,7 @@ class DifferentialASTParityTest(unittest.TestCase):
         """
         str_result = extract_redirects(cmd, expansion)
 
-        # AST path: parse → chain → extract from first CommandNode
+        # AST path: parse -> chain -> extract from first CommandNode
         import tempfile
         from pathlib import Path
 
@@ -652,8 +669,6 @@ class DifferentialASTParityTest(unittest.TestCase):
                 f"Redirect[{i}].target_fd mismatch for {cmd!r}")
             self.assertEqual(sr.target_path, ar.target_path,
                 f"Redirect[{i}].target_path mismatch for {cmd!r}")
-            # body and strip_tabs are harder to compare without expansion
-            # but we test heredoc cases separately below
 
     # ------------------------------------------------------------------
     # regression: 2>&1x / 1>&2y (the BLOCKER)
@@ -734,21 +749,35 @@ class DifferentialASTParityTest(unittest.TestCase):
 
     def test_multiple_stdin_both_paths(self) -> None:
         """Both paths reject multiple stdin redirects."""
-        # Use a pre-formatted sentinel to avoid parse_command heredoc parsing
-        exp = Expansion(
-            arg_values={},
-            heredoc_bodies={"\x01H0\x01": "body\n"},
-        )
-        str_args, str_redirs, str_err = extract_redirects(
-            "cmd < file << \x01H0\x01", expansion=exp,
-        )
-        self.assertIsNotNone(str_err)
-        self.assertIn("Multiple stdin redirects", str_err)
-
-        # AST path: build a CommandNode manually with two fd-0 redirects
+        import tempfile
+        from pathlib import Path
         from shell_sandbox_mcp.parser import (
             CommandNode, RedirectSpec, Word, WordPart,
         )
+
+        # Parse a heredoc to get a real expansion + cleaned command string
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = parse_command(
+                "cat <<EOF\nbody\nEOF", lambda i: (0, b""), wd, 30, 0,
+            )
+        # Get the sentinel WordPart from the AST
+        hd_part = None
+        for rs in prog.chains[0].pipeline.commands[0].redirects:
+            for p in rs.target.parts:
+                if p.is_hd_sentinel:
+                    hd_part = p
+                    break
+        self.assertIsNotNone(hd_part)
+
+        # String path: use the cleaned command with sentinel
+        heredoc_tail = cleaned[len("cat "):]
+        test_cmd = "cmd < file " + heredoc_tail
+        str_args, str_redirs, str_err = extract_redirects(test_cmd, expansion=exp)
+        self.assertIsNotNone(str_err)
+        self.assertIn("Multiple stdin redirects", str_err)
+
+        # AST path: build a CommandNode with the sentinel WordPart
         cmd = CommandNode(
             words=(Word(parts=(WordPart(text="cmd"),)),),
             redirects=(
@@ -758,9 +787,7 @@ class DifferentialASTParityTest(unittest.TestCase):
                 ),
                 RedirectSpec(
                     fd=0, op="<<",
-                    target=Word(parts=(
-                        WordPart(text="\x01H0\x01", is_sentinel=True),
-                    )),
+                    target=Word(parts=(hd_part,)),
                 ),
             ),
         )
@@ -782,15 +809,12 @@ class DifferentialASTParityTest(unittest.TestCase):
     def test_subst_single_word_both_paths(self) -> None:
         import tempfile
         from pathlib import Path
-        # The string path with expansion=None sees the literal sentinel text.
-        str_args, str_redirs, str_err = extract_redirects(
-            "echo \x01A0\x01", None
-        )
         with tempfile.TemporaryDirectory() as td:
             wd = Path(td)
-            # Use a non-empty capture so the sentinel resolves to a visible word
             cap = lambda inner: (0, b"hi")
-            _c, exp, prog = parse_command("echo $(echo hi)", cap, wd, 30, 0)
+            cleaned, exp, prog = parse_command("echo $(echo hi)", cap, wd, 30, 0)
+            # String path: use the cleaned string from the parser
+            str_args, str_redirs, str_err = extract_redirects(cleaned, exp)
             chain = program_to_chain(prog)
             cmd_node = chain[0][1][0]
             ast_args, ast_redirs, ast_err = extract_redirects(cmd_node, exp)
@@ -830,7 +854,6 @@ class DifferentialASTParityTest(unittest.TestCase):
 
     def test_all_string_cases_match_ast(self) -> None:
         """Run every non-expansion test case through both paths."""
-        # Simple redirect cases (no heredoc expansion needed)
         cases = [
             "echo hi > out.txt",
             "echo hi >> log.txt",
@@ -866,8 +889,6 @@ class DifferentialASTParityTest(unittest.TestCase):
         produce program=None, so the AST path can't reach extract_redirects.
         Those are tested separately below.
         """
-        # These error cases go through parse_command successfully and
-        # produce a CommandNode with a missing/invalid redirect target.
         comparable = [
             "echo >",
             "echo 2>",
@@ -877,9 +898,6 @@ class DifferentialASTParityTest(unittest.TestCase):
             with self.subTest(case=case):
                 self._assert_both_equal(case)
 
-        # These cases are rejected by the lexer inside parse_command,
-        # which catches the exception and returns program=None.
-        # Verify the string path still produces the correct error.
         lexer_errors = {
             "echo 3> f": "Redirects only support fds 1 and 2 (got 3)",
             "echo 0> f": "Redirects only support fds 1 and 2 (got 0)",

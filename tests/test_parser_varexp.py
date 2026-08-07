@@ -24,7 +24,6 @@ from shell_sandbox_mcp.parser import (
     Expansion,
     ParseError,
     Redirect,
-    SENTINEL_ARG,
     extract_redirects,
     parse_command,
     program_to_chain,
@@ -123,6 +122,25 @@ def _assert_str_path(
     str_args, _, str_err = str_r
     test.assertIsNone(str_err, f"String path error for {cmd!r}: {str_err}")
     test.assertEqual(str_args, expected, f"String path mismatch for {cmd!r}")
+
+
+# ---------------------------------------------------------------------------
+# AST helpers for opaque sentinel lookups
+# ---------------------------------------------------------------------------
+
+def _find_arg_sentinel(prog):
+    """Return the first arg-sentinel WordPart in the first command, or None."""
+    cmd = prog.chains[0].pipeline.commands[0]
+    for w in cmd.words:
+        for p in w.parts:
+            if p.is_arg_sentinel:
+                return p
+    return None
+
+
+def _any_arg_sentinel(prog) -> bool:
+    """Return True if any arg-sentinel exists in the first command."""
+    return _find_arg_sentinel(prog) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -338,43 +356,40 @@ class ScannerExpansionTest(unittest.TestCase):
     """Check that the expansion table is correctly populated."""
 
     def test_expansion_table_has_value(self) -> None:
-        cleaned, exp, _prog = _parse("echo $HOME")
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m, "Should have a sentinel")
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "/root")
+        cleaned, exp, prog = _parse("echo $HOME")
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part, "Should have a sentinel")
+        self.assertEqual(exp.arg_for(part), "/root")
 
     def test_braced_expansion_table(self) -> None:
-        cleaned, exp, _prog = _parse("echo ${HOME}")
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m, "Should have a sentinel for ${HOME}")
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "/root")
+        cleaned, exp, prog = _parse("echo ${HOME}")
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part, "Should have a sentinel for ${HOME}")
+        self.assertEqual(exp.arg_for(part), "/root")
 
     def test_unset_not_in_table(self) -> None:
         """Unset var should produce sentinel with empty string value."""
-        cleaned, exp, _prog = _parse("echo $UNSET_VAR", env={})
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "")
+        cleaned, exp, prog = _parse("echo $UNSET_VAR", env={})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.arg_for(part), "")
 
     def test_escaped_dollar_no_sentinel(self) -> None:
         """\$VAR should NOT produce a sentinel."""
-        cleaned, exp, _prog = _parse(r"echo \$HOME")
-        self.assertNotIn("\x01A", cleaned)
+        cleaned, exp, prog = _parse(r"echo \$HOME")
+        self.assertFalse(_any_arg_sentinel(prog))
         self.assertIn("$HOME", cleaned)
 
     def test_sq_no_sentinel(self) -> None:
         """'$HOME' should NOT produce a sentinel."""
-        cleaned, exp, _prog = _parse("echo '$HOME'")
-        self.assertNotIn("\x01A", cleaned)
+        cleaned, exp, prog = _parse("echo '$HOME'")
+        self.assertFalse(_any_arg_sentinel(prog))
         self.assertIn("$HOME", cleaned)
 
     def test_special_param_no_sentinel(self) -> None:
         """$$ should NOT produce a sentinel."""
-        cleaned, exp, _prog = _parse("echo $$")
-        self.assertNotIn("\x01A", cleaned)
+        cleaned, exp, prog = _parse("echo $$")
+        self.assertFalse(_any_arg_sentinel(prog))
         self.assertIn("$$", cleaned)
 
 
@@ -388,22 +403,20 @@ class EnvAllowlistIntegrationTest(unittest.TestCase):
     def test_expansion_ignores_os_environ(self) -> None:
         """Pass a custom env; assert os.environ values are NOT used."""
         import os
-        cleaned, exp, _prog = _parse("echo $HOME", env={"HOME": "/custom"})
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "/custom")
+        cleaned, exp, prog = _parse("echo $HOME", env={"HOME": "/custom"})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.arg_for(part), "/custom")
         # If os.environ leaked, the value would be the real HOME, not /custom
         if "HOME" in os.environ:
-            self.assertNotEqual(exp.arg_values.get(sentinel, ""), os.environ["HOME"])
+            self.assertNotEqual(exp.arg_for(part) or "", os.environ["HOME"])
 
     def test_no_env_all_vars_empty(self) -> None:
         """With empty env, all $VAR become sentinels with '' values."""
-        cleaned, exp, _prog = _parse("echo $HOME", env={})
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m, "Even unset vars produce a sentinel")
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "")
+        cleaned, exp, prog = _parse("echo $HOME", env={})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part, "Even unset vars produce a sentinel")
+        self.assertEqual(exp.arg_for(part), "")
 
 
 if __name__ == "__main__":

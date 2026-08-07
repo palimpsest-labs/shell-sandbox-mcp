@@ -7,8 +7,6 @@ from shell_sandbox_mcp.parser import (
     Expansion,
     ParseError,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     TokenKind,
     Token,
     _check_unsupported,
@@ -18,6 +16,31 @@ from shell_sandbox_mcp.parser import (
     parse_command,
     split_legacy,
 )
+
+
+# ---------------------------------------------------------------------------
+# AST navigation helpers — used to locate sentinel WordParts without
+# rebuilding sentinel keys.
+# ---------------------------------------------------------------------------
+
+def _find_hd_sentinel(prog):
+    """Return the first heredoc-sentinel WordPart in the first command."""
+    cmd = prog.chains[0].pipeline.commands[0]
+    for rs in cmd.redirects:
+        for p in rs.target.parts:
+            if p.is_hd_sentinel:
+                return p
+    return None
+
+
+def _find_arg_sentinel(prog):
+    """Return the first arg-sentinel WordPart in the first command."""
+    cmd = prog.chains[0].pipeline.commands[0]
+    for w in cmd.words:
+        for p in w.parts:
+            if p.is_arg_sentinel:
+                return p
+    return None
 
 
 class LexerUnsupportedRejectionTest(unittest.TestCase):
@@ -61,53 +84,49 @@ class LexerUnsupportedRejectionTest(unittest.TestCase):
 class LexerHeredocBodyTest(unittest.TestCase):
     """Test heredoc body collection via parse_command."""
 
-    def _parse(self, cmd: str) -> tuple[str, Expansion]:
+    def _parse(self, cmd: str):
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, b""
-        cleaned, expansion, _prog = parse_command(
+        cleaned, expansion, prog = parse_command(
             cmd, fake_capture, None, 30, 0,
         )
-        return cleaned, expansion
+        return cleaned, expansion, prog
 
     def test_basic_heredoc(self) -> None:
-        cleaned, exp = self._parse("cat <<EOF\nhello\nworld\nEOF")
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertIn(sentinel, exp.heredoc_bodies)
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\nworld\n")
+        cleaned, exp, prog = self._parse("cat <<EOF\nhello\nworld\nEOF")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        body = exp.heredoc_for(part)
+        self.assertIsNotNone(body)
+        self.assertEqual(body, "hello\nworld\n")
 
     def test_heredoc_tab_strip(self) -> None:
-        cleaned, exp = self._parse("cat <<-EOF\n\t\thello\n\tEOF")
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
+        cleaned, exp, prog = self._parse("cat <<-EOF\n\t\thello\n\tEOF")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
         self.assertIn("<<-", cleaned)
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
 
     def test_heredoc_single_quoted_delim(self) -> None:
-        cleaned, exp = self._parse("cat <<'EOF'\n$(echo hi)\nEOF")
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
+        cleaned, exp, prog = self._parse("cat <<'EOF'\n$(echo hi)\nEOF")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
         # Body should be literal — $() NOT expanded
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
     def test_heredoc_backslash_escaped_delim(self) -> None:
-        """<<\EOF should act like <<'EOF' — literal body."""
-        cleaned, exp = self._parse("cat <<\\EOF\n$(echo hi)\nEOF")
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        """<<\\EOF should act like <<'EOF' — literal body."""
+        cleaned, exp, prog = self._parse("cat <<\\EOF\n$(echo hi)\nEOF")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
     def test_heredoc_dash_backslash_escaped_delim(self) -> None:
-        """<<-\EOF should act like <<-'EOF' — literal body with tab strip."""
-        cleaned, exp = self._parse("cat <<-\\EOF\n\t$(echo hi)\n\tEOF")
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        """<<-\\EOF should act like <<-'EOF' — literal body with tab strip."""
+        cleaned, exp, prog = self._parse("cat <<-\\EOF\n\t$(echo hi)\n\tEOF")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
     def test_heredoc_missing_terminator(self) -> None:
         with self.assertRaises(ValueError) as ctx:
@@ -115,40 +134,36 @@ class LexerHeredocBodyTest(unittest.TestCase):
         self.assertIn("not found", str(ctx.exception))
 
     def test_herestring_basic(self) -> None:
-        cleaned, exp = self._parse("cat <<<hello world")
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello world\n")
+        cleaned, exp, prog = self._parse("cat <<<hello world")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello world\n")
 
     def test_herestring_single_quoted(self) -> None:
-        cleaned, exp = self._parse("cat <<<'hello world'")
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello world\n")
+        cleaned, exp, prog = self._parse("cat <<<'hello world'")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello world\n")
 
     def test_herestring_expands_dollar_paren(self) -> None:
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, b"expanded"
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "cat <<<$(echo hi)", fake_capture, None, 30, 0,
         )
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "expanded\n")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "expanded\n")
 
     def test_heredoc_body_expands_dollar_paren_in_unquoted(self) -> None:
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, b"hello"
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "cat <<EOF\n$(echo hello)\nEOF", fake_capture, None, 30, 0,
         )
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
 
 
 class LexerSubstSpanTest(unittest.TestCase):
@@ -158,13 +173,12 @@ class LexerSubstSpanTest(unittest.TestCase):
         def fake_capture(inner: str) -> tuple[int, bytes]:
             self.assertEqual(inner, "echo hello")
             return 0, b"hello"
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "echo $(echo hello)", fake_capture, None, 30, 0,
         )
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values[sentinel], "hello")
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.arg_for(part), "hello")
 
     def test_nested_subst(self) -> None:
         captured: list[str] = []
@@ -173,7 +187,7 @@ class LexerSubstSpanTest(unittest.TestCase):
             captured.append(inner)
             return 0, inner.encode()
 
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "echo $(echo $(echo inner))", fake_capture, None, 30, 0,
         )
         # The outer capture is called with the whole inner text

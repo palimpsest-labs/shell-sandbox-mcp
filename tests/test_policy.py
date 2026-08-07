@@ -20,8 +20,6 @@ from shell_sandbox_mcp.server import (
     InvocationError,
     ProgramNode,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     _expand_command,
     _capture_stdout,
     _extract_redirects,

@@ -18,8 +18,6 @@ from shell_sandbox_mcp.parser import (
     Expansion,
     ParseError,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     extract_redirects,
     parse_command,
     program_to_chain,
@@ -31,7 +29,7 @@ from shell_sandbox_mcp.parser import (
 # ---------------------------------------------------------------------------
 
 def _stub_capture(outputs: dict[str, str]):
-    """Return a capture_fn that maps inner command text → (rc, stdout_bytes)."""
+    """Return a capture_fn that maps inner command text -> (rc, stdout_bytes)."""
     def fake_capture(inner: str):
         val = outputs.get(inner, "")
         return 0, val.encode("utf-8")
@@ -47,6 +45,36 @@ def _parse(cmd: str, outputs: dict[str, str] | None = None, env: Mapping[str, st
         return parse_command(cmd, capture_fn, wd, 30, 0, env=env)
 
 
+# AST helpers
+def _find_arg_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for w in cmd.words:
+        for p in w.parts:
+            if p.is_arg_sentinel:
+                return p
+    return None
+
+def _find_hd_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for rs in cmd.redirects:
+        for p in rs.target.parts:
+            if p.is_hd_sentinel:
+                return p
+    return None
+
+def _all_arg_sentinels(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    result = []
+    for w in cmd.words:
+        for p in w.parts:
+            if p.is_arg_sentinel:
+                result.append(p)
+    return result
+
+def _any_arg_sentinel(prog) -> bool:
+    return _find_arg_sentinel(prog) is not None
+
+
 # ---------------------------------------------------------------------------
 # Basic double-quoted $() expansion (scanner path)
 # ---------------------------------------------------------------------------
@@ -55,58 +83,54 @@ class QuotedSubstScannerTest(unittest.TestCase):
     """Test the char-by-char scanner path (parse_command) for double-quoted $()."""
 
     def test_dq_subst_simple(self) -> None:
-        """echo "$(echo inner)" → inner (expands inside double quotes)."""
-        cleaned, exp, _prog = _parse('echo "$(echo inner)"', {"echo inner": "inner"})
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m, "Should have a sentinel in the cleaned string")
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertIn(sentinel, exp.arg_values)
-        self.assertEqual(exp.arg_values[sentinel], "inner")
+        """echo "$(echo inner)" -> inner (expands inside double quotes)."""
+        cleaned, exp, prog = _parse('echo "$(echo inner)"', {"echo inner": "inner"})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part, "Should have a sentinel in the cleaned string")
+        self.assertEqual(exp.arg_for(part), "inner")
 
     def test_dq_subst_multi_word_single_arg(self) -> None:
-        """echo "$(echo a b c)" → single arg 'a b c', NO field splitting."""
-        cleaned, exp, _prog = _parse(
+        """echo "$(echo a b c)" -> single arg 'a b c', NO field splitting."""
+        cleaned, exp, prog = _parse(
             'echo "$(echo a b c)"', {"echo a b c": "a b c"}
         )
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
-        # The value must be stored as ONE string with spaces — not split into args
-        self.assertEqual(exp.arg_values[sentinel], "a b c")
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part)
+        # The value must be stored as ONE string with spaces -- not split into args
+        self.assertEqual(exp.arg_for(part), "a b c")
 
     def test_sq_stays_literal(self) -> None:
-        """echo '$(echo inner)' → literal $(echo inner) (single quotes literal)."""
-        cleaned, exp, _prog = _parse(
+        """echo '$(echo inner)' -> literal $(echo inner) (single quotes literal)."""
+        cleaned, exp, prog = _parse(
             "echo '$(echo inner)'", {"echo inner": "SHOULD_NOT_APPEAR"}
         )
-        # No sentinel should be in the cleaned string
-        self.assertNotIn("\x01A", cleaned)
+        # No sentinel should be in the AST
+        self.assertFalse(_any_arg_sentinel(prog))
         # The literal $(echo inner) must be present in cleaned
         self.assertIn("$(echo inner)", cleaned)
 
     def test_escaped_dollar_paren_literal(self) -> None:
-        r"""echo "\$(echo x)" → literal $(echo x), NOT expanded."""
-        cleaned, exp, _prog = _parse(
+        r"""echo "\$(echo x)" -> literal $(echo x), NOT expanded."""
+        cleaned, exp, prog = _parse(
             r'echo "\$(echo x)"', {"echo x": "SHOULD_NOT_APPEAR"}
         )
-        self.assertNotIn("\x01A", cleaned)
+        self.assertFalse(_any_arg_sentinel(prog))
         self.assertIn("$(echo x)", cleaned)
 
     def test_compound_dq_subst(self) -> None:
-        r"""echo "pre$(echo mid)post" → premidpost as single arg."""
-        cleaned, exp, _prog = _parse(
+        r"""echo "pre$(echo mid)post" -> premidpost as single arg."""
+        cleaned, exp, prog = _parse(
             r'echo "pre$(echo mid)post"', {"echo mid": "mid"}
         )
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values[sentinel], "mid")
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.arg_for(part), "mid")
         # The cleaned string should have the sentinel between "pre and post"
         self.assertIn('"pre', cleaned)
         self.assertIn('post"', cleaned)
 
     def test_nested_dq_subst(self) -> None:
-        r"""echo "$(echo "$(echo deep)")" — nested expansion inside double quotes."""
+        r"""echo "$(echo "$(echo deep)")" -- nested expansion inside double quotes."""
         captured: list[str] = []
 
         def fake_capture(inner: str):
@@ -115,7 +139,7 @@ class QuotedSubstScannerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             wd = Path(td)
-            cleaned, exp, _prog = parse_command(
+            cleaned, exp, prog = parse_command(
                 'echo "$(echo "$(echo deep)")"', fake_capture, wd, 30, 0,
             )
         # The outer capture should get: echo "$(echo deep)"
@@ -123,17 +147,15 @@ class QuotedSubstScannerTest(unittest.TestCase):
         self.assertIn('echo "$(echo deep)"', captured)
 
     def test_dq_multiple_subst(self) -> None:
-        r"""echo "$(echo a)$(echo b)" → two sentinels, both resolved."""
-        cleaned, exp, _prog = _parse(
+        r"""echo "$(echo a)$(echo b)" -> two sentinels, both resolved."""
+        cleaned, exp, prog = _parse(
             r'echo "$(echo a)$(echo b)"',
             {"echo a": "alpha", "echo b": "beta"},
         )
-        matches = SENTINEL_ARG.findall(cleaned)
-        self.assertEqual(len(matches), 2, f"Expected 2 sentinels, got {matches}")
-        s0 = f"\x01A{matches[0]}\x01"
-        s1 = f"\x01A{matches[1]}\x01"
-        self.assertEqual(exp.arg_values[s0], "alpha")
-        self.assertEqual(exp.arg_values[s1], "beta")
+        parts = _all_arg_sentinels(prog)
+        self.assertEqual(len(parts), 2, f"Expected 2 sentinels, got {parts}")
+        self.assertEqual(exp.arg_for(parts[0]), "alpha")
+        self.assertEqual(exp.arg_for(parts[1]), "beta")
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +171,9 @@ class QuotedArithmeticRejectionTest(unittest.TestCase):
         self.assertIn("Arithmetic", str(ctx.exception))
 
     def test_sq_double_paren_literal(self) -> None:
-        cleaned, exp, _prog = _parse("echo '$((1+1))'")
+        cleaned, exp, prog = _parse("echo '$((1+1))'")
         self.assertIn("$((1+1))", cleaned)
-        self.assertNotIn("\x01A", cleaned)
+        self.assertFalse(_any_arg_sentinel(prog))
 
 
 # ---------------------------------------------------------------------------
@@ -163,36 +185,32 @@ class VariableExpansionTest(unittest.TestCase):
 
     def test_unquoted_var_expands(self) -> None:
         """echo $HOME with env expands to /root (sentinel, not literal)."""
-        cleaned, exp, _prog = _parse("echo $HOME", env={"HOME": "/root"})
-        # The scanner replaces $HOME with a sentinel; the literal $HOME is gone
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m, "Should have a sentinel for $HOME")
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "/root")
+        cleaned, exp, prog = _parse("echo $HOME", env={"HOME": "/root"})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part, "Should have a sentinel for $HOME")
+        self.assertEqual(exp.arg_for(part), "/root")
 
     def test_dq_var_expands(self) -> None:
         """echo "$HOME" with env expands to /root."""
-        cleaned, exp, _prog = _parse('echo "$HOME"', env={"HOME": "/root"})
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m, "Should have a sentinel for $HOME in dq")
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "/root")
+        cleaned, exp, prog = _parse('echo "$HOME"', env={"HOME": "/root"})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part, "Should have a sentinel for $HOME in dq")
+        self.assertEqual(exp.arg_for(part), "/root")
 
     def test_dq_braced_var_expands(self) -> None:
         """echo "${HOME}" with env expands to /root."""
-        cleaned, exp, _prog = _parse('echo "${HOME}"', env={"HOME": "/root"})
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m, "Should have a sentinel for ${HOME} in dq")
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertEqual(exp.arg_values.get(sentinel), "/root")
+        cleaned, exp, prog = _parse('echo "${HOME}"', env={"HOME": "/root"})
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part, "Should have a sentinel for ${HOME} in dq")
+        self.assertEqual(exp.arg_for(part), "/root")
 
     def test_sq_var_literal(self) -> None:
-        cleaned, exp, _prog = _parse("echo '$HOME'")
+        cleaned, exp, prog = _parse("echo '$HOME'")
         self.assertIn("$HOME", cleaned)
 
 
 # ---------------------------------------------------------------------------
-# Heredoc with quoted delimiter — body stays literal (unchanged)
+# Heredoc with quoted delimiter -- body stays literal (unchanged)
 # ---------------------------------------------------------------------------
 
 class HeredocQuotedDelimLiteralTest(unittest.TestCase):
@@ -200,23 +218,21 @@ class HeredocQuotedDelimLiteralTest(unittest.TestCase):
 
     def test_dq_delim_body_literal(self) -> None:
         cmd = 'cat <<"EOF"\n$(echo hi)\nEOF'
-        cleaned, exp, _prog = _parse(cmd, {"echo hi": "SHOULD_NOT_APPEAR"})
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        cleaned, exp, prog = _parse(cmd, {"echo hi": "SHOULD_NOT_APPEAR"})
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
     def test_sq_delim_body_literal(self) -> None:
         cmd = "cat <<'EOF'\n$(echo hi)\nEOF"
-        cleaned, exp, _prog = _parse(cmd, {"echo hi": "SHOULD_NOT_APPEAR"})
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        cleaned, exp, prog = _parse(cmd, {"echo hi": "SHOULD_NOT_APPEAR"})
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
 
 # ---------------------------------------------------------------------------
-# Differential AST parity — scanner path vs AST path
+# Differential AST parity -- scanner path vs AST path
 # ---------------------------------------------------------------------------
 
 class QuotedSubstASTParityTest(unittest.TestCase):
@@ -283,7 +299,7 @@ class QuotedSubstASTParityTest(unittest.TestCase):
         )
 
         if str_err is not None:
-            return  # both errored — parity holds
+            return  # both errored -- parity holds
 
         # Both should produce same args
         self.assertEqual(
@@ -309,7 +325,7 @@ class QuotedSubstASTParityTest(unittest.TestCase):
         )
 
     def test_dq_multi_word_parity(self) -> None:
-        """Single arg with spaces — no field splitting in either path."""
+        """Single arg with spaces -- no field splitting in either path."""
         self._assert_parity(
             'echo "$(echo a b c)"',
             ["echo", "a b c"],
@@ -354,7 +370,7 @@ class QuotedSubstASTParityTest(unittest.TestCase):
         )
 
     def test_dq_empty_subst_parity(self) -> None:
-        """Empty $() output — whole-word dropped (unified on AST path)."""
+        """Empty $() output -- whole-word dropped (unified on AST path)."""
         self._assert_parity(
             'echo "$(echo -n)"',
             ["echo"],

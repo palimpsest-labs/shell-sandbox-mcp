@@ -1,6 +1,6 @@
 import unittest
 from shell_sandbox_mcp.parser import (
-    Expansion, ParseError, SENTINEL_HD,
+    Expansion, ParseError,
     extract_redirects, parse_command,
 )
 
@@ -15,11 +15,16 @@ class HeredocBackslashDelimTest(unittest.TestCase):
 
     def test_backslash_delim_literal_body(self):
         cmd = "cat <<\\EOF\n$(echo hi)\nEOF"
-        cleaned, exp, _prog = self._parse(cmd)
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        cleaned, exp, prog = self._parse(cmd)
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        part = None
+        for rs in cmd_node.redirects:
+            for p in rs.target.parts:
+                if p.is_hd_sentinel:
+                    part = p
+                    break
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
 
 class UnsupportedRejectionTest(unittest.TestCase):
@@ -119,7 +124,11 @@ class BackslashEscapeTest(unittest.TestCase):
         """\\$(cmd) → the backslash prevents $() expansion."""
         cleaned, exp, prog = self._parse("echo \\$(whoami)", {"whoami": "SHOULD_NOT_MATCH"})
         # $(...) inside should NOT be expanded because of backslash
-        self.assertNotIn("\x01A", cleaned)
+        cmd = prog.chains[0].pipeline.commands[0]
+        has_arg_sentinel = any(
+            p.is_arg_sentinel for w in cmd.words for p in w.parts
+        )
+        self.assertFalse(has_arg_sentinel)
         self.assertIn("\\$(whoami)", cleaned)
 
     def test_backslash_quote_inside_double_quotes(self) -> None:
@@ -216,10 +225,15 @@ class NestedSubstAndHeredocTest(unittest.TestCase):
         """Heredoc body containing a line that looks like another heredoc."""
         cmd = "cat <<EOF\nline1\n<<IGNORED\nline3\nEOF"
         cleaned, exp, prog = self._parse(cmd)
-        m = SENTINEL_HD.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        body = exp.heredoc_bodies.get(sentinel)
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        part = None
+        for rs in cmd_node.redirects:
+            for p in rs.target.parts:
+                if p.is_hd_sentinel:
+                    part = p
+                    break
+        self.assertIsNotNone(part)
+        body = exp.heredoc_for(part)
         self.assertIsNotNone(body)
         # The <<IGNORED line should be in the body, not treated as a new heredoc
         self.assertIn("<<IGNORED", body)

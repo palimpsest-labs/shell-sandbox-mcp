@@ -23,8 +23,6 @@ from .parser import (  # noqa: F401
     ParseError,
     ProgramNode,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     _expand_subst_in_text as _parser_expand_subst_in_text,
     _serialize_command,
     _serialize_pipeline,

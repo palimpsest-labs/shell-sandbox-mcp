@@ -1,13 +1,15 @@
 """Shell command parser — lexer, AST, and parse functions.
 
 Replaces the hand-rolled char-by-char parsing passes in server.py with a
-proper lexer + recursive-descent parser.  Exports the same Redirect,
-Expansion, SENTINEL_ARG, and SENTINEL_HD symbols that server.py used to
-define directly, so existing imports keep working.
+proper lexer + recursive-descent parser.  Exports Redirect and Expansion
+(which exposes opaque lookups ``arg_for(part)`` / ``heredoc_for(part)``)
+so existing imports keep working.  The ``\x01A`` / ``\x01H`` sentinel scheme
+is encapsulated inside this module — no callers outside parser.py should
+reconstruct sentinel keys.
 
 Public API
 ----------
-- ParseError, Redirect, Expansion, SENTINEL_ARG, SENTINEL_HD
+- ParseError, Redirect, Expansion
 - parse_command(text, capture_fn, ...) → (cleaned, expansion, program)
 - split_legacy(text) → list[(op|None, [stages], bg)]
 - extract_redirects(segment, expansion) → (args, redirects, err)
@@ -31,8 +33,8 @@ from .config import MAX_HEREDOC_BODY, MAX_SUBST_COUNT, MAX_SUBST_DEPTH, MAX_SUBS
 # Sentinel patterns (moved from server.py; same values)
 # ---------------------------------------------------------------------------
 
-SENTINEL_ARG = re.compile(r"\x01A(\d+)\x01")
-SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
+_SENTINEL_ARG = re.compile(r"\x01A(\d+)\x01")
+_SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
 _BRACED_VAR_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 _VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -43,9 +45,43 @@ _VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 @dataclass
 class Expansion:
-    """Side table holding resolved $() output words and heredoc/here-string bodies."""
-    arg_values: dict[str, str] = field(default_factory=dict)
-    heredoc_bodies: dict[str, str] = field(default_factory=dict)
+    """Side table holding resolved $() output words and heredoc/here-string bodies.
+
+    Lookups MUST go through the opaque ``arg_for(part)`` /
+    ``heredoc_for(part)`` methods.  Do NOT access the internal dicts directly.
+    """
+    _arg_values: dict[str, str] = field(default_factory=dict)
+    _heredoc_bodies: dict[str, str] = field(default_factory=dict)
+
+    # -- public opaque API ------------------------------------------------
+
+    def arg_for(self, part) -> Optional[str]:
+        """Return the resolved $() value for *part*, or None.
+
+        *part* must be a :class:`WordPart` whose ``is_arg_sentinel`` is True.
+        """
+        if not part.is_arg_sentinel:
+            return None
+        return self._arg_values.get(part.text)
+
+    def heredoc_for(self, part) -> Optional[str]:
+        """Return the resolved heredoc/here-string body for *part*, or None.
+
+        *part* must be a :class:`WordPart` whose ``is_hd_sentinel`` is True.
+        """
+        if not part.is_hd_sentinel:
+            return None
+        return self._heredoc_bodies.get(part.text)
+
+    # -- internal write helpers (for parser.py only) ----------------------
+
+    def _set_arg_for(self, sentinel: str, value: str) -> None:
+        """Record a $() output for a sentinel key."""
+        self._arg_values[sentinel] = value
+
+    def _set_heredoc_for(self, sentinel: str, body: str) -> None:
+        """Record a heredoc/here-string body for a sentinel key."""
+        self._heredoc_bodies[sentinel] = body
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +716,7 @@ class Lexer:
         # ONLY in replay mode — in populate mode a literal \x01H<N>\x01
         # delimiter is a real user-typed delimiter whose body must be
         # collected normally.
-        if self._replay_mode and SENTINEL_HD.fullmatch(delimiter):
+        if self._replay_mode and _SENTINEL_HD.fullmatch(delimiter):
             self._tokens.append(Token(
                 TokenKind.R_HEREDOC_STRIP if strip_tabs else TokenKind.R_HEREDOC,
                 op_text, start, fd=0,
@@ -757,8 +793,8 @@ def _detect_sentinels_in_text(text: str) -> list[WordPart]:
     i = 0
     n = len(text)
     while i < n:
-        m_arg = SENTINEL_ARG.match(text, i)
-        m_hd = SENTINEL_HD.match(text, i)
+        m_arg = _SENTINEL_ARG.match(text, i)
+        m_hd = _SENTINEL_HD.match(text, i)
         if m_arg:
             sentinel = m_arg.group(0)
             parts.append(WordPart(text=sentinel, raw=sentinel, is_sentinel=True))
@@ -844,7 +880,7 @@ def _build_ast(
                 value = value[:MAX_SUBST_OUTPUT]
             else:
                 value = env.get(name, "") if env else ""
-            expansion.arg_values[sentinel] = value
+            expansion._set_arg_for(sentinel, value)
 
         return sentinel
 
@@ -1010,8 +1046,8 @@ def _build_ast(
                         # Check for sentinel patterns inside double quotes
                         # ONLY in replay mode (capture_fn is None).
                         if ch == '\x01' and capture_fn is None:
-                            m_arg = SENTINEL_ARG.match(raw, i)
-                            m_hd = SENTINEL_HD.match(raw, i)
+                            m_arg = _SENTINEL_ARG.match(raw, i)
+                            m_hd = _SENTINEL_HD.match(raw, i)
                             if m_arg:
                                 flush()
                                 raw_match = m_arg.group(0)
@@ -1052,8 +1088,8 @@ def _build_ast(
             # Check for sentinel patterns in unquoted text
             # ONLY in replay mode (capture_fn is None).
             if c == '\x01' and capture_fn is None:
-                m_arg = SENTINEL_ARG.match(raw, i)
-                m_hd = SENTINEL_HD.match(raw, i)
+                m_arg = _SENTINEL_ARG.match(raw, i)
+                m_hd = _SENTINEL_HD.match(raw, i)
                 if m_arg or m_hd:
                     flush()
                     parts.extend(_detect_sentinels_in_text(raw[i:]))
@@ -1244,14 +1280,14 @@ def _build_ast(
                     tgt = _peek()
                     if tgt is not None and tgt.kind == TokenKind.WORD:
                         tgt_text = tgt.value
-                        if SENTINEL_HD.fullmatch(tgt_text):
+                        if _SENTINEL_HD.fullmatch(tgt_text):
                             _consume()
                             sentinel = tgt_text
             else:  # R_HERESTRING
                 # _lex_herestring stores the target word in tok.body.
                 raw_target = tok.body or ""
                 target = _strip_quotes(raw_target)
-                if target and SENTINEL_HD.fullmatch(target):
+                if target and _SENTINEL_HD.fullmatch(target):
                     sentinel = target
                 elif not target:
                     # Empty target (e.g. "cmd <<<" with nothing after) —
@@ -1265,7 +1301,7 @@ def _build_ast(
 
             if sentinel is not None:
                 # Reuse — advance next_hd_id past this ID to avoid collisions
-                m = SENTINEL_HD.match(sentinel)
+                m = _SENTINEL_HD.match(sentinel)
                 assert m is not None
                 hd_id = int(m.group(1))
                 if hd_id >= next_hd_id:
@@ -1284,13 +1320,13 @@ def _build_ast(
                     if body and not tok.quoted_delim:
                         body = _expand_subst_in_text(body, capture_fn, env=env)
                     body = body[:MAX_HEREDOC_BODY] if body else ""
-                    expansion.heredoc_bodies[sentinel] = body
+                    expansion._set_heredoc_for(sentinel, body)
                 else:  # R_HERESTRING
                     body_word = _strip_quotes(tok.body) if tok.body else ""
                     if body_word and not tok.quoted_delim:
                         body_word = _expand_subst_in_text(body_word, capture_fn, env=env)
                     body = (body_word + "\n")[:MAX_HEREDOC_BODY]
-                    expansion.heredoc_bodies[sentinel] = body
+                    expansion._set_heredoc_for(sentinel, body)
 
             op_map = {
                 TokenKind.R_HEREDOC: "<<",
@@ -1657,7 +1693,7 @@ def _extract_from_node(
         resolved = ""
         for p in w.parts:
             if p.is_arg_sentinel and expansion is not None:
-                val = expansion.arg_values.get(p.text)
+                val = expansion.arg_for(p)
                 resolved += val if val is not None else p.text
             else:
                 resolved += p.text
@@ -1672,9 +1708,9 @@ def _extract_from_node(
         for p in rs.target.parts:
             if p.is_hd_sentinel and expansion is not None:
                 target_text += p.text
-                body = expansion.heredoc_bodies.get(p.text)
+                body = expansion.heredoc_for(p)
             elif p.is_arg_sentinel and expansion is not None:
-                val = expansion.arg_values.get(p.text)
+                val = expansion.arg_for(p)
                 target_text += val if val is not None else p.text
             else:
                 target_text += p.text
@@ -1770,7 +1806,7 @@ def parse_command(
     # Reject unsupported constructs (quote-aware scan)
     _check_unsupported(command)
 
-    expansion = Expansion(arg_values={}, heredoc_bodies={})
+    expansion = Expansion()
     tokens = Lexer(command).tokenize()
     program = _build_ast(
         tokens, expansion,

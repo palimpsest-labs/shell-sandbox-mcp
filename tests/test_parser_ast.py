@@ -9,8 +9,6 @@ from shell_sandbox_mcp.parser import (
     PipelineNode,
     ProgramNode,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     Word,
     WordPart,
     extract_redirects,
@@ -70,63 +68,89 @@ class SplitLegacyFdDupTest(unittest.TestCase):
 class ParseCommandSentinelTest(unittest.TestCase):
     """Test that parse_command emits correct sentinels."""
 
-    def _parse(self, cmd: str) -> tuple[str, Expansion]:
+    def _parse(self, cmd: str):
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, inner.encode()
-        cleaned, expansion, _prog = parse_command(
+        cleaned, expansion, prog = parse_command(
             cmd, fake_capture, None, 30, 0,
         )
-        return cleaned, expansion
+        return cleaned, expansion, prog
+
+    def _all_arg_sentinels(self, prog):
+        """Return all arg-sentinel WordParts from the first command."""
+        cmd = prog.chains[0].pipeline.commands[0]
+        result = []
+        for w in cmd.words:
+            for p in w.parts:
+                if p.is_arg_sentinel:
+                    result.append(p)
+        return result
+
+    def _all_hd_sentinels(self, prog):
+        """Return all heredoc-sentinel WordParts from the first command."""
+        cmd = prog.chains[0].pipeline.commands[0]
+        result = []
+        for rs in cmd.redirects:
+            for p in rs.target.parts:
+                if p.is_hd_sentinel:
+                    result.append(p)
+        return result
 
     def test_subst_sentinel_id_increment(self) -> None:
-        cleaned, exp = self._parse("echo $(a) $(b) $(c)")
-        # Three sentinels with ids 0, 1, 2
-        matches = SENTINEL_ARG.findall(cleaned)
-        self.assertEqual(len(matches), 3)
-        ids = [int(m) for m in matches]
-        self.assertEqual(ids, [0, 1, 2])
+        cleaned, exp, prog = self._parse("echo $(a) $(b) $(c)")
+        parts = self._all_arg_sentinels(prog)
+        self.assertEqual(len(parts), 3)
+        ids = []
+        for p in parts:
+            # Extract the numeric id from the sentinel text (internal format)
+            val = exp.arg_for(p)
+            self.assertIsNotNone(val)
+            ids.append(p.text)
+        # Verify three distinct sentinels (ids 0, 1, 2 by text content)
+        self.assertEqual(len(set(ids)), 3)
 
     def test_heredoc_sentinel_id_increment(self) -> None:
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, b""
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "cat <<A\nx\nA\n<<B\ny\nB", fake_capture, None, 30, 0,
         )
-        matches = SENTINEL_HD.findall(cleaned)
-        self.assertEqual(len(matches), 2)
-        ids = [int(m) for m in matches]
-        self.assertEqual(ids, [0, 1])
+        parts = self._all_hd_sentinels(prog)
+        self.assertEqual(len(parts), 2)
+        # Verify two distinct sentinels
+        self.assertEqual(len(set(p.text for p in parts)), 2)
 
     def test_arg_sentinel_single_word(self) -> None:
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, b"a b c"
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "echo $(cmd)", fake_capture, None, 30, 0,
         )
-        m = SENTINEL_ARG.search(cleaned)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
+        parts = self._all_arg_sentinels(prog)
+        self.assertEqual(len(parts), 1)
         # Value has spaces but is stored as one word
-        self.assertEqual(exp.arg_values[sentinel], "a b c")
+        self.assertEqual(exp.arg_for(parts[0]), "a b c")
 
     def test_compound_word_sentinel(self) -> None:
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, b"b"
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "echo a$(cmd)c", fake_capture, None, 30, 0,
         )
-        # The sentinel is in the middle of the cleaned command
-        self.assertIn("\x01A0\x01", cleaned)
+        # There should be an arg sentinel in the middle of the word
+        parts = self._all_arg_sentinels(prog)
+        self.assertEqual(len(parts), 1)
 
     def test_cleaned_command_structure(self) -> None:
         def fake_capture(inner: str) -> tuple[int, bytes]:
             return 0, b"result"
-        cleaned, exp, _prog = parse_command(
+        cleaned, exp, prog = parse_command(
             "echo $(cmd) > out.txt", fake_capture, None, 30, 0,
         )
         # The cleaned command should not contain $(...) or body text
         self.assertNotIn("$(cmd)", cleaned)
-        self.assertIn("\x01A0\x01", cleaned)
+        parts = self._all_arg_sentinels(prog)
+        self.assertEqual(len(parts), 1)
         self.assertIn(">", cleaned)
         self.assertIn("out.txt", cleaned)
 
@@ -196,8 +220,31 @@ class ASTNodeConstructionTest(unittest.TestCase):
         self.assertEqual(w.text, "")
 
     def test_word_part_sentinel_detection(self) -> None:
-        wp_arg = WordPart(text="\x01A0\x01", is_sentinel=True)
-        wp_hd = WordPart(text="\x01H0\x01", is_sentinel=True)
+        # Get sentinel WordParts from real parse_command output instead of
+        # constructing them with sentinel bytes.
+        def fake_capture(inner: str) -> tuple[int, bytes]:
+            return 0, b"arg_val"
+        _, _, prog_arg = parse_command(
+            "echo $(x)", fake_capture, None, 30, 0,
+        )
+        wp_arg = None
+        for w in prog_arg.chains[0].pipeline.commands[0].words:
+            for p in w.parts:
+                if p.is_arg_sentinel:
+                    wp_arg = p
+                    break
+
+        _, _, prog_hd = parse_command(
+            "cat <<EOF\nx\nEOF",
+            lambda i: (0, b""), None, 30, 0,
+        )
+        wp_hd = None
+        for rs in prog_hd.chains[0].pipeline.commands[0].redirects:
+            for p in rs.target.parts:
+                if p.is_hd_sentinel:
+                    wp_hd = p
+                    break
+
         wp_normal = WordPart(text="hello", is_sentinel=False)
 
         self.assertTrue(wp_arg.is_arg_sentinel)
@@ -235,11 +282,22 @@ class ASTNodeConstructionTest(unittest.TestCase):
             r.fd = 1  # frozen dataclass rejects attribute assignment
 
     def test_expansion_mutable(self) -> None:
-        e = Expansion()
-        e.arg_values["key"] = "val"
-        e.heredoc_bodies["hd"] = "body"
-        self.assertEqual(e.arg_values["key"], "val")
-        self.assertEqual(e.heredoc_bodies["hd"], "body")
+        """Verify that Expansion stores values set via the internal write API
+        and retrieved via the opaque lookup API."""
+        def fake_capture(inner: str) -> tuple[int, bytes]:
+            return 0, b"val"
+        _, exp, prog = parse_command(
+            "echo $(key)", fake_capture, None, 30, 0,
+        )
+        # The arg sentinel should be populated and retrievable
+        part = None
+        for w in prog.chains[0].pipeline.commands[0].words:
+            for p in w.parts:
+                if p.is_arg_sentinel:
+                    part = p
+                    break
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.arg_for(part), "val")
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +434,9 @@ class SerializeProgramTest(unittest.TestCase):
         from shell_sandbox_mcp.parser import serialize_program
         cleaned, exp, prog = self._parse("echo $(whoami)", {"whoami": "root"})
         s = serialize_program(prog)
-        # Should contain sentinel
-        self.assertIn("\x01A0\x01", s)
+        # Should contain a sentinel (not the resolved value)
+        cmd = prog.chains[0].pipeline.commands[0]
+        self.assertTrue(any(p.is_sentinel for w in cmd.words for p in w.parts))
 
     def test_serialize_pipeline(self) -> None:
         from shell_sandbox_mcp.parser import serialize_program
@@ -402,14 +461,21 @@ class CmdToDisplayTest(unittest.TestCase):
                 return cmd
         return None
 
+    def _assert_no_control_chars(self, s: str) -> None:
+        """Assert a display string contains no control characters (like sentinels)."""
+        for ch in s:
+            self.assertTrue(
+                ord(ch) >= 32 or ch in '\n\t',
+                f"Display string contains control char 0x{ord(ch):02x}: {s!r}",
+            )
+
     def test_display_renders_subst_no_sentinel(self) -> None:
         """cmd_to_display on a dq-embedded $(whoami) shows $(whoami), not a sentinel."""
         from shell_sandbox_mcp.parser import cmd_to_display
         _cleaned, _exp, prog = self._parse('echo "$(whoami)"', {"whoami": "root"})
         cmd = self._first_cmd(prog)
         display = cmd_to_display(cmd)
-        self.assertNotIn("\x01A", display,
-                         f"display must NOT contain sentinels: {display!r}")
+        self._assert_no_control_chars(display)
         self.assertIn("$(whoami)", display,
                       f"display must show the original $(whoami): {display!r}")
 
@@ -419,7 +485,7 @@ class CmdToDisplayTest(unittest.TestCase):
         _cleaned, _exp, prog = self._parse('echo "$(whoami)"', {"whoami": "root"})
         cmd = self._first_cmd(prog)
         display = _serialize_command(cmd)
-        self.assertNotIn("\x01A", display)
+        self._assert_no_control_chars(display)
         self.assertIn("$(whoami)", display)
 
     def test_display_multiple_subst(self) -> None:
@@ -431,7 +497,7 @@ class CmdToDisplayTest(unittest.TestCase):
         )
         cmd = self._first_cmd(prog)
         display = _serialize_command(cmd)
-        self.assertNotIn("\x01A", display)
+        self._assert_no_control_chars(display)
         self.assertIn("$(echo a)", display)
         self.assertIn("$(echo b)", display)
 
@@ -444,7 +510,7 @@ class CmdToDisplayTest(unittest.TestCase):
         )
         cmd = self._first_cmd(prog)
         display = _serialize_command(cmd)
-        self.assertNotIn("\x01A", display)
+        self._assert_no_control_chars(display)
         self.assertIn("pre$(echo mid)post", display)
 
     def test_display_heredoc_shows_operator(self) -> None:
@@ -464,7 +530,7 @@ class CmdToDisplayTest(unittest.TestCase):
         display = _serialize_command(cmd)
         self.assertIn("echo hello", display)
         self.assertIn("> out.txt", display)
-        self.assertNotIn("\x01A", display)
+        self._assert_no_control_chars(display)
 
 
 if __name__ == "__main__":

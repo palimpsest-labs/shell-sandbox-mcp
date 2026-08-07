@@ -19,8 +19,6 @@ from shell_sandbox_mcp.server import (
     InvocationError,
     ProgramNode,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     _expand_command,
     _capture_stdout,
     _extract_redirects,
@@ -33,6 +31,25 @@ from shell_sandbox_mcp.server import (
     MAX_SUBST_COUNT,
     MAX_SUBST_OUTPUT,
 )
+
+
+# AST helpers
+def _find_hd_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for rs in cmd.redirects:
+        for p in rs.target.parts:
+            if p.is_hd_sentinel:
+                return p
+    return None
+
+def _find_arg_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for w in cmd.words:
+        for p in w.parts:
+            if p.is_arg_sentinel:
+                return p
+    return None
+
 
 # ---------------------------------------------------------------------------
 # _extract_redirects
@@ -100,8 +117,6 @@ class ExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(redirs[0].target_fd, 2)
 
     def test_2gt1x_not_fd_dup(self) -> None:
-        # `2>&1x` — the `x` after `1` means this is a `2>` redirect to file
-        # `&1x`, NOT an fd-dup operator.
         args, redirs, err = self._extract("cmd 2>&1x")
         self.assertIsNone(err)
         self.assertEqual(args, ["cmd"])
@@ -111,8 +126,6 @@ class ExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(redirs[0].raw_target, "&1x")
 
     def test_1gt2y_not_fd_dup(self) -> None:
-        # `1>&2y` — the `y` after `2` means this is a `1>` redirect to file
-        # `&2y`, NOT an fd-dup operator.
         args, redirs, err = self._extract("cmd 1>&2y")
         self.assertIsNone(err)
         self.assertEqual(args, ["cmd"])
@@ -160,14 +173,12 @@ class ExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(redirs[1].target_fd, 2)
 
     def test_glued_not_redirect(self) -> None:
-        # foo>bar — > is not at word boundary, treated as literal
         args, redirs, err = self._extract("echo foo>bar")
         self.assertIsNone(err)
         self.assertEqual(args, ["echo", "foo>bar"])
         self.assertEqual(len(redirs), 0)
 
     def test_glued_target_ok(self) -> None:
-        # >out.txt — > is at word start, out.txt is glued target
         args, redirs, err = self._extract(">out.txt echo hi")
         self.assertIsNone(err)
         self.assertEqual(args, ["echo", "hi"])
@@ -191,7 +202,6 @@ class ExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(err, "Redirects only support fds 1 and 2 (got 0)")
 
     def test_2gt3_error(self) -> None:
-        # 2>&3 — only 1 and 2 are valid dup target fds.
         args, redirs, err = self._extract("cmd 2>&3")
         self.assertEqual(err, "Redirect dup target fd must be 1 or 2")
 
@@ -218,24 +228,33 @@ class ExtractRedirectsTest(unittest.TestCase):
         self.assertEqual(err, "Input redirect missing target file")
 
     def test_input_redirect_then_heredoc_rejected(self) -> None:
-        expansion = Expansion(arg_values={}, heredoc_bodies={"\x01H0\x01": "body\n"})
-        args, redirs, err = server._extract_redirects(
-            "cmd < file << \x01H0\x01", expansion=expansion,
-        )
+        # Parse a heredoc to get a real expansion + AST with sentinel
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<EOF\nbody\nEOF", wd, 30, 0,
+            )
+        # Use AST path for extract_redirects — assemble a combined command
+        heredoc_tail = cleaned[len("cat "):]  # "<< \x01H0\x01" at runtime
+        test_cmd = "cmd < file " + heredoc_tail
+        args, redirs, err = server._extract_redirects(test_cmd, expansion=exp)
         self.assertIsNotNone(err)
         self.assertIn("Multiple stdin redirects", err)
 
     def test_heredoc_then_input_rejected(self) -> None:
-        expansion = Expansion(arg_values={}, heredoc_bodies={"\x01H0\x01": "body\n"})
-        args, redirs, err = server._extract_redirects(
-            "cmd << \x01H0\x01 < file", expansion=expansion,
-        )
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<EOF\nbody\nEOF", wd, 30, 0,
+            )
+        heredoc_tail = cleaned[len("cat "):]
+        test_cmd = "cmd " + heredoc_tail + " < file"
+        args, redirs, err = server._extract_redirects(test_cmd, expansion=exp)
         self.assertIsNotNone(err)
         self.assertIn("Multiple stdin redirects", err)
 
     def test_input_heredoc_error(self) -> None:
         args, redirs, err = self._extract("cmd << EOF")
-        # Without expansion, bare << with non-sentinel target cannot resolve
         self.assertIn("not found", err)
 
     def test_unbalanced_quotes_error(self) -> None:
@@ -347,7 +366,6 @@ class ValidateRedirectPathsTest(unittest.TestCase):
         self.assertEqual(validated[0].target_path, str(Path("/tmp/input-redir-test").resolve()))
 
     def test_input_redirect_symlink_escape(self) -> None:
-        # A symlink under /tmp pointing outside /tmp must be rejected.
         link = Path("/tmp/input-redir-symlink-test")
         try:
             link.symlink_to("/etc/passwd")
@@ -524,8 +542,6 @@ class RunSegmentRedirectTest(unittest.TestCase):
         self.assertIn("[stderr -> stdout]", out)
 
     def test_2gt1_then_stdout_redirect_snapshots(self) -> None:
-        # `2>&1 >file`: stderr must be bound to the ORIGINAL stdout (a shared
-        # pipe), not dragged into `file` by the later stdout redirect.
         import subprocess as _sp
 
         outfile = self.root / "out.txt"
@@ -558,22 +574,19 @@ class RunSegmentRedirectTest(unittest.TestCase):
         self.assertIn("[stderr -> stdout]", out)
 
     def test_redirect_target_symlink_rejected(self) -> None:
-        # O_NOFOLLOW: a redirect target that is a symlink (even inside the
-        # work dir) must not be followed when opening for output.
         target = self.root / "real.txt"
         link = self.root / "out.txt"
         link.symlink_to(target)
         self._stub_build([
             server.Redirect(fd=1, op='>', target_path=str(link), target_fd=None, raw_target='out.txt'),
         ])
+        import subprocess as _sp
         def fake_run(args, **kwargs):
             return _sp.CompletedProcess(args, 1, stdout=None, stderr=None)
         server.subprocess.run = fake_run
         rc, out = server._run_segment("testcmd", self.root, 10)
-        # The open should raise (ELOOP), surfaced as a clean error -> rc 1.
         self.assertEqual(rc, 1)
         self.assertIn("Error opening redirect target", out)
-        # The symlink target must NOT have been created/truncated.
         self.assertFalse(target.exists())
 
 # ---------------------------------------------------------------------------
@@ -642,8 +655,6 @@ class RunPipelineRedirectTest(unittest.TestCase):
 
         server._build_invocation = fake_build
 
-        # Stub Popen to simulate a successful pipeline.
-        # Both stdout and stderr are fake pipes with close()/read().
         class _FakePipe:
             def close(self):
                 pass
@@ -762,10 +773,11 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         and fail with "Heredoc body not found".
         """
         self._stub_popen()
-        expansion = Expansion(
-            arg_values={},
-            heredoc_bodies={"\x01H0\x01": "hello\n"},
+        # Parse a heredoc to get a real expansion + AST
+        expanded, exp, prog = _expand_command(
+            "cat <<EOF\nhello\nEOF", self.root, 30, 0,
         )
+        cmd_node = prog.chains[0].pipeline.commands[0]
         received = {}
 
         def fake_build(command, work_dir, expansion=None):
@@ -779,12 +791,13 @@ class RunBackgroundRedirectTest(unittest.TestCase):
             )
 
         server._build_invocation = fake_build
+        # Pass CommandNode directly — no sentinel string reconstruction
         rc, out = server._run_background(
-            [f"cat << \x01H0\x01"], self.root, expansion=expansion,
+            [cmd_node], self.root, expansion=exp,
         )
         self.assertEqual(rc, 0)
         self.assertIn("Backgrounded PID", out)
-        self.assertIs(received["expansion"], expansion)
+        self.assertIs(received["expansion"], exp)
 
     def test_background_command_substitution_resolves(self) -> None:
         """$() sentinels resolve via expansion in backgrounded commands."""
@@ -807,9 +820,20 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         server.subprocess.Popen = RecPopen
         server._start_reaper = lambda: None
 
-        expansion = Expansion(arg_values={"\x01A0\x01": "world"}, heredoc_bodies={})
+        # Parse a subst to get a real expansion + AST
+        def fake_capture(inner, *args, **kwargs):
+            return 0, b"world"
+        orig = server._capture_stdout
+        server._capture_stdout = fake_capture
+        try:
+            expanded, exp, prog = _expand_command(
+                "echo $(echo world)", self.root, 30, 0,
+            )
+        finally:
+            server._capture_stdout = orig
+        cmd_node = prog.chains[0].pipeline.commands[0]
         rc, out = server._run_background(
-            [f"echo \x01A0\x01"], self.root, expansion=expansion,
+            [cmd_node], self.root, expansion=exp,
         )
         self.assertEqual(rc, 0)
         self.assertIn("Backgrounded PID", out)
@@ -819,7 +843,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
     def test_background_heredoc_on_non_first_stage_rejected(self) -> None:
         """Non-first pipeline stage heredoc is rejected in background mode."""
         def fake_build(command, work_dir, expansion=None):
-            if "echo" in command:
+            if isinstance(command, str) and "echo" in command:
                 return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "echo", "hi"],
@@ -827,7 +851,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
                     {},
                     [],
                 )
-            if "cat" in command:
+            if isinstance(command, str) and "cat" in command:
                 return server.Invocation(
                     str(server.BUSYBOX_BIN.resolve()),
                     [str(server.BUSYBOX_BIN.resolve()), "cat"],
@@ -891,30 +915,6 @@ class RunBackgroundRedirectTest(unittest.TestCase):
 # Heredoc / here-string / command substitution tests (moved from test_expand.py)
 # ---------------------------------------------------------------------------
 
-from shell_sandbox_mcp.server import (
-    CommandNode,
-    EmptyInvocation,
-    Expansion,
-    FdPlan,
-    Invocation,
-    InvocationError,
-    ProgramNode,
-    Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
-    _expand_command,
-    _capture_stdout,
-    _extract_redirects,
-    _build_invocation,
-    _resolve_fd_targets,
-    _run_segment_core,
-    _run_pipeline_core,
-    _serialize_command,
-    MAX_SUBST_DEPTH,
-    MAX_SUBST_COUNT,
-    MAX_SUBST_OUTPUT,
-)
-
 class ExtractRedirectsHeredocTest(unittest.TestCase):
     """Test heredoc/here-string sentinel resolution in _extract_redirects."""
 
@@ -922,11 +922,15 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
         return server._extract_redirects(segment, expansion)
 
     def test_herestring_sentinel(self) -> None:
-        expansion = Expansion(
-            arg_values={},
-            heredoc_bodies={"\x01H0\x01": "hello\n"},
-        )
-        args, redirs, err = self._extract("cat <<< \x01H0\x01", expansion)
+        # Parse a here-string to get a real expansion + AST + cleaned string
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<<'hello'\n", wd, 30, 0,
+            )
+        # The cleaned string has "<<< \x01H0\x01" — use AST path
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
         self.assertEqual(args, ["cat"])
         self.assertEqual(len(redirs), 1)
@@ -935,11 +939,13 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
         self.assertEqual(redirs[0].body, "hello\n")
 
     def test_heredoc_sentinel(self) -> None:
-        expansion = Expansion(
-            arg_values={},
-            heredoc_bodies={"\x01H0\x01": "line1\nline2\n"},
-        )
-        args, redirs, err = self._extract("cat << \x01H0\x01", expansion)
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<EOF\nline1\nline2\nEOF", wd, 30, 0,
+            )
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
         self.assertEqual(args, ["cat"])
         self.assertEqual(len(redirs), 1)
@@ -948,11 +954,13 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
         self.assertEqual(redirs[0].body, "line1\nline2\n")
 
     def test_heredoc_tab_strip_sentinel(self) -> None:
-        expansion = Expansion(
-            arg_values={},
-            heredoc_bodies={"\x01H0\x01": "line1\n"},
-        )
-        args, redirs, err = self._extract("cat <<- \x01H0\x01", expansion)
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<-EOF\n\tline1\n\tEOF", wd, 30, 0,
+            )
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
         self.assertEqual(args, ["cat"])
         self.assertEqual(len(redirs), 1)
@@ -962,11 +970,21 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
         self.assertTrue(redirs[0].strip_tabs)
 
     def test_arg_sentinel_resolved(self) -> None:
-        expansion = Expansion(
-            arg_values={"\x01A0\x01": "hello world"},
-            heredoc_bodies={},
-        )
-        args, redirs, err = self._extract("echo \x01A0\x01", expansion)
+        # Parse a subst to get a real expansion + AST
+        def fake_capture(inner, *args, **kwargs):
+            return 0, b"hello world"
+        orig = server._capture_stdout
+        server._capture_stdout = fake_capture
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                cleaned, exp, prog = _expand_command(
+                    "echo $(echo 'hello world')", wd, 30, 0,
+                )
+        finally:
+            server._capture_stdout = orig
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
         # Arg sentinel should be resolved to the single word "hello world"
         self.assertEqual(args, ["echo", "hello world"])
@@ -974,53 +992,111 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
 
     def test_compound_word_sentinel_resolved(self) -> None:
         """A sentinel embedded mid-word is resolved: echo a$(echo b)c -> abc."""
-        expansion = Expansion(
-            arg_values={"\x01A0\x01": "b"},
-            heredoc_bodies={},
-        )
-        args, redirs, err = self._extract("echo a\x01A0\x01c", expansion)
+        def fake_capture(inner, *args, **kwargs):
+            return 0, b"b"
+        orig = server._capture_stdout
+        server._capture_stdout = fake_capture
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                cleaned, exp, prog = _expand_command(
+                    "echo a$(echo b)c", wd, 30, 0,
+                )
+        finally:
+            server._capture_stdout = orig
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
         self.assertEqual(args, ["echo", "abc"])
 
     def test_compound_word_multiple_sentinels_resolved(self) -> None:
         """Multiple sentinels in one word are each substituted in place."""
-        expansion = Expansion(
-            arg_values={"\x01A0\x01": "x", "\x01A1\x01": "y"},
-            heredoc_bodies={},
-        )
-        args, redirs, err = self._extract("echo \x01A0\x01-\x01A1\x01", expansion)
+        def fake_capture(inner, *args, **kwargs):
+            # Map inner commands to short values matching old test expectations
+            mapping = {"echo x": "x", "echo y": "y"}
+            return 0, mapping.get(inner, inner).encode()
+        orig = server._capture_stdout
+        server._capture_stdout = fake_capture
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                cleaned, exp, prog = _expand_command(
+                    "echo $(echo x)-$(echo y)", wd, 30, 0,
+                )
+        finally:
+            server._capture_stdout = orig
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
         self.assertEqual(args, ["echo", "x-y"])
 
     def test_arg_sentinel_spaces_preserved(self) -> None:
-        expansion = Expansion(
-            arg_values={"\x01A0\x01": "a b c"},
-            heredoc_bodies={},
-        )
-        args, redirs, err = self._extract("printf %s \x01A0\x01", expansion)
+        def fake_capture(inner, *args, **kwargs):
+            return 0, b"a b c"
+        orig = server._capture_stdout
+        server._capture_stdout = fake_capture
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                cleaned, exp, prog = _expand_command(
+                    "printf %s $(echo 'a b c')", wd, 30, 0,
+                )
+        finally:
+            server._capture_stdout = orig
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
         self.assertEqual(args, ["printf", "%s", "a b c"])
 
     def test_arg_sentinel_in_redirect_target(self) -> None:
-        expansion = Expansion(
-            arg_values={"\x01A0\x01": "out.txt"},
-            heredoc_bodies={},
+        # Parse a $() substitution to get a real sentinel WordPart + Expansion.
+        def fake_capture(inner, *args, **kwargs):
+            return 0, b"out.txt"
+        orig = server._capture_stdout
+        server._capture_stdout = fake_capture
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wd = Path(td)
+                cleaned, exp, prog = _expand_command(
+                    "echo $(echo out.txt)", wd, 30, 0,
+                )
+        finally:
+            server._capture_stdout = orig
+        # Extract the sentinel WordPart from the AST
+        sentinel_part = None
+        for w in prog.chains[0].pipeline.commands[0].words:
+            for p in w.parts:
+                if p.is_arg_sentinel:
+                    sentinel_part = p
+                    break
+        self.assertIsNotNone(sentinel_part)
+        self.assertEqual(exp.arg_for(sentinel_part), "out.txt")
+
+        # Build a synthetic CommandNode with the sentinel as a redirect target
+        from shell_sandbox_mcp.parser import (
+            CommandNode, RedirectSpec, Word, WordPart,
         )
-        args, redirs, err = self._extract("echo hi > \x01A0\x01", expansion)
+        cmd = CommandNode(
+            words=(Word(parts=(WordPart(text="echo"),)), Word(parts=(WordPart(text="hi"),))),
+            redirects=(
+                RedirectSpec(fd=1, op=">", target=Word(parts=(sentinel_part,))),
+            ),
+        )
+        args, redirs, err = self._extract(cmd, exp)
         self.assertIsNone(err)
         self.assertEqual(args, ["echo", "hi"])
         self.assertEqual(len(redirs), 1)
         self.assertEqual(redirs[0].raw_target, "out.txt")
 
     def test_multiple_stdin_redirects_rejected(self) -> None:
-        expansion = Expansion(
-            arg_values={},
-            heredoc_bodies={
-                "\x01H0\x01": "body1\n",
-                "\x01H1\x01": "body2\n",
-            },
-        )
-        args, redirs, err = self._extract("cat << \x01H0\x01 << \x01H1\x01", expansion)
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<A\nb1\nA\n<<B\nb2\nB", wd, 30, 0,
+            )
+        # Use AST path which has both heredoc sentinels
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNotNone(err)
         self.assertIn("Multiple stdin redirects", err)
 
@@ -1034,21 +1110,39 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
         self.assertEqual(redirs[0].raw_target, "file")
 
     def test_heredoc_body_not_found_error(self) -> None:
-        args, redirs, err = self._extract("cat << \x01H99\x01")
+        # Parse a heredoc to get a real CommandNode + expansion
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<EOF\nbody\nEOF", wd, 30, 0,
+            )
+        # Test with an EMPTY expansion — body won't be found
+        empty_exp = server.Expansion()
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, empty_exp)
         self.assertIsNotNone(err)
         self.assertIn("Heredoc body not found", err)
 
     def test_herestring_body_not_found_error(self) -> None:
-        args, redirs, err = self._extract("cat <<< \x01H99\x01")
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            cleaned, exp, prog = _expand_command(
+                "cat <<<hello", wd, 30, 0,
+            )
+        empty_exp = server.Expansion()
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        args, redirs, err = self._extract(cmd_node, empty_exp)
         self.assertIsNotNone(err)
         self.assertIn("Here-string body not found", err)
 
     def test_arg_sentinel_not_in_expansion_returns_literal(self) -> None:
-        # Without expansion, sentinel passes through as literal
-        args, redirs, err = self._extract("echo \x01A0\x01")
+        # Without expansion, $(...) is parsed into a sentinel in replay mode.
+        # Since the expansion is empty, the sentinel text passes through literally.
+        args, redirs, err = self._extract("echo $(whoami)")
         self.assertIsNone(err)
-        self.assertEqual(args, ["echo", "\x01A0\x01"])
-
+        # The sentinel (not the original text) appears in args
+        self.assertNotIn("$(whoami)", args)
+        self.assertEqual(len(args), 2)
 
 
 if __name__ == "__main__":

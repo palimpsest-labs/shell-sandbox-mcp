@@ -19,8 +19,6 @@ from shell_sandbox_mcp.server import (
     InvocationError,
     ProgramNode,
     Redirect,
-    SENTINEL_ARG,
-    SENTINEL_HD,
     _expand_command,
     _capture_stdout,
     _extract_redirects,
@@ -33,6 +31,28 @@ from shell_sandbox_mcp.server import (
     MAX_SUBST_COUNT,
     MAX_SUBST_OUTPUT,
 )
+
+
+# ---------------------------------------------------------------------------
+# AST helpers for opaque lookups
+# ---------------------------------------------------------------------------
+
+def _find_hd_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for rs in cmd.redirects:
+        for p in rs.target.parts:
+            if p.is_hd_sentinel:
+                return p
+    return None
+
+def _find_arg_sentinel(prog):
+    cmd = prog.chains[0].pipeline.commands[0]
+    for w in cmd.words:
+        for p in w.parts:
+            if p.is_arg_sentinel:
+                return p
+    return None
+
 
 # ---------------------------------------------------------------------------
 # _run_pipeline real-subprocess orchestration
@@ -55,7 +75,7 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _fake_build(self, mapping: dict[str, server.Invocation]):
-        def fake(command: str, work_dir, expansion=None):
+        def fake(command, work_dir, expansion=None):
             return mapping.get(command, server.EmptyInvocation())
 
         server._build_invocation = fake
@@ -70,10 +90,6 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         self.assertEqual(out, "6")  # "hello\n" is 6 bytes
 
     def test_upstream_keeps_running_is_reaped(self) -> None:
-        # The last stage (head) exits immediately, but the producer loops
-        # writing to stderr forever. The orchestration must kill+reap the
-        # upstream stage and still return promptly without hanging or racing
-        # on the stderr buffer.
         self._fake_build({
             "producer": server.Invocation(
                 "/bin/sh",
@@ -90,8 +106,6 @@ class RunPipelineIntegrationTest(unittest.TestCase):
         self.assertIn("[stderr]", out)
 
     def test_pipeline_timeout_kills_stages(self) -> None:
-        # A last stage that never exits must be killed and reported as a
-        # timeout rather than hanging the tool.
         self._fake_build({
             "producer": server.Invocation("/bin/echo", ["/bin/echo", "hi"], None, {}, []),
             "consumer": server.Invocation(
@@ -142,103 +156,91 @@ class ExpandCommandTest(unittest.TestCase):
 
     def test_unquoted_heredoc(self) -> None:
         cmd = "cat <<EOF\nhello\nworld\nEOF"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
         # Should contain << + sentinel
         self.assertIn("<<", expanded)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertIn(sentinel, exp.heredoc_bodies)
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\nworld\n")
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello\nworld\n")
 
     def test_single_quoted_delimiter_no_expansion(self) -> None:
         self._stub_capture({"echo hi": "hi"})
         cmd = "cat <<'EOF'\n$(echo hi)\nEOF"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
         # Body should be literal $(echo hi), not expanded
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
         self.assertEqual(len(self.captures), 0)  # no $() expansion triggered
 
     def test_unquoted_heredoc_expands_dollar_paren(self) -> None:
         self._stub_capture({"echo hello": "hello"})
         cmd = "cat <<EOF\n$(echo hello)\nEOF"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
 
     def test_escaped_dollar_paren_in_heredoc_not_expanded(self) -> None:
         """A backslash-escaped $() in an unquoted heredoc body stays literal."""
         self._stub_capture({"echo hi": "hi"})
         cmd = "cat <<EOF\n\\$(echo hi)\nEOF"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "\\$(echo hi)\n")
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "\\$(echo hi)\n")
         self.assertEqual(len(self.captures), 0)  # no $() expansion triggered
 
     def test_heredoc_tab_strip(self) -> None:
         cmd = "cat <<-EOF\n\t\thello\n\tEOF"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
         self.assertIn("<<-", expanded)
         # Body should have ALL leading tabs stripped
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
 
     def test_herestring_unquoted(self) -> None:
         cmd = "cat <<<hello"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello\n")
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello\n")
         self.assertIn("<<<", expanded)
 
     def test_herestring_quoted(self) -> None:
         cmd = "cat <<<'hello world'"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hello world\n")
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hello world\n")
 
     def test_herestring_expands_dollar_paren_unless_single_quoted(self) -> None:
         self._stub_capture({"echo hi": "hi"})
         # Unquoted here-string with $()
         cmd = "cat <<<$(echo hi)"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "hi\n")
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "hi\n")
 
         # Single-quoted here-string with $() — no expansion
         self.captures.clear()
         cmd2 = "cat <<<'$(echo hi)'"
-        expanded2, exp2, _program2 = _expand_command(cmd2, self.work_dir, 30, 0)
-        m2 = SENTINEL_HD.search(expanded2)
-        self.assertIsNotNone(m2)
-        sentinel2 = f"\x01H{m2.group(1)}\x01"
-        self.assertEqual(exp2.heredoc_bodies[sentinel2], "$(echo hi)\n")
+        expanded2, exp2, prog2 = _expand_command(cmd2, self.work_dir, 30, 0)
+        part2 = _find_hd_sentinel(prog2)
+        self.assertIsNotNone(part2)
+        self.assertEqual(exp2.heredoc_for(part2), "$(echo hi)\n")
         self.assertEqual(len(self.captures), 0)
 
     def test_command_substitution_sentinel(self) -> None:
         self._stub_capture({"echo hello": "hello"})
         cmd = "echo $(echo hello)"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
         # Should contain arg sentinel
-        m = SENTINEL_ARG.search(expanded)
-        self.assertIsNotNone(m)
-        sentinel = f"\x01A{m.group(1)}\x01"
-        self.assertIn(sentinel, exp.arg_values)
-        self.assertEqual(exp.arg_values[sentinel], "hello")
+        part = _find_arg_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.arg_for(part), "hello")
         # The expanded command should have "echo <sentinel>"
         self.assertTrue(expanded.startswith("echo "))
 
@@ -246,11 +248,7 @@ class ExpandCommandTest(unittest.TestCase):
         outputs = {"echo inner": "inner", "echo $(echo inner)": "outer"}
         self._stub_capture(outputs)
         cmd = "echo $(echo $(echo inner))"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        # The outer $() captures "echo $(echo inner)" since the inner $()
-        # is inside the outer $(), and the outer _capture_stdout call is what
-        # triggers the recursive expansion (via its own _expand_command call).
-        # The stub short-circuits that.
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
         self.assertIn("echo $(echo inner)", self.captures)
 
     def test_unbalanced_dollar_paren_error(self) -> None:
@@ -265,17 +263,11 @@ class ExpandCommandTest(unittest.TestCase):
         self.assertIn("not found", str(ctx.exception))
 
     def test_depth_limit(self) -> None:
-        # Do NOT stub _capture_stdout — the depth check must fire.
-        # Pass depth=MAX_SUBST_DEPTH so that when _expand_command encounters $()
-        # it calls _capture_stdout with depth+1 = MAX_SUBST_DEPTH+1 which
-        # triggers the limit.
         with self.assertRaises(ValueError) as ctx:
             _expand_command("echo $(echo A)", self.work_dir, 30, MAX_SUBST_DEPTH)
         self.assertIn("depth", str(ctx.exception).lower())
 
     def test_count_limit(self) -> None:
-        # Do NOT stub _capture_stdout — the count check must fire.
-        # Create many $() substitutions to exceed MAX_SUBST_COUNT.
         parts = ["$(echo {})".format(i) for i in range(MAX_SUBST_COUNT + 5)]
         cmd = "echo " + " ".join(parts)
         with self.assertRaises(ValueError) as ctx:
@@ -284,19 +276,19 @@ class ExpandCommandTest(unittest.TestCase):
 
     def test_quotes_inside_heredoc_body_preserved(self) -> None:
         cmd = "cat <<EOF\nline with \"quotes\" and 'apostrophes'\nEOF"
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        sentinel = f"\x01H{m.group(1)}\x01"
-        self.assertEqual(exp.heredoc_bodies[sentinel], "line with \"quotes\" and 'apostrophes'\n")
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
+        self.assertEqual(exp.heredoc_for(part), "line with \"quotes\" and 'apostrophes'\n")
 
     def test_double_quoted_delimiter_no_expansion(self) -> None:
         self._stub_capture({"echo hi": "hi"})
         cmd = 'cat <<"EOF"\n$(echo hi)\nEOF'
-        expanded, exp, _program = _expand_command(cmd, self.work_dir, 30, 0)
-        m = SENTINEL_HD.search(expanded)
-        sentinel = f"\x01H{m.group(1)}\x01"
+        expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+        part = _find_hd_sentinel(prog)
+        self.assertIsNotNone(part)
         # Body should be literal $(echo hi), not expanded
-        self.assertEqual(exp.heredoc_bodies[sentinel], "$(echo hi)\n")
+        self.assertEqual(exp.heredoc_for(part), "$(echo hi)\n")
 
 class CaptureStdoutTest(unittest.TestCase):
     """Test _capture_stdout with stubbed segment/pipeline cores."""
@@ -452,13 +444,13 @@ class BuildInvocationHeredocTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_heredoc_redirect_passed_through(self) -> None:
-        expansion = Expansion(
-            arg_values={},
-            heredoc_bodies={"\x01H0\x01": "body\n"},
+        # Parse a heredoc to get a real expansion + AST CommandNode
+        expanded, exp, prog = _expand_command(
+            "cat <<EOF\nbody\nEOF", self.root, 30, 0,
         )
-        inv = _build_invocation(
-            "cat << \x01H0\x01", self.root, expansion=expansion,
-        )
+        cmd_node = prog.chains[0].pipeline.commands[0]
+        # Feed the CommandNode directly — no sentinel string reconstruction
+        inv = _build_invocation(cmd_node, self.root, expansion=exp)
         self.assertIsInstance(inv, Invocation)
         self.assertEqual(len(inv.redirects), 1)
         self.assertEqual(inv.redirects[0].fd, 0)
@@ -621,7 +613,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                 return b""
 
         def fake_build(command, work_dir, expansion=None):
-            if "cat" in command:
+            if isinstance(command, str) and "cat" in command:
                 return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
@@ -629,7 +621,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     {},
                     [Redirect(fd=0, op="<<", body="hello\n")],
                 )
-            if "grep" in command:
+            if isinstance(command, str) and "grep" in command:
                 return Invocation(
                     "/usr/bin/grep",
                     ["/usr/bin/grep", "x"],
@@ -654,7 +646,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
     def test_heredoc_on_non_first_stage_rejected(self) -> None:
         """Non-first stage with heredoc should be rejected."""
         def fake_build(command, work_dir, expansion=None):
-            if "echo" in command:
+            if isinstance(command, str) and "echo" in command:
                 return Invocation(
                     "/usr/bin/echo",
                     ["/usr/bin/echo", "hi"],
@@ -662,7 +654,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     {},
                     [],
                 )
-            if "cat" in command:
+            if isinstance(command, str) and "cat" in command:
                 return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
@@ -712,7 +704,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                 return b""
 
         def fake_build(command, work_dir, expansion=None):
-            if "cat" in command:
+            if isinstance(command, str) and "cat" in command:
                 return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
@@ -720,7 +712,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     {},
                     [Redirect(fd=0, op="<", raw_target=str(infile), target_path=str(infile))],
                 )
-            if "grep" in command:
+            if isinstance(command, str) and "grep" in command:
                 return Invocation(
                     "/usr/bin/grep",
                     ["/usr/bin/grep", "x"],
@@ -740,14 +732,11 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
         # First stage stdin must be the open file object, not a pipe.
         self.assertIsNot(captured_stdins[0], subprocess.PIPE)
         self.assertIsNotNone(captured_stdins[0])
-        # The returned report is the LAST stage's; the first stage's stdin
-        # report line must still have been produced internally (checked by
-        # the file-object stdin above).
 
     def test_input_redirect_on_non_first_stage_rejected(self) -> None:
         """< file on a non-first stage is rejected like a heredoc."""
         def fake_build(command, work_dir, expansion=None):
-            if "echo" in command:
+            if isinstance(command, str) and "echo" in command:
                 return Invocation(
                     "/usr/bin/echo",
                     ["/usr/bin/echo", "hi"],
@@ -755,7 +744,7 @@ class RunPipelineCoreStdinTest(unittest.TestCase):
                     {},
                     [],
                 )
-            if "cat" in command:
+            if isinstance(command, str) and "cat" in command:
                 return Invocation(
                     "/usr/bin/cat",
                     ["/usr/bin/cat"],
