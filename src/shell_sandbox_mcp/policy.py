@@ -303,6 +303,11 @@ COMMANDS = {
         # (the interpreter is dynamically linked, unlike the self-contained
         # cosmo APE).
         "extra_unveil_rx": _python_musl_paths,
+        # Set SSL_CERT_FILE so the vendored musl CPython can verify TLS
+        # certificates from any cwd (its default CA bundle is under the
+        # vendored deps/ tree, which is not unveiled; /etc/ssl is already
+        # unveiled read-only by sandbox.c).
+        "env": {"SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"},
     },
     "file": {
         "binary": str(REPO_ROOT / "bin" / "cosmo" / "file"),
@@ -324,6 +329,15 @@ BUSYBOX_APPLETS = [
     "id", "date", "env", "seq", "shuf", "xargs", "unzip",
     "true", "false", "sleep",
 ]
+
+# Base pledges for busybox applets.  Override per applet below for applets
+# that need extra syscalls (fattr for utimensat, proc/prot_exec for spawning).
+_BUSYBOX_BASE_PROMISES = "stdio rpath wpath cpath"
+
+# Per-applet promise suffix overrides (appended to _BUSYBOX_BASE_PROMISES).
+_BUSYBOX_PROMISE_OVERRIDES: dict[str, str] = {
+    "touch": " fattr",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +403,7 @@ def _maybe_venv_cfg(
         "is_venv": True,
         "pythonpath_extra": COMMANDS["python3"].get("pythonpath_extra", []),
         "extra_unveil_rx": COMMANDS["python3"].get("extra_unveil_rx"),
+        "env": dict(COMMANDS["python3"].get("env", {})),
     }
 
 
@@ -425,6 +440,7 @@ def _resolve_venv_fallback(
         "is_venv": True,
         "pythonpath_extra": COMMANDS["python3"].get("pythonpath_extra", []),
         "extra_unveil_rx": COMMANDS["python3"].get("extra_unveil_rx"),
+        "env": dict(COMMANDS["python3"].get("env", {})),
     }
 
 
@@ -449,9 +465,10 @@ def _resolve_command(
 
     # Check if it's a busybox applet alias
     if cmd_name in BUSYBOX_APPLETS:
-        cfg = {
+        promises = _BUSYBOX_BASE_PROMISES + _BUSYBOX_PROMISE_OVERRIDES.get(cmd_name, "")
+        cfg: dict = {
             "binary": str(BUSYBOX_BIN.resolve()),
-            "promises": "stdio rpath wpath cpath",
+            "promises": promises,
             "description": f"BusyBox {cmd_name}",
         }
         binary = cfg["binary"]

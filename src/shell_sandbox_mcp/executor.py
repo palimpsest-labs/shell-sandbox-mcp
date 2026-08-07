@@ -202,6 +202,9 @@ def _build_invocation(
 
     env: dict[str, str] = dict(shell_env) if shell_env is not None else _base_env()  # allowlisted base
     env.update(unveil_env)                      # SANDBOX_*, PYTHON*, GIT_*
+    # Apply per-command fixed subprocess env (e.g. SSL_CERT_FILE for
+    # python3 so the vendored CPython can verify TLS from any cwd).
+    env.update(cfg.get("env") or {})
 
     # Optionally prepend a directory to PATH (e.g. so build commands resolve a
     # busybox `mv` from the vendored toolchain instead of GNU /usr/bin/mv).

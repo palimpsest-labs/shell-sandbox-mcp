@@ -228,6 +228,47 @@ class NoPledgeFlagTest(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Busybox per-applet promise overrides
+# ---------------------------------------------------------------------------
+
+
+class BusyboxPromiseOverridesTest(unittest.TestCase):
+    """Test that _resolve_command returns correct promises for busybox applets
+    with overrides (touch gets fattr; xargs/find stay at base promises)."""
+
+    def test_touch_has_fattr(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["touch"])
+        self.assertIn("fattr", cfg["promises"])
+        self.assertNotIn("proc", cfg["promises"])
+        self.assertNotIn("git_subprocess_aware", cfg)
+
+    def test_xargs_base_promises_only(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["xargs"])
+        self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
+        self.assertNotIn("git_subprocess_aware", cfg)
+
+    def test_find_base_promises_only(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["find"])
+        self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
+        self.assertNotIn("git_subprocess_aware", cfg)
+
+    def test_cat_has_base_promises_only(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["cat"])
+        self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
+        self.assertNotIn("git_subprocess_aware", cfg)
+
+    def test_grep_has_base_promises_only(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["grep"])
+        self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
+        self.assertNotIn("git_subprocess_aware", cfg)
+
+    def test_mkdir_has_base_promises_only(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["mkdir"])
+        self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
+        self.assertNotIn("git_subprocess_aware", cfg)
+
+
 
 if __name__ == "__main__":
     unittest.main()

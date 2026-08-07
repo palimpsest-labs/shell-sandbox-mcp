@@ -775,10 +775,8 @@ class BuildInvocationNoPledgeTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self._orig_stage = server._stage_git_global_config
 
     def tearDown(self) -> None:
-        server._stage_git_global_config = self._orig_stage
         self._tmp.cleanup()
 
     def test_build_invocation_git_sets_no_pledge_env(self) -> None:
@@ -788,12 +786,16 @@ class BuildInvocationNoPledgeTest(unittest.TestCase):
         def fake_stage():
             return fake_config
 
+        orig_stage = server._stage_git_global_config
         server._stage_git_global_config = fake_stage
-        inv = _build_invocation("git status", self.root)
-        self.assertIsInstance(inv, Invocation)
-        self.assertIsNotNone(inv.env)
-        self.assertEqual(inv.env.get("SANDBOX_NO_PLEDGE"), "1")
-        self.assertEqual(inv.env.get("GIT_CONFIG_GLOBAL"), fake_config)
+        try:
+            inv = _build_invocation("git status", self.root)
+            self.assertIsInstance(inv, Invocation)
+            self.assertIsNotNone(inv.env)
+            self.assertEqual(inv.env.get("SANDBOX_NO_PLEDGE"), "1")
+            self.assertEqual(inv.env.get("GIT_CONFIG_GLOBAL"), fake_config)
+        finally:
+            server._stage_git_global_config = orig_stage
 
     def test_build_invocation_no_pledge_flag_drives_env(self) -> None:
         """A fake COMMANDS entry with no_pledge=True should set the env var."""
