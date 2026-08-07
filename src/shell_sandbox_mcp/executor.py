@@ -28,6 +28,7 @@ from .parser import (
     _serialize_command,
     parse_command as _parser_parse_command,
 )
+from .redirects import FdDefaults, RedirectPlan
 
 
 def _get_server():
@@ -369,9 +370,12 @@ def _build_pipeline_plan(segments, work_dir, expansion, mode):
                 def_stdout = sink.sentinel if is_last else _stdlib_subprocess.PIPE
                 def_stderr = sink.sentinel if is_last else _stdlib_subprocess.PIPE
 
-            plan = srv._resolve_fd_targets(
-                redirects, def_stdout, def_stderr,
-                snapshot_2gt1=is_last,
+            plan = RedirectPlan(tuple(redirects)).apply(
+                FdDefaults(
+                    stdout=def_stdout,
+                    stderr=def_stderr,
+                    snapshot_2gt1=is_last,
+                )
             )
 
             if mode == "background" and is_last:

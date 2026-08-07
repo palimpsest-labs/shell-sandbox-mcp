@@ -23,6 +23,58 @@ class FdPlan:
     stdin_bytes: Optional[bytes] = None
     stdin_file: Optional[object] = None
 
+    def share_stdout_stderr_via_pipe(self) -> None:
+        """Point both stdout and stderr at a single shared pipe.
+
+        Used by ``1>&2`` and snapshot ``2>&1`` when the source fd is
+        ``subprocess.PIPE``: both stdout and stderr write to the write end,
+        and the parent reads from the read end (``shared_read_fd``).
+        """
+        rfd, wfd = os.pipe()
+        self.shared_read_fd = rfd
+        self.stdout = wfd
+        self.stderr = wfd
+        self.to_close.append(wfd)
+
+
+@dataclass(frozen=True)
+class FdDefaults:
+    """Initial fd targets and stdin defaults for a segment's FdPlan."""
+    stdout: object
+    stderr: object
+    snapshot_2gt1: bool = True
+    stdin_bytes: Optional[bytes] = None
+    stdin_file: Optional[object] = None
+
+
+@dataclass(frozen=True)
+class RedirectPlan:
+    """A sequence of Redirects applied in order to a segment's fds."""
+    redirects: tuple[Redirect, ...]
+
+    def apply(self, defaults: FdDefaults) -> FdPlan:
+        """Apply every redirect in order, returning the resolved FdPlan.
+
+        Builds a fresh :class:`FdPlan` seeded from *defaults* and applies each
+        redirect in place.  The plan is created fresh here and must NOT be
+        reused across calls: each ``apply`` mutates its own plan.
+        """
+        plan = FdPlan(
+            stdout=defaults.stdout,
+            stderr=defaults.stderr,
+            to_close=[],
+            report=[],
+            shared_read_fd=None,
+            stdin_bytes=defaults.stdin_bytes,
+            stdin_file=defaults.stdin_file,
+        )
+        has_later_stdout_file = any(
+            r.fd == 1 and r.op in (">", ">>") for r in self.redirects
+        )
+        for r in self.redirects:
+            r.apply(plan, snapshot_2gt1=has_later_stdout_file and defaults.snapshot_2gt1)
+        return plan
+
 
 def _extract_redirects(
     segment,
@@ -44,121 +96,16 @@ def _resolve_fd_targets(
     *,
     snapshot_2gt1: bool = True,
 ) -> FdPlan:
-    """Apply redirects in order (last-wins per fd) and return an ``FdPlan``.
+    """Back-compat shim for the plan-based fd resolver.
 
-    Returns an :class:`FdPlan` with attributes ``stdout``, ``stderr``,
-    ``to_close``, ``report``, ``shared_read_fd``, ``stdin_bytes`` and
-    ``stdin_file``.  ``shared_read_fd`` is ``None`` unless a ``1>&2`` (or
-    ``2>&1`` when ``snapshot_2gt1``) redirect forced creation of a shared
-    pipe (when the source fd is ``subprocess.PIPE``).  ``stdin_bytes`` is
-    ``None`` unless a heredoc/here-string redirect was provided;
-    ``stdin_file`` is ``None`` unless a ``< file`` input redirect was
-    provided (an open binary file object).
-
-    ``snapshot_2gt1=False`` is used for intermediate pipeline stages, where
-    a ``2>&1`` must merge stderr into the existing stdout pipe (so a later
-    ``>file`` cannot apply to it) rather than snapshot a fresh shared pipe
-    that would break the pipe chaining.
+    Delegates to :class:`RedirectPlan` / :class:`FdDefaults`.  Kept with its
+    exact historical signature for the ~direct test call sites and the
+    ``server`` re-export.
     """
-    stdout_target = default_stdout
-    stderr_target = default_stderr
-    files_to_close: list = []
-    report_lines: list[str] = []
-    shared_pipe_read_fd = None
-    stdin_bytes: Optional[bytes] = None
-    stdin_file: Optional[object] = None
-
-    for r in redirects:
-        if r.op == "<":
-            if stdin_file is not None or stdin_bytes is not None:
-                raise ValueError("Multiple stdin redirects in one segment")
-            try:
-                fd = os.open(r.target_path, os.O_RDONLY | os.O_NOFOLLOW)
-            except FileNotFoundError:
-                raise ValueError(f"Input redirect file not found: {r.raw_target}")
-            except OSError as e:
-                raise ValueError(f"Cannot open input redirect {r.raw_target}: {e}")
-            stdin_file = os.fdopen(fd, "rb")
-            files_to_close.append(stdin_file)
-            report_lines.append(f"[stdin <- {r.raw_target}]")
-        elif r.op in ("<<", "<<-", "<<<"):
-            # Heredoc / here-string: only one stdin redirect per segment
-            # (already enforced in _extract_redirects).
-            if stdin_bytes is not None or stdin_file is not None:
-                raise ValueError("Multiple stdin redirects in one segment")
-            stdin_bytes = (r.body or "").encode("utf-8")
-            if r.op == "<<<":
-                report_lines.append("[stdin <<<]")
-            elif r.op == "<<-":
-                report_lines.append("[stdin <<-]")
-            else:
-                report_lines.append("[stdin <<]")
-        elif r.op in (">", ">>"):
-            # O_NOFOLLOW closes the symlink-swap TOCTOU: the path was
-            # containment-validated earlier, so a redirect target must not be
-            # a symlink pointing outside the work tree at open time.
-            flags = os.O_WRONLY | os.O_CREAT
-            flags |= os.O_TRUNC if r.op == ">" else os.O_APPEND
-            flags |= os.O_NOFOLLOW
-            # Contrast with the secret 0o600 in policy.py: a redirect target is
-            # NOT secret, so use 0o666 — the mode is masked by the process umask
-            # at open, so a restrictive umask still applies.
-            fd = os.open(r.target_path, flags, 0o666)
-            fh = os.fdopen(fd, "wb" if r.op == ">" else "ab")
-            files_to_close.append(fh)
-            if r.fd == 1:
-                stdout_target = fh
-                arrow = "->" if r.op == ">" else "->>"
-                report_lines.append(f"[stdout {arrow} {r.raw_target}]")
-            else:  # fd == 2
-                stderr_target = fh
-                arrow = "->" if r.op == ">" else "->>"
-                report_lines.append(f"[stderr {arrow} {r.raw_target}]")
-        elif r.op == ">&":
-            if r.fd == 2 and r.target_fd == 1:  # 2>&1
-                # If a LATER `>file` will redirect stdout, snapshot stdout's
-                # current destination so stderr isn't dragged along with it
-                # (matches POSIX: `2>&1 >file` puts stderr on the original
-                # stdout). Otherwise a plain subprocess.STDOUT (merge stderr
-                # into stdout's target) is correct and lighter.
-                later_stdout_redirect = any(
-                    rr.fd == 1 and rr.op in (">", ">>") for rr in redirects
-                )
-                if (
-                    snapshot_2gt1
-                    and later_stdout_redirect
-                    and isinstance(stdout_target, int)
-                    and stdout_target == subprocess.PIPE
-                ):
-                    rfd, wfd = os.pipe()
-                    shared_pipe_read_fd = rfd
-                    stdout_target = wfd
-                    stderr_target = wfd
-                    files_to_close.append(wfd)
-                else:
-                    stderr_target = subprocess.STDOUT
-                report_lines.append("[stderr -> stdout]")
-            elif r.fd == 1 and r.target_fd == 2:  # 1>&2
-                if isinstance(stderr_target, int) and stderr_target == subprocess.PIPE:
-                    # Create a shared pipe so both stdout and stderr write to
-                    # the same fd; parent reads from the read end.
-                    rfd, wfd = os.pipe()
-                    shared_pipe_read_fd = rfd
-                    stdout_target = wfd
-                    stderr_target = wfd
-                    files_to_close.append(wfd)
-                else:
-                    # stderr is a real file handle (or a shared-pipe fd);
-                    # just point stdout at the same target.
-                    stdout_target = stderr_target
-                report_lines.append("[stdout -> stderr]")
-
-    return FdPlan(
-        stdout=stdout_target,
-        stderr=stderr_target,
-        to_close=files_to_close,
-        report=report_lines,
-        shared_read_fd=shared_pipe_read_fd,
-        stdin_bytes=stdin_bytes,
-        stdin_file=stdin_file,
+    return RedirectPlan(tuple(redirects)).apply(
+        FdDefaults(
+            stdout=default_stdout,
+            stderr=default_stderr,
+            snapshot_2gt1=snapshot_2gt1,
+        )
     )

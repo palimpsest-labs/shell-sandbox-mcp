@@ -21,7 +21,9 @@ Public API
 from __future__ import annotations
 
 import enum
+import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Optional
@@ -98,6 +100,90 @@ class Redirect:
     raw_target: Optional[str] = None         # user-typed target (for messages)
     body: Optional[str] = None               # literal stdin content for heredoc/here-string
     strip_tabs: bool = False                 # <<- semantics (strip leading TABs)
+
+    def apply(self, plan, *, snapshot_2gt1: bool) -> None:
+        """Apply this redirect to an :class:`FdPlan` in place.
+
+        Mutates *plan* in place (stdout/stderr targets, ``to_close``,
+        ``report``, stdin fields, ``shared_read_fd``).  ``snapshot_2gt1``
+        tells a ``2>&1`` whether a later ``>file`` will redirect stdout, in
+        which case stderr should snapshot stdout's current destination via a
+        shared pipe rather than merge into it (POSIX ``2>&1 >file``
+        semantics).
+        """
+        if self.op == "<":
+            if plan.stdin_file is not None or plan.stdin_bytes is not None:
+                raise ValueError("Multiple stdin redirects in one segment")
+            try:
+                fd = os.open(self.target_path, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                raise ValueError(f"Input redirect file not found: {self.raw_target}")
+            except OSError as e:
+                raise ValueError(f"Cannot open input redirect {self.raw_target}: {e}")
+            plan.stdin_file = os.fdopen(fd, "rb")
+            plan.to_close.append(plan.stdin_file)
+            plan.report.append(f"[stdin <- {self.raw_target}]")
+        elif self.op in ("<<", "<<-", "<<<"):
+            # Heredoc / here-string: only one stdin redirect per segment
+            # (already enforced in _extract_redirects).
+            if plan.stdin_bytes is not None or plan.stdin_file is not None:
+                raise ValueError("Multiple stdin redirects in one segment")
+            plan.stdin_bytes = (self.body or "").encode("utf-8")
+            if self.op == "<<<":
+                plan.report.append("[stdin <<<]")
+            elif self.op == "<<-":
+                plan.report.append("[stdin <<-]")
+            else:
+                plan.report.append("[stdin <<]")
+        elif self.op in (">", ">>"):
+            # O_NOFOLLOW closes the symlink-swap TOCTOU: the path was
+            # containment-validated earlier, so a redirect target must not be
+            # a symlink pointing outside the work tree at open time.
+            flags = os.O_WRONLY | os.O_CREAT
+            flags |= os.O_TRUNC if self.op == ">" else os.O_APPEND
+            flags |= os.O_NOFOLLOW
+            # Contrast with the secret 0o600 in policy.py: a redirect target is
+            # NOT secret, so use 0o666 — the mode is masked by the process umask
+            # at open, so a restrictive umask still applies.
+            fd = os.open(self.target_path, flags, 0o666)
+            fh = os.fdopen(fd, "wb" if self.op == ">" else "ab")
+            plan.to_close.append(fh)
+            if self.fd == 1:
+                plan.stdout = fh
+                arrow = "->" if self.op == ">" else "->>"
+                plan.report.append(f"[stdout {arrow} {self.raw_target}]")
+            else:  # fd == 2
+                plan.stderr = fh
+                arrow = "->" if self.op == ">" else "->>"
+                plan.report.append(f"[stderr {arrow} {self.raw_target}]")
+        elif self.op == ">&":
+            if self.fd == 2 and self.target_fd == 1:  # 2>&1
+                # If a LATER `>file` will redirect stdout, snapshot stdout's
+                # current destination so stderr isn't dragged along with it
+                # (matches POSIX: `2>&1 >file` puts stderr on the original
+                # stdout). Otherwise a plain subprocess.STDOUT (merge stderr
+                # into stdout's target) is correct and lighter.  The
+                # ``later_stdout_redirect`` lookahead is supplied via the
+                # ``snapshot_2gt1`` parameter (computed by RedirectPlan).
+                if (
+                    snapshot_2gt1
+                    and isinstance(plan.stdout, int)
+                    and plan.stdout == subprocess.PIPE
+                ):
+                    plan.share_stdout_stderr_via_pipe()
+                else:
+                    plan.stderr = subprocess.STDOUT
+                plan.report.append("[stderr -> stdout]")
+            elif self.fd == 1 and self.target_fd == 2:  # 1>&2
+                if isinstance(plan.stderr, int) and plan.stderr == subprocess.PIPE:
+                    # Create a shared pipe so both stdout and stderr write to
+                    # the same fd; parent reads from the read end.
+                    plan.share_stdout_stderr_via_pipe()
+                else:
+                    # stderr is a real file handle (or a shared-pipe fd);
+                    # just point stdout at the same target.
+                    plan.stdout = plan.stderr
+                plan.report.append("[stdout -> stderr]")
 
 
 # ---------------------------------------------------------------------------
