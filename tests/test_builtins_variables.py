@@ -75,16 +75,14 @@ class SplitChainsTest(unittest.TestCase):
         self.assertEqual(segs[1], (";", "echo b", False))
 
     def test_separator_inside_subst_not_split(self) -> None:
-        # split_legacy produces 1 segment — the $() body is absorbed and
-        # the display form uses sentinel markers.
+        # The $() body is absorbed and the display form uses sentinel markers.
         segs = split_chains("echo $(echo a; echo b)")
         self.assertEqual(len(segs), 1)
         self.assertIn("echo", segs[0][1])
 
     def test_heredoc_separator_not_split(self) -> None:
-        # split_legacy produces 1 segment for heredoc — the heredoc body
-        # `;\n` is absorbed into the token and newline after EOF is not
-        # a chain separator in replay mode.
+        # Heredoc body is absorbed into the token and newline after EOF is
+        # not a chain separator in replay mode.
         segs = split_chains("cat <<EOF\n;\nEOF\necho done")
         self.assertEqual(len(segs), 1)
         self.assertIn("cat", segs[0][1])

@@ -13,6 +13,14 @@ from typing import Optional
 from .config import DEFAULT_ALLOWED_DIRS, EXTRA_REDIRECT_ROOTS
 from .parser import Redirect
 
+# ---------------------------------------------------------------------------
+# Module-level cache: resolve DEFAULT_ALLOWED_DIRS once at import time so
+# _validate_cwd doesn't re-resolve them on every call.
+# ---------------------------------------------------------------------------
+_RESOLVED_ALLOWED_DIRS: tuple[Path, ...] = tuple(
+    Path(allowed).expanduser().resolve() for allowed in DEFAULT_ALLOWED_DIRS
+)
+
 
 def _contained_path(cmd_name: str, work_dir: Path) -> Optional[Path]:
     """Resolve `cmd_name` relative to `work_dir`, returning the resolved
@@ -79,8 +87,7 @@ def _validate_cwd(resolved: Path, raw: str) -> Optional[str]:
         return f"Directory not found: {raw}"
 
     # Must be within an allowed tree or a subdirectory thereof
-    for allowed in DEFAULT_ALLOWED_DIRS:
-        allowed_path = Path(allowed).expanduser().resolve()
+    for allowed_path in _RESOLVED_ALLOWED_DIRS:
         try:
             resolved.relative_to(allowed_path)
             return None

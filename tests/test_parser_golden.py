@@ -17,11 +17,13 @@ from typing import Mapping, Optional, Tuple
 
 from shell_sandbox_mcp.parser import (
     Expansion,
+    Lexer,
     Redirect,
+    _build_ast,
+    _serialize_command,
     extract_redirects,
     parse_command,
     program_to_chain,
-    split_legacy,
 )
 
 
@@ -31,7 +33,7 @@ from shell_sandbox_mcp.parser import (
 
 @dataclass(frozen=True)
 class SplitCase:
-    """A single split_legacy golden case."""
+    """A single chain-projection golden case."""
     name: str
     command: str
     # expected_chain: (op|None, stages: tuple[str,...], backgrounded: bool)
@@ -63,10 +65,11 @@ class ExpansionCase:
 
 
 # ---------------------------------------------------------------------------
-# SplitCommandGoldenTest — pins split_legacy string projections
+# SplitCommandGoldenTest — pins program_to_chain + _serialize_command projections
 # ---------------------------------------------------------------------------
-# split_legacy is STILL LIVE (server.py uses it as the legacy fallback), so
-# its string projections are pinned here verbatim.
+# The live path uses Lexer → _build_ast → program_to_chain →
+# _serialize_command to project a command string into the chain format.
+# These goldens pin that projection exactly.
 
 SPLIT_CASES = (
     SplitCase("no_operator_single_segment", "ls -la",
@@ -132,13 +135,20 @@ SPLIT_CASES = (
 
 
 class SplitCommandGoldenTest(unittest.TestCase):
-    """Golden: exact string projections from split_legacy."""
+    """Golden: exact string projections from the live chain projection path."""
 
     def test_split_golden(self) -> None:
         for case in SPLIT_CASES:
             with self.subTest(name=case.name, command=case.command):
+                tokens = Lexer(case.command, replay_mode=True).tokenize()
+                program = _build_ast(tokens, Expansion())
+                chains = program_to_chain(program)
+                projected = [
+                    (op, [_serialize_command(cmd) for cmd in cmd_nodes], bg)
+                    for op, cmd_nodes, bg in chains
+                ]
                 self.assertEqual(
-                    split_legacy(case.command),
+                    projected,
                     [(op, list(stages), bg)
                      for op, stages, bg in case.expected_chain],
                 )

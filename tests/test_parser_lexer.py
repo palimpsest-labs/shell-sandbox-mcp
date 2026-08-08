@@ -14,7 +14,6 @@ from shell_sandbox_mcp.parser import (
     _strip_quotes,
     extract_redirects,
     parse_command,
-    split_legacy,
 )
 
 
@@ -219,20 +218,6 @@ class LexerSubstSpanTest(unittest.TestCase):
 
 class LexerQuoteStateTest(unittest.TestCase):
     """Test quote-awareness in lexer and parser."""
-
-    def test_operators_inside_quotes_preserved(self) -> None:
-        # split_legacy should treat operators inside quotes as literal
-        result = split_legacy('echo "a|b" | wc')
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0][1], ['echo "a|b"', "wc"])
-
-    def test_semicolon_inside_quotes_preserved(self) -> None:
-        result = split_legacy('echo "a;b"')
-        self.assertEqual(result, [(None, ['echo "a;b"'], False)])
-
-    def test_ampersand_inside_quotes_preserved(self) -> None:
-        result = split_legacy('echo "a & b"')
-        self.assertEqual(result, [(None, ['echo "a & b"'], False)])
 
     def test_redirect_inside_quotes_literal(self) -> None:
         args, redirs, err = extract_redirects('echo ">" hello')

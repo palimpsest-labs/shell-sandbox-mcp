@@ -13,56 +13,7 @@ from shell_sandbox_mcp.parser import (
     WordPart,
     extract_redirects,
     parse_command,
-    split_legacy,
 )
-
-
-class SplitLegacyLenientTest(unittest.TestCase):
-    """Test lenient drop semantics in split_legacy."""
-
-    def test_double_semicolon_drops_empties(self) -> None:
-        result = split_legacy("a ;; b")
-        self.assertEqual(result, [(None, ["a"], False), (";", ["b"], False)])
-
-    def test_triple_pipe_drops_empty_stage(self) -> None:
-        result = split_legacy("a ||| b")
-        self.assertEqual(result, [(None, ["a"], False), ("||", ["b"], False)])
-
-    def test_leading_pipe_drops_empty(self) -> None:
-        result = split_legacy("| ls")
-        self.assertEqual(result, [(None, ["ls"], False)])
-
-    def test_trailing_pipe_drops_empty(self) -> None:
-        result = split_legacy("ls |")
-        self.assertEqual(result, [(None, ["ls"], False)])
-
-    def test_lone_semicolon_empty(self) -> None:
-        self.assertEqual(split_legacy(";"), [])
-
-    def test_empty_command(self) -> None:
-        self.assertEqual(split_legacy(""), [])
-        self.assertEqual(split_legacy("   "), [])
-
-    def test_only_whitespace_between_operators(self) -> None:
-        result = split_legacy("  a   ;;  b  ")
-        self.assertEqual(result, [(None, ["a"], False), (";", ["b"], False)])
-
-
-class SplitLegacyFdDupTest(unittest.TestCase):
-    """Test that split_legacy correctly handles 2>&1 / 1>&2 as non-backgrounding."""
-
-    def test_2gt1_not_background(self) -> None:
-        result = split_legacy("echo hi 2>&1")
-        self.assertEqual(result, [(None, ["echo hi 2>&1"], False)])
-
-    def test_1gt2_not_background(self) -> None:
-        result = split_legacy("cmd 1>&2")
-        self.assertEqual(result, [(None, ["cmd 1>&2"], False)])
-
-    def test_redirect_then_bare_ampersand(self) -> None:
-        # 2>err & — the & after a space is backgrounding
-        result = split_legacy("grep x 2>err &")
-        self.assertEqual(result, [(None, ["grep x 2>err"], True)])
 
 
 class ParseCommandSentinelTest(unittest.TestCase):

@@ -748,39 +748,16 @@ class Runner:
                     self.ran_any = True
                     continue
 
-            # Compound command dispatch (if/while/until/for).
-            # Compounds must be the sole element of their pipeline and
-            # cannot be backgrounded.  They route through the stateful
-            # execution path so they have access to the VariableStore.
-            #
-            # This is the second dispatch point (the first is above, at
-            # the top of the segment-processing loop).  The first dispatch
-            # catches compounds immediately from cmd_nodes before any
-            # prefix/builtin/cd processing.  This second dispatch handles
-            # the (currently unreachable but defensive) case where a
-            # compound survives through prefix-extraction and reappears
-            # in *nodes*.  Consolidation would require restructuring the
-            # entire prefix/builtin/cd block; keeping both is simpler and
-            # harmless.
-            if not bg and len(nodes) == 1:
-                node = nodes[0]
-                if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode, FuncNode, GroupNode)):
-                    try:
-                        rc, out = self._run_compound(
-                            node, store, self.work_dir, timeout, depth,
-                            joined_for_stage=joined,
-                        )
-                    except LoopSignal as sig:
-                        if self._loop_depth > 0:
-                            raise
-                        out = f"{sig.kind}: only meaningful in a `for`, `while`, or `until` loop"
-                        rc = 1
-                    self.prev_rc = rc
-                    self.ran_any = True
-                    self.stages.append({"command": joined, "output": out, "rc": rc})
-                    if out:
-                        self.outputs.append(out)
-                    continue
+            # Compound command dispatch (if/while/until/for) — second point.
+            # The first dispatch above catches compounds immediately from
+            # cmd_nodes before prefix/builtin/cd processing.  A compound
+            # node CANNOT survive the prefix-extraction block above
+            # (prefix extraction re-wraps or fails on compound nodes), so
+            # this point is unreachable in the current architecture.
+            assert not (
+                not bg and len(nodes) == 1
+                and isinstance(nodes[0], (IfNode, WhileNode, ForNode, CaseNode, SubshellNode, FuncNode, GroupNode))
+            ), "Unreachable: compound node survived prefix extraction"
 
             # Per-stage builtin handling in multi-stage pipelines.
             # Single-stage builtins are handled above (byte-for-byte preserved).

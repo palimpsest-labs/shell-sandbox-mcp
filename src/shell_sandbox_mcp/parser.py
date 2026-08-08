@@ -11,7 +11,6 @@ Public API
 ----------
 - ParseError, Redirect, Expansion
 - parse_command(text, capture_fn, ...) → (cleaned, expansion, program)
-- split_legacy(text) → list[(op|None, [stages], bg)]
 - extract_redirects(segment, expansion=None, work_dir=None) → (args, redirects, err)
 - serialize_program(program) → str
 - program_to_chain(program) → list[(op|None, [CommandNode], bg)]
@@ -22,6 +21,7 @@ from __future__ import annotations
 
 import enum
 import fnmatch as _fnmatch
+import functools
 import glob as _glob
 import os
 import re
@@ -1848,8 +1848,7 @@ def _build_ast(
         if t is None:
             return None
 
-        # Collect consecutive chain operators (last wins, matching
-        # split_legacy's behaviour:  ;;  ,  ;&&  ,  ||;  etc.).
+        # Collect consecutive chain operators (last wins:  ;;  ,  ;&&  ,  ||;  etc.).
         # DSEMI (;;) acts as a single ; outside case bodies.
         operator: Optional[str] = None
         while t is not None and t.kind in (TokenKind.SEMI,
@@ -1869,7 +1868,7 @@ def _build_ast(
         pipeline = _parse_pipeline()
         if pipeline is None:
             # Trailing operator(s) with nothing after — drop
-            # (matching split_legacy empty-drop semantics).
+            # (empty-drop semantics).
             return None
 
         # Check for backgrounding
@@ -2922,7 +2921,7 @@ def _serialize_command(cmd: "CommandLike", sentinel: bool = False) -> str:
 
     When *sentinel* is True, words and redirect targets use the sentinel form
     (for :func:`serialize_program`); otherwise the human-readable display form
-    is used (for :func:`cmd_to_display` and :func:`split_legacy`).
+    is used (for :func:`cmd_to_display`).
     """
     if isinstance(cmd, IfNode):
         return "<if statement>"
@@ -2968,29 +2967,6 @@ def _serialize_command(cmd: "CommandLike", sentinel: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
-# split_legacy — reimplementation of legacy split
-# ---------------------------------------------------------------------------
-
-def split_legacy(command: str) -> list[tuple[Optional[str], list[str], bool]]:
-    """Split a command string into a chain of pipe-connected pipelines.
-
-    AST-projected: lexes *command*, builds an AST in replay mode, and
-    projects each :class:`CommandNode` to its display form via
-    :func:`_serialize_command`.  Preserves empty-drop semantics.
-
-    Returns a list of ``(operator, pipeline, backgrounded)`` triples.
-    """
-    tokens = Lexer(command, replay_mode=True).tokenize()
-    program = _build_ast(tokens, Expansion())  # replay mode
-    chains = program_to_chain(program)
-    result: list[tuple[Optional[str], list[str], bool]] = []
-    for op, cmd_nodes, bg in chains:
-        segs = [_serialize_command(cmd) for cmd in cmd_nodes]
-        result.append((op, segs, bg))
-    return result
-
-
-# ---------------------------------------------------------------------------
 # program_to_chain — project ProgramNode to legacy chain format
 # ---------------------------------------------------------------------------
 
@@ -3000,17 +2976,16 @@ def program_to_chain(
 ) -> list[tuple[Optional[str], list["CommandLike"], bool]]:
     """Project a ProgramNode to the legacy chain format.
 
-    Returns ``[(operator, [CommandLike...], backgrounded), ...]``.
-    This is the AST-native equivalent of ``split_legacy`` for use by the
-    live execution path so it can walk the AST directly.
+    Returns ``[(operator, [CommandLike...], backgrounded), ...]``
+    for use by the live execution path so it can walk the AST directly.
 
-    Empty pipelines are dropped (matching ``split_legacy``'s empty-drop
-    semantics) so that ``_run_pipeline`` never receives an empty list.
+    Empty pipelines are dropped (empty-drop semantics) so that
+    ``_run_pipeline`` never receives an empty list.
     """
     result: list[tuple[Optional[str], list["CommandLike"], bool]] = []
     for chain in program.chains:
         if not chain.pipeline.commands:
-            continue  # drop empty pipeline (parity with split_legacy)
+            continue  # drop empty pipeline
         result.append((
             chain.operator,
             list(chain.pipeline.commands),
@@ -3457,6 +3432,14 @@ _IFS_DEFAULT = " \t\n"
 _IFS_WS = frozenset(" \t\n")
 
 
+@functools.lru_cache(maxsize=16)
+def _ifs_partition(ifs: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Memoized: partition *ifs* into (ws_chars, nws_chars) tuples."""
+    ws = tuple(c for c in ifs if c in _IFS_WS)
+    nws = tuple(c for c in ifs if c not in _IFS_WS)
+    return ws, nws
+
+
 def _effective_ifs(ifs: Optional[str]) -> str:
     """Return the effective IFS: *ifs* or the default ``" \\t\\n"``."""
     return _IFS_DEFAULT if ifs is None else ifs
@@ -3489,8 +3472,7 @@ def _field_split(value: str, ifs: str) -> list[str]:
         return []
 
     # Partition IFS into ws and non-ws subsets.
-    ws_chars = [c for c in ifs if c in _IFS_WS]
-    nws_chars = [c for c in ifs if c not in _IFS_WS]
+    ws_chars, nws_chars = _ifs_partition(ifs)
 
     # Only whitespace IFS → simple word splitting + trim.
     if not nws_chars:
@@ -3674,11 +3656,6 @@ def _extract_from_node(
                     fields[-1]["keep_if_empty"] = True
                 # "$*" is quoted → pattern uses glob.escape.
                 fields[-1]["pattern"] += _glob.escape(joined)
-            elif p.is_at_split and expansion is None:
-                # No expansion → sentinel literal text (shouldn't happen in
-                # practice but be defensive).
-                fields[-1]["resolved"] += p.text
-                fields[-1]["pattern"] += p.text
             elif p.is_arg_sentinel and expansion is not None:
                 val = expansion.arg_for(p)
                 val = val if val is not None else p.text

@@ -47,8 +47,6 @@ class ASTConsumptionTest(unittest.TestCase):
        the live path.
     2. ``_extract_redirects`` is called with a ``CommandNode`` via the AST
        projection path (``_extract_from_node``).
-    3. The ``split_legacy`` function is NOT called from the live path
-       (proving the double-lex is eliminated).
     """
 
     def setUp(self) -> None:
@@ -58,13 +56,11 @@ class ASTConsumptionTest(unittest.TestCase):
         # Save originals
         self._orig_build = server._build_invocation
         self._orig_extract = server._extract_redirects
-        self._orig_split_legacy = server.split_legacy
 
     def tearDown(self) -> None:
         import shutil
         server._build_invocation = self._orig_build
         server._extract_redirects = self._orig_extract
-        server.split_legacy = self._orig_split_legacy
         shutil.rmtree(self.allowed, ignore_errors=True)
         self._tmp.cleanup()
 
@@ -119,33 +115,6 @@ class ASTConsumptionTest(unittest.TestCase):
             CommandNode,
             received_types,
             f"Expected CommandNode in received_types, got {received_types}",
-        )
-
-    def test_split_legacy_not_called_from_live_path(self) -> None:
-        """split_legacy is NOT invoked from the AST live path."""
-        call_count = [0]
-        orig_split = server.split_legacy
-
-        def counting_split(command):
-            call_count[0] += 1
-            return orig_split(command)
-
-        server.split_legacy = counting_split
-        # Stub _build_invocation to short-circuit
-        def _fake_build(command, work_dir, expansion=None):
-            return server.InvocationError("spy")
-        server._build_invocation = _fake_build
-
-        try:
-            server.shell_run("echo hi", cwd=str(self.allowed))
-        finally:
-            server.split_legacy = orig_split
-
-        # split_legacy should NOT be called from the live AST path
-        self.assertEqual(
-            call_count[0], 0,
-            f"split_legacy was called {call_count[0]} times from the live path; "
-            "double-lex is still present!",
         )
 
     def test_expand_command_returns_programnode(self) -> None:

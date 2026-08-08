@@ -35,7 +35,6 @@ from .parser import (  # noqa: F401
     program_to_chain,
     segment_needs_variable_state,
     split_chains,
-    split_legacy,
 )
 
 # ---------------------------------------------------------------------------
@@ -370,15 +369,8 @@ def shell_run(
     except (ParseError, ValueError) as e:
         return _structured_error(1, str(e))
 
-    # Walk the AST directly (Option B: single-parse path).  The AST is now the
-    # ONLY execution path — the legacy string-based split_legacy fallback
-    # was removed in U2.
-    if program is None:
-        # Defensive: parse_command returns program=None only if AST building
-        # failed after the scanner succeeded (see parser.parse_command). Surface
-        # a clean error string rather than crashing. Do NOT route to the
-        # legacy splitter.
-        return _structured_error(1, "Command parse error.")
+    # Walk the AST directly (single-parse path).
+    assert program is not None, "_expand_command must return a ProgramNode"
     chains = program_to_chain(program)
     if not chains:
         return _structured_error(1, "Empty command.")
