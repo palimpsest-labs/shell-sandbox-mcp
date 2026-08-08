@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import (
+    DEFAULT_ALLOWED_DIRS,
     MAX_OUTPUT,
     MAX_SUBST_COUNT,
     MAX_SUBST_DEPTH,
@@ -136,6 +137,12 @@ def _build_invocation(
         paths = extra_unveil_rx(work_dir) if callable(extra_unveil_rx) else extra_unveil_rx
         if paths:
             unveil_env["SANDBOX_UNVEIL_RX"] = ":".join(paths)
+
+    # Widen unveil from cwd-scoped to all allowed project trees so commands
+    # can access any file within the security boundary without an explicit cd.
+    # Resolved to absolute paths because unveil(2) needs real paths.
+    allowed_roots = [str(Path(d).expanduser().resolve()) for d in DEFAULT_ALLOWED_DIRS]
+    unveil_env["SANDBOX_UNVEIL_RWCX"] = ":".join(allowed_roots)
 
     # Sandbox-local python site dir: create <cwd>/.py-site, expose the base
     # via PYTHONUSERBASE (so `pip install --user` lands inside the sandbox)

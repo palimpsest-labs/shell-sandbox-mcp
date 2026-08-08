@@ -13,6 +13,10 @@
  * SANDBOX_UNVEIL_RX — extra paths to unveil read-execute (e.g. a vendored
  * compiler toolchain and the Cosmopolitan APE loader) so build tools can
  * exec their subprocesses.
+ * SANDBOX_UNVEIL_RWCX — extra paths to unveil read-write-create-execute
+ * (e.g. the allowed project trees ~/projects and /tmp) so commands can access
+ * any file within the security boundary regardless of the current working
+ * directory.
  * SANDBOX_NO_PLEDGE — if set, skip the pledge() call entirely (unveil still
  * confines the filesystem). Used only for the git command, whose git-lfs
  * subprocess (a Go binary) needs the waitid syscall, which no cosmocc pledge
@@ -139,6 +143,12 @@ int main(int argc, char *argv[]) {
        access is granted. */
     if (unveil_list_from_env("SANDBOX_UNVEIL_RX", "rx") != 0)
         return 1;
+    /* Additional read-write-create-execute paths from SANDBOX_UNVEIL_RWCX
+       (colon-separated).  Allowed project trees (e.g. ~/projects, /tmp) so
+       commands can access any file within the security boundary regardless
+       of the current working directory. */
+    if (unveil_list_from_env("SANDBOX_UNVEIL_RWCX", "rwcx") != 0)
+        return 1;
     /* Musl loader fallback: if SANDBOX_MUSL_LOADER and SANDBOX_MUSL_RTLIB are
        set, unveil them rx so the fallback execv can map the loader and libc.so
        for dynamically-linked musl binaries whose baked PT_INTERP
@@ -163,15 +173,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Apply the pledge — always include exec so we can execvp().
-       When SANDBOX_NO_PLEDGE is set, skip pledge entirely. This is a
-       per-command policy flag set by the Python side (git uses it for
-       waitid/git-lfs — a Go binary that needs syscalls no cosmocc pledge
-       token permits). Unveil (above) still confines the filesystem, which
-       remains the security boundary. */
+    /* Apply the pledge — always include exec + unveil + flock so we can
+       execvp(), nested sandbox invocations can call unveil(), and build
+       tools like cargo can lock files (Cosmopolitan requires explicit
+       promise tokens for each — separate from OpenBSD where some are
+       always permitted). When SANDBOX_NO_PLEDGE is set, skip pledge
+       entirely. This is a per-command policy flag set by the Python side
+       (git uses it for waitid/git-lfs — a Go binary that needs syscalls
+       no cosmocc pledge token permits). Unveil (above) still confines the
+       filesystem, which remains the security boundary. */
     if (getenv("SANDBOX_NO_PLEDGE") == NULL) {
         char full_promises[512];
-        int wrote = snprintf(full_promises, sizeof(full_promises), "%s exec", promises);
+        int wrote = snprintf(full_promises, sizeof(full_promises), "%s exec unveil flock", promises);
         if (wrote < 0 || (size_t)wrote >= sizeof(full_promises)) {
             fprintf(stderr, "sandbox: promise string too long (%d chars, max %zu)\n",
                     wrote, sizeof(full_promises) - 1);

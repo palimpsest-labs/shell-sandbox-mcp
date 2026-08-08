@@ -8,6 +8,9 @@ COSMOCC = bin/cosmo-toolchain/bin/cosmocc
 
 bin/sandbox: vendor/sandbox.c
 	$(COSMOCC) -O2 -o bin/sandbox vendor/sandbox.c
+	/bin/sh bin/sandbox --assimilate
+	@file -b bin/sandbox | grep -q '^ELF 64-bit LSB executable' \
+	  || { echo "assimilation failed: bin/sandbox is not a native ELF" >&2; exit 1; }
 
 # Note: `bin/sandbox` is intentionally NOT removed by `clean`. It is a
 # tracked binary (Git LFS) that bin/run-sandbox execs to run every sandboxed

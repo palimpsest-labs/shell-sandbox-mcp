@@ -420,7 +420,7 @@ def _try_source(
     from pathlib import Path
 
     from .config import EXTRA_REDIRECT_ROOTS, MAX_HEREDOC_BODY, MAX_SOURCE_DEPTH
-    from .containment import _contained_in_any
+    from .containment import _RESOLVED_ALLOWED_DIRS, _contained_in_any
 
     srv = _get_server()
     args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
@@ -440,7 +440,7 @@ def _try_source(
     if depth >= MAX_SOURCE_DEPTH:
         return True, f"source: recursion depth limit ({MAX_SOURCE_DEPTH}) exceeded", 1
 
-    cand = _contained_in_any(path_str, [work_dir, *EXTRA_REDIRECT_ROOTS])
+    cand = _contained_in_any(path_str, [work_dir, *_RESOLVED_ALLOWED_DIRS, *EXTRA_REDIRECT_ROOTS])
     if cand is None:
         return True, f"source: file escapes sandbox: {path_str}", 1
 

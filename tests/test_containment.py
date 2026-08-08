@@ -10,6 +10,12 @@ import unittest
 from pathlib import Path
 
 from shell_sandbox_mcp import server
+from shell_sandbox_mcp.containment import (
+    _contained_path,
+    _RESOLVED_ALLOWED_DIRS,
+    _validate_redirect_paths,
+)
+from shell_sandbox_mcp.parser import Redirect
 from shell_sandbox_mcp.server import (
     CommandNode,
     EmptyInvocation,
@@ -195,6 +201,72 @@ class BinaryStillContainedTest(unittest.TestCase):
             server._binary_still_contained(str(link.resolve()), self.root)
         )
 
+
+
+# ---------------------------------------------------------------------------
+# Widened redirect/access across allowed roots (sibling projects)
+# ---------------------------------------------------------------------------
+
+
+class WidenedAccessTest(unittest.TestCase):
+    """Redirects and access may target ANY absolute path under the allowed
+    roots (_RESOLVED_ALLOWED_DIRS, e.g. ~/projects and /tmp), regardless of the
+    current working directory. Local-binary resolution stays cwd-scoped."""
+
+    @staticmethod
+    def _mk_redirect(raw: str) -> Redirect:
+        return Redirect(fd=1, op=">", target_path=None, target_fd=None, raw_target=raw)
+
+    def setUp(self) -> None:
+        # Two sibling temp dirs under /tmp, which is an allowed root.
+        base = Path(tempfile.gettempdir())
+        self._dirs = []
+        for _ in range(2):
+            d = base / ("widen-" + os.urandom(4).hex())
+            d.mkdir()
+            self._dirs.append(d)
+        self.work_dir = self._dirs[0]
+        self.sibling = self._dirs[1]
+
+    def tearDown(self) -> None:
+        import shutil
+
+        for d in self._dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_redirect_under_sibling_allowed_root_accepted(self) -> None:
+        # Absolute target under a sibling allowed root (same tree as /tmp).
+        target = self.sibling / "out.txt"
+        out, err = _validate_redirect_paths([self._mk_redirect(str(target))], self.work_dir)
+        self.assertIsNone(err)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(Path(out[0].target_path), target.resolve())
+
+    def test_redirect_under_an_allowed_root_dir_accepted(self) -> None:
+        # Pick an allowed root from _RESOLVED_ALLOWED_DIRS if one is /tmp.
+        if Path("/tmp").resolve() in _RESOLVED_ALLOWED_DIRS:
+            target = self.sibling / "nested" / "file.log"
+            out, err = _validate_redirect_paths(
+                [self._mk_redirect(str(target))], self.work_dir
+            )
+            self.assertIsNone(err)
+            self.assertEqual(len(out), 1)
+
+    def test_redirect_outside_all_allowed_roots_rejected(self) -> None:
+        for target in ("/etc/passwd", "/usr/bin/sh"):
+            out, err = _validate_redirect_paths(
+                [self._mk_redirect(target)], self.work_dir
+            )
+            self.assertIsNotNone(err)
+            self.assertEqual(out, [])
+
+    def test_local_binary_resolution_stays_cwd_scoped(self) -> None:
+        # Even though the sibling root is allowed for redirects, a local
+        # binary resolved from work_dir must NOT pick up one in the sibling.
+        (self.sibling / "prog").write_text("#!/bin/sh\necho hi\n")
+        (self.sibling / "prog").chmod(0o755)
+        self.assertIsNone(_contained_path(str(self.sibling / "prog"), self.work_dir))
+        self.assertIsNone(server._resolve_local_binary(str(self.sibling / "prog"), self.work_dir))
 
 
 if __name__ == "__main__":

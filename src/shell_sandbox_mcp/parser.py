@@ -3718,7 +3718,7 @@ def _expand_glob_arg(pattern: str, work_dir: Path) -> list[str]:
     matches survive containment. Caller falls back to the literal arg when this
     returns [].
     """
-    from .containment import _contained_in_any
+    from .containment import _RESOLVED_ALLOWED_DIRS, _contained_in_any
     from .config import EXTRA_REDIRECT_ROOTS
     if work_dir is None:
         return []
@@ -3727,7 +3727,7 @@ def _expand_glob_arg(pattern: str, work_dir: Path) -> list[str]:
     matches = _glob.glob(pat)
     out = []
     for m in matches:
-        cand = _contained_in_any(m, [work_dir, *EXTRA_REDIRECT_ROOTS])
+        cand = _contained_in_any(m, [work_dir, *_RESOLVED_ALLOWED_DIRS, *EXTRA_REDIRECT_ROOTS])
         if cand is not None:
             out.append(str(cand))
     out.sort()   # deterministic order (glob order is filesystem-dependent)

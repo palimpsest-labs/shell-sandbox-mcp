@@ -112,7 +112,9 @@ def _validate_redirect_paths(
     validated: list[Redirect] = []
     for r in redirects:
         if r.op in (">", ">>", "<"):
-            cand = _contained_in_any(r.raw_target, [work_dir, *EXTRA_REDIRECT_ROOTS])
+            cand = _contained_in_any(
+                r.raw_target, [work_dir, *_RESOLVED_ALLOWED_DIRS, *EXTRA_REDIRECT_ROOTS]
+            )
             if cand is None:
                 return [], f"Redirect target escapes allowed roots: {r.raw_target}"
             validated.append(replace(r, target_path=str(cand)))
