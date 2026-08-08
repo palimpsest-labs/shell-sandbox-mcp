@@ -186,7 +186,12 @@ COMMANDS = {
     },
     "cargo": {
         "binary": "cargo",
-        "promises": "stdio rpath wpath cpath proc prot_exec",
+        # flock: cargo locks Cargo.lock + target dir for concurrent builds.
+        # fattr: rustc sets file mtimes/perms on build artifacts in target/.
+        # proc/prot_exec: cargo spawns rustc/linker subprocesses.
+        # inet/dns: cargo may fetch crates from a registry (crates.io) during
+        #   `cargo build`/`fetch` when the lockfile is regenerated.
+        "promises": "stdio rpath wpath cpath proc prot_exec flock fattr inet dns",
         "description": "Rust package manager (build, test, check, fmt, clippy)",
     },
     "make": {
