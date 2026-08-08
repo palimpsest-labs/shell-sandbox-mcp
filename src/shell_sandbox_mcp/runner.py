@@ -30,6 +30,7 @@ from .parser import (
     ParseError,
     SubshellNode,
     WhileNode,
+    parse_command,
     program_to_chain,
 )
 from .config import MAX_LOOP_ITER
@@ -57,7 +58,7 @@ class LoopSignal(Exception):
         self.count = max(1, count)
 
 
-def _expand_for_word(
+def _expand_for_word_synthetic(
     raw_word: str,
     work_dir: Path,
     timeout: int,
@@ -81,6 +82,11 @@ def _expand_for_word(
 
     *field_split* controls IFS field splitting on unquoted expansions
     (True for for-loop in-words, False for case-subject).
+
+    Retained as ``_expand_for_word_synthetic`` solely for A/B parity
+    comparison in tests.  The live callers use :func:`_expand_for_word_direct`
+    / :func:`_expand_for_words`, which parse the raw word directly instead of
+    wrapping it in a synthetic command.
     """
     if raw_word == "":
         return [""]
@@ -115,6 +121,154 @@ def _expand_for_word(
     if len(args) == 1:
         return [""]
     return args[1:]
+
+
+def _expand_for_word_direct(
+    raw_word: str,
+    work_dir: Path,
+    timeout: int,
+    depth: int,
+    base_env: dict[str, str],
+    srv,
+    positional: tuple[str, ...] = (),
+    *,
+    field_split: bool = True,
+    ifs: Optional[str] = None,
+) -> list[str]:
+    """Expand a single for-loop ``in`` word WITHOUT a synthetic wrapper.
+
+    Parses *raw_word* directly via :func:`parser.parse_command` (populate
+    mode, so ``$()`` capture, ``$VAR``, glob, and IFS splitting all apply),
+    projects the first command node through :func:`_extract_from_node`, and
+    returns the expanded arg list directly.
+
+    Returns a LIST of strings to support ``"$@"`` fan-out.
+
+    *field_split* controls IFS field splitting on unquoted expansions
+    (True for for-loop in-words, False for case-subject).
+    """
+    if raw_word == "":
+        return [""]
+
+    def _capture(inner: str) -> tuple[int, bytes]:
+        # Fresh closure matching executor._expand_command's capture: the
+        # sub-command runs at depth+1 beyond the parse depth (depth+1).
+        return srv._capture_stdout(
+            inner, work_dir, timeout, depth + 2, None, None, env=base_env,
+        )
+
+    try:
+        expanded, expansion, program = parse_command(
+            raw_word, _capture, work_dir, timeout, depth + 1,
+            env=base_env,
+        )
+    except (ParseError, ValueError):
+        return [raw_word]  # fallback: literal
+
+    if program is None:
+        return [raw_word]
+
+    expansion.positional_tuple = positional
+    expansion.ifs = ifs
+
+    chains = program_to_chain(program)
+    if not chains or not chains[0][1]:
+        # A word made only of structural tokens (e.g. a bare unquoted ``|``,
+        # ``;``, ``&&``) yields an empty program.  Return the literal word.
+        # This deliberately diverges from the synthetic path, which returned
+        # ``[""]`` for these (its ``__for_expand`` marker survived as the sole
+        # command before the metachar).  The divergence is unreachable in
+        # practice: the for-parser always quotes metacharacters, so a bare
+        # unquoted metachar never appears as a for-loop ``in`` word.
+        return [raw_word]
+
+    cmd_node = chains[0][1][0]
+    if not isinstance(cmd_node, CommandNode):
+        # A compound/subshell word (e.g. a bare ``(a)``) would have been the
+        # second command after the synthetic ``__for_expand`` marker, whose
+        # sole arg was stripped → the word expanded to nothing.
+        return [""]
+
+    from .parser import _extract_from_node
+    args, _, _ = _extract_from_node(
+        cmd_node, expansion, work_dir, field_split=field_split,
+    )
+    return args if args else [""]
+
+
+def _expand_for_words(
+    raw_words,
+    work_dir: Path,
+    timeout: int,
+    depth: int,
+    base_env: dict[str, str],
+    srv,
+    positional: tuple[str, ...] = (),
+    *,
+    ifs: Optional[str] = None,
+) -> list[str]:
+    """Expand all for-loop ``in`` words in a single batched parse.
+
+    Joins the raw words with ``\n`` and parses them as ONE command (the
+    parse-level LRU cache in ``parse_command`` is keyed by the command text,
+    so a batch parses in a single populate pass).  Each line becomes one
+    chain with one command node holding one word, and ``_extract_from_node``
+    is applied per chain.  ``field_split`` is always True (for-loop words).
+
+    Falls back to per-word :func:`_expand_for_word_direct` when the batch
+    parse fails, yields no program, or the chain count does not match the
+    word count (metachar corruption that would misalign lines).
+    """
+    if not raw_words:
+        return []
+
+    escaped = ['""' if w == "" else w for w in raw_words]
+    batch_cmd = "\n".join(escaped)
+
+    def _capture(inner: str) -> tuple[int, bytes]:
+        return srv._capture_stdout(
+            inner, work_dir, timeout, depth + 2, None, None, env=base_env,
+        )
+
+    def _fallback() -> list[str]:
+        out: list[str] = []
+        for w in raw_words:
+            out.extend(_expand_for_word_direct(
+                w, work_dir, timeout, depth, base_env, srv,
+                positional=positional, field_split=True, ifs=ifs,
+            ))
+        return out
+
+    try:
+        expanded, expansion, program = parse_command(
+            batch_cmd, _capture, work_dir, timeout, depth + 1,
+            env=base_env,
+        )
+    except (ParseError, ValueError):
+        return _fallback()
+
+    if program is None:
+        return _fallback()
+
+    expansion.positional_tuple = positional
+    expansion.ifs = ifs
+
+    chains = program_to_chain(program)
+    if not chains or len(chains) != len(escaped):
+        return _fallback()
+
+    from .parser import _extract_from_node
+    out: list[str] = []
+    for chain in chains:
+        cmd_nodes = chain[1]
+        if not cmd_nodes or not isinstance(cmd_nodes[0], CommandNode):
+            out.append("")
+            continue
+        args, _, _ = _extract_from_node(
+            cmd_nodes[0], expansion, work_dir, field_split=True,
+        )
+        out.extend(args if args else [""])
+    return out
 
 
 def _match_case_pattern(subject: str, pattern_text: str, store: "VariableStore") -> bool:
@@ -1148,12 +1302,11 @@ class Runner:
         base_env = _base_env()
 
         # Expand in-words through the existing expansion machinery.
-        in_words: list[str] = []
-        for raw_word in node.in_words:
-            expanded = _expand_for_word(raw_word, work_dir, timeout, depth,
-                                        base_env, srv, positional=store.positional,
-                                        ifs=store.variables.get("IFS"))
-            in_words.extend(expanded)
+        in_words = _expand_for_words(
+            node.in_words, work_dir, timeout, depth, base_env, srv,
+            positional=store.positional,
+            ifs=store.variables.get("IFS"),
+        )
 
         outputs: list[str] = []
         last_rc = 0
@@ -1272,7 +1425,7 @@ class Runner:
     ) -> tuple[int, str]:
         """Execute a ``case`` construct: match subject against patterns.
 
-        The subject word is expanded via :func:`_expand_for_word`.  Patterns
+        The subject word is expanded via :func:`_expand_for_word_direct`.  Patterns
         are tried in order; the first matching clause's body runs.  If no
         clause matches, returns ``(0, "")`` (POSIX).
         """
@@ -1282,10 +1435,10 @@ class Runner:
         env = store.env_for_expansion()
 
         # Expand subject through existing machinery (NO field splitting).
-        expanded = _expand_for_word(node.subject, work_dir, timeout, depth,
-                                    env, srv, positional=store.positional,
-                                    field_split=False,
-                                    ifs=store.variables.get("IFS"))
+        expanded = _expand_for_word_direct(node.subject, work_dir, timeout, depth,
+                                           env, srv, positional=store.positional,
+                                           field_split=False,
+                                           ifs=store.variables.get("IFS"))
         subject = " ".join(expanded) if expanded else ""
 
         for clause in node.clauses:
