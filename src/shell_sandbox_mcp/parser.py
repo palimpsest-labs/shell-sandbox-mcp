@@ -26,6 +26,7 @@ import glob as _glob
 import os
 import re
 import subprocess
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Mapping, Optional
@@ -133,6 +134,13 @@ class Expansion:
     def _set_heredoc_for(self, sentinel: str, body: str) -> None:
         """Record a heredoc/here-string body for a sentinel key."""
         self._heredoc_bodies[sentinel] = body
+
+
+# A registry entry describing one sentinel for later re-resolution.
+# ``(tag, sentinel, source, flag)``:
+#   tag = "arg"  (is_subst in flag), "hd"/"hs" (heredoc/here-string,
+#         needs-expansion in flag), "at_split", or "star_join".
+SentinelRegistryEntry = tuple[str, str, str, bool]
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1215,353 @@ def _detect_sentinels_in_text(text: str) -> list[WordPart]:
 
 
 # ---------------------------------------------------------------------------
+# Parameter-expansion helpers (module level so both _build_ast's populate
+# mode and _populate_expansion's cache-hit re-resolution can share them).
+# The shared runtime state (env, capture_fn, subst_count) is threaded
+# explicitly rather than captured from a closure.
+# ---------------------------------------------------------------------------
+
+def _prefix_len(value: str, pattern: str, longest: bool) -> int:
+    """Return how many leading chars of *value* match *pattern*.
+
+    Uses fnmatch-style glob (not regex).  When *longest* is True returns
+    the longest matching prefix length (``##``); otherwise the shortest
+    (``#``).  Returns 0 when nothing matches (remove nothing).
+    """
+    ks = range(len(value), -1, -1) if longest else range(0, len(value) + 1)
+    for k in ks:
+        if _fnmatch.fnmatchcase(value[:k], pattern):
+            return k
+    return 0
+
+
+def _suffix_len(value: str, pattern: str, longest: bool) -> int:
+    """Return how many trailing chars of *value* match *pattern*.
+
+    Shortest (``%``) / longest (``%%``) suffix glob match.  0 if none.
+    """
+    n = len(value)
+    ks = range(n, -1, -1) if longest else range(0, n + 1)
+    for k in ks:
+        if _fnmatch.fnmatchcase(value[n - k:], pattern):
+            return k
+    return 0
+
+
+def _expand_dollar(
+    text: str,
+    i: int,
+    out: list[str],
+    d: int,
+    env=None,
+    capture_fn=None,
+    subst_count=None,
+) -> int:
+    """Expand ``$VAR`` / ``${...}`` / ``$(...)`` at *i* (points at ``$``).
+
+    Appends the result to *out* and returns the index of the char after
+    the consumed span.  Used by :func:`_expand_operand` for recursive
+    expansion inside a parameter-expansion operand.
+    """
+    n2 = len(text)
+    if i + 1 >= n2:
+        out.append('$')
+        return i + 1
+    nxt = text[i + 1]
+    if nxt == '(':
+        if i + 2 < n2 and text[i + 2] == '(':
+            raise ParseError("Arithmetic expansion $((...)) is not supported")
+        j = i + 2
+        pd = 1
+        q: Optional[str] = None
+        while j < n2 and pd > 0:
+            cj = text[j]
+            if q is not None:
+                if cj == q:
+                    q = None
+            elif cj in ("'", '"'):
+                q = cj
+            elif cj == '(':
+                pd += 1
+            elif cj == ')':
+                pd -= 1
+            j += 1
+        if pd != 0:
+            raise ValueError("Unbalanced $( ... )")
+        inner = text[i + 2 : j - 1]
+        if d + 1 > MAX_SUBST_DEPTH:
+            raise ValueError(
+                f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
+            )
+        if subst_count is None:
+            subst_count = [0]
+        subst_count[0] += 1
+        if subst_count[0] > MAX_SUBST_COUNT:
+            raise ValueError(
+                f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
+            )
+        _rc, stdout_bytes = capture_fn(inner)
+        val = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
+        out.append(val[:MAX_SUBST_OUTPUT])
+        return j
+    if nxt == '{':
+        if _BRACED_VAR_GUARD.match(text, i):
+            end = _find_braced_end(text, i + 1)
+            if end is None:
+                raise ParseError("Unbalanced ${...}")
+            inner = text[i + 2 : end - 1]
+            if subst_count is None:
+                subst_count = [0]
+            subst_count[0] += 1
+            if subst_count[0] > MAX_SUBST_COUNT:
+                raise ValueError(
+                    f"Parameter expansion count limit ({MAX_SUBST_COUNT}) exceeded"
+                )
+            out.append(_expand_param(inner, d + 1, env, capture_fn, subst_count))
+            return end
+        out.append('$')
+        return i + 1
+    if nxt.isalpha() or nxt == '_':
+        m = _VAR_NAME_RE.match(text, i + 1)
+        assert m is not None
+        out.append(env.get(m.group(0), "") if env else "")
+        return m.end()
+    out.append('$')
+    return i + 1
+
+
+def _expand_operand(
+    text: str,
+    d: int,
+    env=None,
+    capture_fn=None,
+    subst_count=None,
+) -> str:
+    """Recursively expand a ``${...}`` operand (default/alternate/pattern).
+
+    Supports ``$VAR``, ``${...}`` (recursive), ``$(...)`` (via
+    *capture_fn*), backslash escapes, and single/double-quote grouping.
+    Quote markers are stripped; content inside single quotes is literal.
+    """
+    out: list[str] = []
+    i, n2 = 0, len(text)
+    quote: Optional[str] = None   # "'" or '"' while inside a quote
+    while i < n2:
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                out.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = None
+                i += 1
+                continue
+            if c == '\\' and i + 1 < n2 and text[i + 1] in ('"', '$', '\\'):
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '$':
+                i = _expand_dollar(text, i, out, d, env, capture_fn, subst_count)
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c == "'":
+            quote = "'"
+            i += 1
+            continue
+        if c == '"':
+            quote = '"'
+            i += 1
+            continue
+        if c == '\\' and i + 1 < n2:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if c == '$':
+            i = _expand_dollar(text, i, out, d, env, capture_fn, subst_count)
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _expand_param(raw: str, d: int = 0, env=None, capture_fn=None, subst_count=None) -> str:
+    """Resolve a POSIX parameter expansion from the raw braced text.
+
+    ``raw`` is the text between ``${`` and the matching ``}``.  Plain
+    variable names resolve straight to the env value (byte-for-byte
+    backward compatible).  Operator forms (``:-``, ``:=``, ``:?``,
+    ``:+``, ``#``-length, ``#/##``/``%/%%`` removal, ``:offset[:len]``
+    substring, ``,``/``,,``/``^``/``^^`` case modification) are parsed
+    and resolved here.  Unparseable forms fall through to the literal
+    ``${raw}`` text.
+    """
+    if d > MAX_SUBST_DEPTH:
+        raise ValueError(
+            f"Parameter expansion depth limit ({MAX_SUBST_DEPTH}) exceeded"
+        )
+    if subst_count is None:
+        subst_count = [0]
+
+    # Plain-name fast path (backward compatible).
+    if _VAR_NAME_RE.fullmatch(raw):
+        return env.get(raw, "") if env else ""
+
+    # ${#VAR} — string length.
+    if raw.startswith('#'):
+        name = raw[1:]
+        if _VAR_NAME_RE.fullmatch(name):
+            val = env.get(name, "") if env else ""
+            return str(len(val))
+        # ${#1} — length of positional parameter $1
+        if name.isdigit() or name in "@*":
+            val = env.get(name, "") if env else ""
+            return str(len(val))
+        return "${" + raw + "}"
+
+    # Try to match a regular variable name at the start.
+    m = _VAR_NAME_RE.match(raw)
+    # If no regular name, try a positional-parameter name (digits or #@*$?!-).
+    if m is None:
+        if raw and (raw[0].isdigit() or raw[0] in "#@*$?!-"):
+            # Extract the positional name: digits, or a single #/@/*
+            if raw[0] in "#@*$?!-":
+                name = raw[0]
+                rest = raw[1:]
+            else:
+                # Extract leading digits
+                j = 0
+                while j < len(raw) and raw[j].isdigit():
+                    j += 1
+                name = raw[:j]
+                rest = raw[j:]
+            value = env.get(name, "") if env else ""
+            if not rest:
+                return value
+            # Operator forms on positional params (e.g. ${1:-default})
+            if rest.startswith(':-') or rest.startswith(':='):
+                operand = rest[2:]
+                if not value:
+                    return _expand_operand(operand, d, env, capture_fn, subst_count)
+                return value
+            if rest.startswith(':?'):
+                msg = rest[2:]
+                if not value:
+                    if msg:
+                        msg = _expand_operand(msg, d, env, capture_fn, subst_count)
+                    else:
+                        msg = "parameter not set or null"
+                    raise ValueError(msg)
+                return value
+            if rest.startswith(':+'):
+                operand = rest[2:]
+                if value:
+                    return _expand_operand(operand, d, env, capture_fn, subst_count)
+                return ""
+            if rest.startswith(':'):
+                segs = rest[1:].split(':', 1)
+                off_str = segs[0]
+                len_str = segs[1] if len(segs) > 1 else ""
+                if off_str == "" or not off_str.isdigit():
+                    return "${" + raw + "}"
+                offset = int(off_str)
+                vlen = len(value)
+                start_idx = min(offset, vlen)
+                if len_str == "":
+                    return value[start_idx:]
+                if not len_str.isdigit():
+                    return "${" + raw + "}"
+                length = int(len_str)
+                end_idx = min(start_idx + length, vlen)
+                return value[start_idx:end_idx]
+            return "${" + raw + "}"
+        return "${" + raw + "}"
+    name = m.group(0)
+    rest = raw[m.end():]
+    value = env.get(name, "") if env else ""
+    if not rest:
+        return value
+
+    # Default / assign / error / alternate (colon operators).
+    # NOTE: `${VAR:=default}` is treated identically to `${VAR:-default}`.
+    # The sandbox env is read-only per call, so no assignment is possible;
+    # we document the equivalence rather than attempt to mutate env.
+    if rest.startswith(':-') or rest.startswith(':='):
+        operand = rest[2:]
+        if not value:
+            return _expand_operand(operand, d, env, capture_fn, subst_count)
+        return value
+    if rest.startswith(':?'):
+        msg = rest[2:]
+        if not value:
+            if msg:
+                msg = _expand_operand(msg, d, env, capture_fn, subst_count)
+            else:
+                msg = "parameter not set or null"
+            raise ValueError(msg)
+        return value
+    if rest.startswith(':+'):
+        operand = rest[2:]
+        if value:
+            return _expand_operand(operand, d, env, capture_fn, subst_count)
+        return ""
+
+    # ${VAR:offset[:len]} — substring (non-negative offsets; clamped).
+    if rest.startswith(':'):
+        segs = rest[1:].split(':', 1)
+        off_str = segs[0]
+        len_str = segs[1] if len(segs) > 1 else ""
+        if off_str == "" or not off_str.isdigit():
+            return "${" + raw + "}"   # unknown operator → literal
+        offset = int(off_str)
+        vlen = len(value)
+        start_idx = min(offset, vlen)          # offset beyond length → empty
+        if len_str == "":
+            return value[start_idx:]
+        if not len_str.isdigit():
+            return "${" + raw + "}"            # unknown operator → literal
+        length = int(len_str)
+        end_idx = min(start_idx + length, vlen)  # clamp length
+        return value[start_idx:end_idx]
+
+    # Prefix removal — ${VAR#pat} (shortest) / ${VAR##pat} (longest).
+    if rest.startswith('##'):
+        pat = _expand_operand(rest[2:], d, env, capture_fn, subst_count)
+        return value[_prefix_len(value, pat, longest=True):]
+    if rest.startswith('#'):
+        pat = _expand_operand(rest[1:], d, env, capture_fn, subst_count)
+        return value[_prefix_len(value, pat, longest=False):]
+
+    # Suffix removal — ${VAR%pat} (shortest) / ${VAR%%pat} (longest).
+    if rest.startswith('%%'):
+        pat = _expand_operand(rest[2:], d, env, capture_fn, subst_count)
+        k = _suffix_len(value, pat, longest=True)
+        return value[: len(value) - k]
+    if rest.startswith('%'):
+        pat = _expand_operand(rest[1:], d, env, capture_fn, subst_count)
+        k = _suffix_len(value, pat, longest=False)
+        return value[: len(value) - k]
+
+    # Case modification — all / first char.
+    if rest in ('^^', '^', ',,', ','):
+        if rest == '^^':
+            return value.upper()
+        if rest == '^':
+            return value[:1].upper() + value[1:] if value else ""
+        if rest == ',,':
+            return value.lower()
+        if rest == ',':
+            return value[:1].lower() + value[1:] if value else ""
+
+    return "${" + raw + "}"   # unknown operator → literal
+
+
+# ---------------------------------------------------------------------------
 # AST builder — builds AST from tokens + pre-populated expansion
 # ---------------------------------------------------------------------------
 
@@ -1220,6 +1575,7 @@ def _build_ast(
     depth: int = 0,
     subst_count=None,
     deadline=None,
+    _sentinel_registry: Optional[list] = None,
 ) -> ProgramNode:
     """Build an AST from the token stream.
 
@@ -1242,320 +1598,6 @@ def _build_ast(
     if subst_count is None:
         subst_count = [0]
 
-    def _prefix_len(value: str, pattern: str, longest: bool) -> int:
-        """Return how many leading chars of *value* match *pattern*.
-
-        Uses fnmatch-style glob (not regex).  When *longest* is True returns
-        the longest matching prefix length (``##``); otherwise the shortest
-        (``#``).  Returns 0 when nothing matches (remove nothing).
-        """
-        ks = range(len(value), -1, -1) if longest else range(0, len(value) + 1)
-        for k in ks:
-            if _fnmatch.fnmatchcase(value[:k], pattern):
-                return k
-        return 0
-
-    def _suffix_len(value: str, pattern: str, longest: bool) -> int:
-        """Return how many trailing chars of *value* match *pattern*.
-
-        Shortest (``%``) / longest (``%%``) suffix glob match.  0 if none.
-        """
-        n = len(value)
-        ks = range(n, -1, -1) if longest else range(0, n + 1)
-        for k in ks:
-            if _fnmatch.fnmatchcase(value[n - k:], pattern):
-                return k
-        return 0
-
-    def _expand_dollar(text: str, i: int, out: list[str], d: int) -> int:
-        """Expand ``$VAR`` / ``${...}`` / ``$(...)`` at *i* (points at ``$``).
-
-        Appends the result to *out* and returns the index of the char after
-        the consumed span.  Used by :func:`_expand_operand` for recursive
-        expansion inside a parameter-expansion operand.
-        """
-        n2 = len(text)
-        if i + 1 >= n2:
-            out.append('$')
-            return i + 1
-        nxt = text[i + 1]
-        if nxt == '(':
-            if i + 2 < n2 and text[i + 2] == '(':
-                raise ParseError("Arithmetic expansion $((...)) is not supported")
-            j = i + 2
-            pd = 1
-            q: Optional[str] = None
-            while j < n2 and pd > 0:
-                cj = text[j]
-                if q is not None:
-                    if cj == q:
-                        q = None
-                elif cj in ("'", '"'):
-                    q = cj
-                elif cj == '(':
-                    pd += 1
-                elif cj == ')':
-                    pd -= 1
-                j += 1
-            if pd != 0:
-                raise ValueError("Unbalanced $( ... )")
-            inner = text[i + 2 : j - 1]
-            if d + 1 > MAX_SUBST_DEPTH:
-                raise ValueError(
-                    f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
-                )
-            subst_count[0] += 1
-            if subst_count[0] > MAX_SUBST_COUNT:
-                raise ValueError(
-                    f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
-                )
-            _rc, stdout_bytes = capture_fn(inner)
-            val = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
-            out.append(val[:MAX_SUBST_OUTPUT])
-            return j
-        if nxt == '{':
-            if _BRACED_VAR_GUARD.match(text, i):
-                end = _find_braced_end(text, i + 1)
-                if end is None:
-                    raise ParseError("Unbalanced ${...}")
-                inner = text[i + 2 : end - 1]
-                subst_count[0] += 1
-                if subst_count[0] > MAX_SUBST_COUNT:
-                    raise ValueError(
-                        f"Parameter expansion count limit ({MAX_SUBST_COUNT}) exceeded"
-                    )
-                out.append(_expand_param(inner, d + 1))
-                return end
-            out.append('$')
-            return i + 1
-        if nxt.isalpha() or nxt == '_':
-            m = _VAR_NAME_RE.match(text, i + 1)
-            assert m is not None
-            out.append(env.get(m.group(0), "") if env else "")
-            return m.end()
-        out.append('$')
-        return i + 1
-
-    def _expand_operand(text: str, d: int) -> str:
-        """Recursively expand a ``${...}`` operand (default/alternate/pattern).
-
-        Supports ``$VAR``, ``${...}`` (recursive), ``$(...)`` (via
-        *capture_fn*), backslash escapes, and single/double-quote grouping.
-        Quote markers are stripped; content inside single quotes is literal.
-        """
-        out: list[str] = []
-        i, n2 = 0, len(text)
-        quote: Optional[str] = None   # "'" or '"' while inside a quote
-        while i < n2:
-            c = text[i]
-            if quote == "'":
-                if c == "'":
-                    quote = None
-                else:
-                    out.append(c)
-                i += 1
-                continue
-            if quote == '"':
-                if c == '"':
-                    quote = None
-                    i += 1
-                    continue
-                if c == '\\' and i + 1 < n2 and text[i + 1] in ('"', '$', '\\'):
-                    out.append(text[i + 1])
-                    i += 2
-                    continue
-                if c == '$':
-                    i = _expand_dollar(text, i, out, d)
-                    continue
-                out.append(c)
-                i += 1
-                continue
-            if c == "'":
-                quote = "'"
-                i += 1
-                continue
-            if c == '"':
-                quote = '"'
-                i += 1
-                continue
-            if c == '\\' and i + 1 < n2:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if c == '$':
-                i = _expand_dollar(text, i, out, d)
-                continue
-            out.append(c)
-            i += 1
-        return "".join(out)
-
-    def _expand_param(raw: str, d: int = 0) -> str:
-        """Resolve a POSIX parameter expansion from the raw braced text.
-
-        ``raw`` is the text between ``${`` and the matching ``}``.  Plain
-        variable names resolve straight to the env value (byte-for-byte
-        backward compatible).  Operator forms (``:-``, ``:=``, ``:?``,
-        ``:+``, ``#``-length, ``#/##``/``%/%%`` removal, ``:offset[:len]``
-        substring, ``,``/``,,``/``^``/``^^`` case modification) are parsed
-        and resolved here.  Unparseable forms fall through to the literal
-        ``${raw}`` text.
-        """
-        if d > MAX_SUBST_DEPTH:
-            raise ValueError(
-                f"Parameter expansion depth limit ({MAX_SUBST_DEPTH}) exceeded"
-            )
-
-        # Plain-name fast path (backward compatible).
-        if _VAR_NAME_RE.fullmatch(raw):
-            return env.get(raw, "") if env else ""
-
-        # ${#VAR} — string length.
-        if raw.startswith('#'):
-            name = raw[1:]
-            if _VAR_NAME_RE.fullmatch(name):
-                val = env.get(name, "") if env else ""
-                return str(len(val))
-            # ${#1} — length of positional parameter $1
-            if name.isdigit() or name in "@*":
-                val = env.get(name, "") if env else ""
-                return str(len(val))
-            return "${" + raw + "}"
-
-        # Try to match a regular variable name at the start.
-        m = _VAR_NAME_RE.match(raw)
-        # If no regular name, try a positional-parameter name (digits or #@*$?!-).
-        if m is None:
-            if raw and (raw[0].isdigit() or raw[0] in "#@*$?!-"):
-                # Extract the positional name: digits, or a single #/@/*
-                if raw[0] in "#@*$?!-":
-                    name = raw[0]
-                    rest = raw[1:]
-                else:
-                    # Extract leading digits
-                    j = 0
-                    while j < len(raw) and raw[j].isdigit():
-                        j += 1
-                    name = raw[:j]
-                    rest = raw[j:]
-                value = env.get(name, "") if env else ""
-                if not rest:
-                    return value
-                # Operator forms on positional params (e.g. ${1:-default})
-                if rest.startswith(':-') or rest.startswith(':='):
-                    operand = rest[2:]
-                    if not value:
-                        return _expand_operand(operand, d)
-                    return value
-                if rest.startswith(':?'):
-                    msg = rest[2:]
-                    if not value:
-                        if msg:
-                            msg = _expand_operand(msg, d)
-                        else:
-                            msg = "parameter not set or null"
-                        raise ValueError(msg)
-                    return value
-                if rest.startswith(':+'):
-                    operand = rest[2:]
-                    if value:
-                        return _expand_operand(operand, d)
-                    return ""
-                if rest.startswith(':'):
-                    segs = rest[1:].split(':', 1)
-                    off_str = segs[0]
-                    len_str = segs[1] if len(segs) > 1 else ""
-                    if off_str == "" or not off_str.isdigit():
-                        return "${" + raw + "}"
-                    offset = int(off_str)
-                    vlen = len(value)
-                    start_idx = min(offset, vlen)
-                    if len_str == "":
-                        return value[start_idx:]
-                    if not len_str.isdigit():
-                        return "${" + raw + "}"
-                    length = int(len_str)
-                    end_idx = min(start_idx + length, vlen)
-                    return value[start_idx:end_idx]
-                return "${" + raw + "}"
-            return "${" + raw + "}"
-        name = m.group(0)
-        rest = raw[m.end():]
-        value = env.get(name, "") if env else ""
-        if not rest:
-            return value
-
-        # Default / assign / error / alternate (colon operators).
-        # NOTE: `${VAR:=default}` is treated identically to `${VAR:-default}`.
-        # The sandbox env is read-only per call, so no assignment is possible;
-        # we document the equivalence rather than attempt to mutate env.
-        if rest.startswith(':-') or rest.startswith(':='):
-            operand = rest[2:]
-            if not value:
-                return _expand_operand(operand, d)
-            return value
-        if rest.startswith(':?'):
-            msg = rest[2:]
-            if not value:
-                if msg:
-                    msg = _expand_operand(msg, d)
-                else:
-                    msg = "parameter not set or null"
-                raise ValueError(msg)
-            return value
-        if rest.startswith(':+'):
-            operand = rest[2:]
-            if value:
-                return _expand_operand(operand, d)
-            return ""
-
-        # ${VAR:offset[:len]} — substring (non-negative offsets; clamped).
-        if rest.startswith(':'):
-            segs = rest[1:].split(':', 1)
-            off_str = segs[0]
-            len_str = segs[1] if len(segs) > 1 else ""
-            if off_str == "" or not off_str.isdigit():
-                return "${" + raw + "}"   # unknown operator → literal
-            offset = int(off_str)
-            vlen = len(value)
-            start_idx = min(offset, vlen)          # offset beyond length → empty
-            if len_str == "":
-                return value[start_idx:]
-            if not len_str.isdigit():
-                return "${" + raw + "}"            # unknown operator → literal
-            length = int(len_str)
-            end_idx = min(start_idx + length, vlen)  # clamp length
-            return value[start_idx:end_idx]
-
-        # Prefix removal — ${VAR#pat} (shortest) / ${VAR##pat} (longest).
-        if rest.startswith('##'):
-            pat = _expand_operand(rest[2:], d)
-            return value[_prefix_len(value, pat, longest=True):]
-        if rest.startswith('#'):
-            pat = _expand_operand(rest[1:], d)
-            return value[_prefix_len(value, pat, longest=False):]
-
-        # Suffix removal — ${VAR%pat} (shortest) / ${VAR%%pat} (longest).
-        if rest.startswith('%%'):
-            pat = _expand_operand(rest[2:], d)
-            k = _suffix_len(value, pat, longest=True)
-            return value[: len(value) - k]
-        if rest.startswith('%'):
-            pat = _expand_operand(rest[1:], d)
-            k = _suffix_len(value, pat, longest=False)
-            return value[: len(value) - k]
-
-        # Case modification — all / first char.
-        if rest in ('^^', '^', ',,', ','):
-            if rest == '^^':
-                return value.upper()
-            if rest == '^':
-                return value[:1].upper() + value[1:] if value else ""
-            if rest == ',,':
-                return value.lower()
-            if rest == ',':
-                return value[:1].lower() + value[1:] if value else ""
-
-        return "${" + raw + "}"   # unknown operator → literal
 
     def _emit_arg_sentinel(raw_src: str, name: str, *, is_subst: bool) -> str:
         """Assign the next arg-sentinel ID and, in populate mode, resolve the value.
@@ -1590,8 +1632,13 @@ def _build_ast(
                 if _VAR_NAME_RE.fullmatch(name) or name.isdigit() or name in "#@*":
                     value = env.get(name, "") if env else ""
                 else:
-                    value = _expand_param(name, depth)
+                    value = _expand_param(name, depth, env, capture_fn, subst_count)
             expansion._set_arg_for(sentinel, value)
+            if _sentinel_registry is not None:
+                _sentinel_registry.append((
+                    "arg", sentinel,
+                    raw_src if is_subst else name, is_subst,
+                ))
 
         return sentinel
 
@@ -2808,12 +2855,20 @@ def _build_ast(
                         body = _expand_subst_in_text(body, capture_fn, env=env)
                     body = body[:MAX_HEREDOC_BODY] if body else ""
                     expansion._set_heredoc_for(sentinel, body)
+                    if _sentinel_registry is not None:
+                        _sentinel_registry.append((
+                            "hd", sentinel, tok.body or "", not tok.quoted_delim,
+                        ))
                 else:  # R_HERESTRING
                     body_word = _strip_quotes(tok.body) if tok.body else ""
                     if body_word and not tok.quoted_delim:
                         body_word = _expand_subst_in_text(body_word, capture_fn, env=env)
                     body = (body_word + "\n")[:MAX_HEREDOC_BODY]
                     expansion._set_heredoc_for(sentinel, body)
+                    if _sentinel_registry is not None:
+                        _sentinel_registry.append((
+                            "hs", sentinel, tok.body or "", not tok.quoted_delim,
+                        ))
 
             op_map = {
                 TokenKind.R_HEREDOC: "<<",
@@ -2876,6 +2931,79 @@ def _build_ast(
         chains.append(chain)
 
     return ProgramNode(chains=tuple(chains))
+
+
+# ---------------------------------------------------------------------------
+# _populate_expansion — re-resolve a cached sentinel registry
+# ---------------------------------------------------------------------------
+
+def _populate_expansion(
+    registry,
+    capture_fn,
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    subst_count: Optional[list[int]] = None,
+    depth: int = 0,
+) -> Expansion:
+    """Re-resolve sentinel values from a cached *registry* into a fresh Expansion.
+
+    The AST is value-agnostic: it only stores sentinel keys (``\\x01A<N>\\x01`` /
+    ``\\x01H<N>\\x01``), and the actual ``$()`` output, ``$VAR`` value, and
+    heredoc/here-string body are resolved at execution time from *env* and
+    *capture_fn*.  This is the cache-hit counterpart to :func:`_build_ast`'s
+    populate mode: it re-runs the per-iteration value resolution so a cached
+    AST can be reused across loop iterations (e.g. re-capturing fresh ``$()``
+    output each iteration and re-reading ``$VAR`` from the current env).
+
+    *registry* is a list of :data:`SentinelRegistryEntry` tuples recorded by
+    ``_build_ast`` / ``parse_command``.
+    """
+    if subst_count is None:
+        subst_count = [0]
+    expansion = Expansion()
+    for tag, sentinel, source, flag in registry:
+        if tag == "arg":
+            if flag:  # is_subst — re-capture fresh output each iteration
+                if depth + 1 > MAX_SUBST_DEPTH:
+                    raise ValueError(
+                        f"Command substitution depth limit ({MAX_SUBST_DEPTH}) exceeded"
+                    )
+                subst_count[0] += 1
+                if subst_count[0] > MAX_SUBST_COUNT:
+                    raise ValueError(
+                        f"Command substitution count limit ({MAX_SUBST_COUNT}) exceeded"
+                    )
+                _rc, stdout_bytes = capture_fn(source)
+                value: str = stdout_bytes.decode("utf-8", errors="replace").rstrip("\n")
+                value = value[:MAX_SUBST_OUTPUT]
+                expansion._set_arg_for(sentinel, value)
+            else:  # VARREF — re-resolve the bare name from the current env
+                # Mirror _build_ast's _emit_arg_sentinel: plain variable
+                # names and positional parameters ($1, $#, $@, $*, etc.)
+                # resolve straight from env; anything else is a parameter
+                # expansion operator form (e.g. ${1:-default}).
+                if _VAR_NAME_RE.fullmatch(source) or source.isdigit() or source in "#@*":
+                    value = env.get(source, "") if env else ""
+                else:
+                    value = _expand_param(source, env=env, capture_fn=capture_fn, subst_count=subst_count)
+                expansion._set_arg_for(sentinel, value)
+        elif tag == "hd":  # heredoc / heredoc-strip
+            body = source
+            if flag and body:  # unquoted delimiter → expand $(...) in body
+                body = _expand_subst_in_text(body, capture_fn, env=env)
+            body = body[:MAX_HEREDOC_BODY] if body else ""
+            expansion._set_heredoc_for(sentinel, body)
+        elif tag == "hs":  # here-string: strip quotes, expand, append newline
+            body_word = _strip_quotes(source) if source else ""
+            if flag and body_word:
+                body_word = _expand_subst_in_text(body_word, capture_fn, env=env)
+            body = (body_word + "\n")[:MAX_HEREDOC_BODY]
+            expansion._set_heredoc_for(sentinel, body)
+        elif tag == "at_split":
+            expansion.at_split_keys.add(sentinel)
+        elif tag == "star_join":
+            expansion.star_join_keys.add(sentinel)
+    return expansion
 
 
 # ---------------------------------------------------------------------------
@@ -2998,6 +3126,11 @@ def program_to_chain(
 # split_chains — lex-only chain split for per-chain re-expansion
 # ---------------------------------------------------------------------------
 
+# Memoization cache: command → list[(op, seg_text, bg)].
+# The returned tuples are (str|None, str, bool) — pure structural data.
+_SPLIT_CHAINS_CACHE: "OrderedDict[str, list]" = OrderedDict()
+_SPLIT_CHAINS_CACHE_MAX = 256
+
 
 def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     """Split *command* into chain segments at top-level separators.
@@ -3019,6 +3152,14 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     maintained via open/close keyword pairing.  Brace groups (``{ }``)
     are also tracked.
     """
+    # Check the memoization cache.
+    cached = _SPLIT_CHAINS_CACHE.get(command)
+    if cached is not None:
+        _SPLIT_CHAINS_CACHE.move_to_end(command)
+        # Return a shallow copy so a caller that mutates the returned list
+        # cannot corrupt the shared cache entry.
+        return list(cached)
+
     tokens = Lexer(command).tokenize()
 
     # First pass: compute which separators are at depth 0 (outside compounds).
@@ -3107,10 +3248,15 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     if not depth_0_seps:
         stripped = command.strip()
         if not stripped:
-            return []
-        return [(None, stripped, False)]
+            result: list[tuple[Optional[str], str, bool]] = []
+        else:
+            result = [(None, stripped, False)]
+        _SPLIT_CHAINS_CACHE[command] = result
+        if len(_SPLIT_CHAINS_CACHE) > _SPLIT_CHAINS_CACHE_MAX:
+            _SPLIT_CHAINS_CACHE.popitem(last=False)
+        return result
 
-    result: list[tuple[Optional[str], str, bool]] = []
+    result = []
     prev_end = 0
     next_op: Optional[str] = None
 
@@ -3144,6 +3290,9 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     if last_seg:
         result.append((next_op, last_seg, False))
 
+    _SPLIT_CHAINS_CACHE[command] = result
+    if len(_SPLIT_CHAINS_CACHE) > _SPLIT_CHAINS_CACHE_MAX:
+        _SPLIT_CHAINS_CACHE.popitem(last=False)
     return result
 
 
@@ -3826,6 +3975,22 @@ def _extract_from_node(
 
 
 # ---------------------------------------------------------------------------
+# parse_command cache — value-agnostic parse-artifact LRU cache
+# ---------------------------------------------------------------------------
+
+# Keyed by *command* text; stores (program, cleaned, registry_tuple) where
+# registry_tuple is an immutable tuple of SentinelRegistryEntry tuples.
+_PARSE_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+_PARSE_CACHE_MAX = 256
+
+
+def _clear_parse_cache() -> None:
+    """Clear the parse-command and split-chains caches (for tests)."""
+    _PARSE_CACHE.clear()
+    _SPLIT_CHAINS_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
 # parse_command — thin AST wrapper (scan → lex → build → serialize)
 # ---------------------------------------------------------------------------
 
@@ -3838,6 +4003,8 @@ def parse_command(
     deadline: Optional[float] = None,
     subst_count: Optional[list[int]] = None,
     env: Optional[Mapping[str, str]] = None,
+    *,  # noqa: B006
+    _sentinel_registry: Optional[list] = None,
 ) -> tuple[str, Expansion, Optional[ProgramNode]]:
     """Pre-pass: resolve ``$(...)``, heredocs, and here-strings.
 
@@ -3852,6 +4019,14 @@ def parse_command(
     NOT the per-command unveil_env (which is computed after parse time).
 
     Returns ``(cleaned_command, expansion, program_ast)``.
+
+    Populate mode (*capture_fn* is not None) uses an LRU cache keyed by
+    *command* text.  The cached artifacts (program AST, cleaned command
+    string, and sentinel registry) are value-agnostic, so the per-call
+    value resolution (``$()`` capture, ``$VAR`` lookup, heredoc/here-string
+    body expansion) is re-run via :func:`_populate_expansion` on every
+    call.  Replay mode (*capture_fn* is None) skips the cache entirely so
+    golden/projection tests remain byte-identical.
     """
     import time as _time
 
@@ -3860,9 +4035,57 @@ def parse_command(
     if deadline is None:
         deadline = _time.time() + timeout
 
-    # Reject unsupported constructs (quote-aware scan)
-    _check_unsupported(command)
+    # ── Populate mode: try the parse cache ───────────────────────────
+    if capture_fn is not None:
+        cached = _PARSE_CACHE.get(command)
+        if cached is not None:
+            # Cache hit — reuse the value-agnostic AST + serialized
+            # command string, and build a fresh Expansion from the
+            # recorded sentinel registry.
+            program, cleaned, registry_tuple = cached
+            expansion = _populate_expansion(
+                list(registry_tuple), capture_fn, env=env,
+                subst_count=subst_count, depth=depth,
+            )
+            if _sentinel_registry is not None:
+                _sentinel_registry.extend(registry_tuple)
+            # Touch for LRU.
+            _PARSE_CACHE.move_to_end(command)
+            return cleaned, expansion, program
 
+        # Cache miss — parse fully, recording a sentinel registry so
+        # subsequent identical commands can skip lex/build/serialize.
+        _registry: list = []
+        _check_unsupported(command)
+        expansion = Expansion()
+        tokens = Lexer(command).tokenize()
+        program = _build_ast(
+            tokens, expansion,
+            command=command,
+            capture_fn=capture_fn,
+            env=env,
+            depth=depth,
+            subst_count=subst_count,
+            deadline=deadline,
+            _sentinel_registry=_registry,
+        )
+        for key in expansion.at_split_keys:
+            _registry.append(("at_split", key, "", False))
+        for key in expansion.star_join_keys:
+            _registry.append(("star_join", key, "", False))
+        cleaned = serialize_program(program)
+
+        # Write to cache (LRU with cap).
+        _PARSE_CACHE[command] = (program, cleaned, tuple(_registry))
+        if len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
+            _PARSE_CACHE.popitem(last=False)
+
+        if _sentinel_registry is not None:
+            _sentinel_registry.extend(_registry)
+        return cleaned, expansion, program
+
+    # ── Replay mode (capture_fn is None): full parse, no cache ──────
+    _check_unsupported(command)
     expansion = Expansion()
     tokens = Lexer(command).tokenize()
     program = _build_ast(
@@ -3873,7 +4096,13 @@ def parse_command(
         depth=depth,
         subst_count=subst_count,
         deadline=deadline,
+        _sentinel_registry=_sentinel_registry,
     )
+    if _sentinel_registry is not None:
+        for key in expansion.at_split_keys:
+            _sentinel_registry.append(("at_split", key, "", False))
+        for key in expansion.star_join_keys:
+            _sentinel_registry.append(("star_join", key, "", False))
     cleaned = serialize_program(program)
     return cleaned, expansion, program
 
