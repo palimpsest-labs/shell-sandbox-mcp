@@ -177,7 +177,7 @@ class MixedPipelineTest(unittest.TestCase):
         def fake_background(segments, work_dir, expansion=None,
                             *, shell_env=None, stage_env_overrides=None):
             calls.append({"segments": segments, "bg": True})
-            return 0, "bg"
+            return 0, "bg", 0
 
         server._run_background = fake_background
 

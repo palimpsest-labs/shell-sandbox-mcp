@@ -151,7 +151,7 @@ from .executor import (  # noqa: F401
 # Re-export runner symbols
 # ---------------------------------------------------------------------------
 
-from .runner import Runner  # noqa: F401
+from .runner import LoopSignal, Runner  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Re-export variables symbols
@@ -167,6 +167,12 @@ mcp = FastMCP(
     "shell-sandbox",
     instructions="Run shell commands safely via pledge + busybox sandbox",
 )
+
+# Session-level function registry — shared across all shell_run calls within
+# one MCP process (FastMCP stdio has one client per process).  Declared at
+# module level so it survives across invocations and persists user-defined
+# function definitions for the lifetime of the server.
+_SESSION_FUNCTIONS: dict[str, str] = {}
 
 
 @mcp.tool()
@@ -277,6 +283,14 @@ def shell_run(
     other stages IN THE SAME pipeline — each subprocess stage's env is
     snapshotted from the exported vars at pipeline start.
 
+    **Positional parameters:** quoted ``"$@"`` fans out to one argv entry
+    per positional parameter (POSIX-compatible).  Quoted ``"$*"`` joins
+    positional parameters with spaces into a single arg.  Unquoted ``$@``
+    and ``$*`` both produce a single space-joined arg (no IFS field-splitting
+    is performed for any ``$VAR`` expansion).  Inside heredoc bodies and
+    here-strings, ``$@`` / ``$*`` are space-joined (no fan-out).  The
+    for-loop ``for x in "$@"`` correctly iterates each positional.
+
     By default this tool returns a plain string: the per-pipeline outputs
     joined with newlines (or ``"(no output)"`` when nothing was produced),
     with ``"Exit code: N"`` lines embedded for non-zero exits.  Set
@@ -337,12 +351,12 @@ def shell_run(
     # segment starts with an assignment word or one of the new builtins,
     # take the existing single-expand path unchanged — byte-for-byte identical.
     segments = split_chains(command)
-    needs_state = any(segment_needs_variable_state(seg) for _, seg, _ in segments)
+    needs_state = any(segment_needs_variable_state(seg, _SESSION_FUNCTIONS.keys()) for _, seg, _ in segments)
 
     if needs_state:
         runner = Runner(
             work_dir=work_dir, default_timeout=timeout,
-            variables=VariableStore(),
+            variables=VariableStore(functions=_SESSION_FUNCTIONS),
         )
         if structured:
             return runner.run_command(command, timeout, structured=True).to_dict()

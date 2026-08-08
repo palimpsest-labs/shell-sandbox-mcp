@@ -723,10 +723,10 @@ def _launch_pipeline_foreground(
 def _launch_background(
     plan: PipelinePlan,
     work_dir: Path,
-) -> tuple[int, str]:
+) -> tuple[int, str, int]:
     """Launch a pipeline in the background via chained ``Popen``.
 
-    Returns ``(0, message)`` with the PID and (if applicable) log path.
+    Returns ``(rc, message, pid)`` with the PID and (if applicable) log path.
     """
     srv = _get_server()
     invocations = plan.invocations
@@ -774,7 +774,7 @@ def _launch_background(
                 fh.close()
             except OSError:
                 pass
-        return 1, f"Failed to launch background pipeline: {e}"
+        return 1, f"Failed to launch background pipeline: {e}", 0
 
     # Parent releases its handles; children hold their own copies.
     for fh in plan.all_to_close:
@@ -803,7 +803,7 @@ def _launch_background(
                 seen.add(line)
 
     srv._start_reaper()
-    return 0, "\n".join(msg_parts)
+    return 0, "\n".join(msg_parts), procs[0].pid
 
 
 # ---------------------------------------------------------------------------
@@ -1171,7 +1171,7 @@ def _run_background(
     *,
     shell_env=None,
     stage_env_overrides=None,
-) -> tuple[int, str]:
+) -> tuple[int, str, int]:
     """Launch a pipe-connected pipeline in the background and return immediately.
 
     Each element of *segments* may be a ``str`` (legacy) or a
@@ -1182,12 +1182,13 @@ def _run_background(
     stage's stdout, are redirected to a timestamped log file under
     ``work_dir`` so the parent never blocks on pipe buffers.
 
-    Returns ``(0, message)`` with the PID and log path.
+    Returns ``(rc, message, pid)`` with the PID and log path.  *pid* is 0
+    on early-return paths (empty command or plan error).
     """
     plan = _build_pipeline_plan(segments, work_dir, expansion, "background",
                                 shell_env=shell_env, stage_env_overrides=stage_env_overrides)
     if plan is None:
-        return 0, ""
+        return 0, "", 0
     if isinstance(plan, _PlanError):
-        return 1, plan.message
+        return 1, plan.message, 0
     return _launch_background(plan, work_dir)

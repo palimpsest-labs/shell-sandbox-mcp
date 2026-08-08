@@ -354,7 +354,7 @@ class ShellRunPipelineTest(unittest.TestCase):
             ]
             self.background_calls.append(str_stages)
             rc = background_rc.get(tuple(str_stages), 0)
-            return rc, f"bg:{'|'.join(str_stages)}"
+            return rc, f"bg:{'|'.join(str_stages)}", 0
 
         server._run_pipeline = fake_pipeline
         server._run_segment = fake_segment

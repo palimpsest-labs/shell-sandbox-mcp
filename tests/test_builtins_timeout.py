@@ -84,8 +84,8 @@ class ShellRunTimeoutTest(unittest.TestCase):
 
     def _stub_background(self) -> None:
         def fake_background(segments, work_dir: Path,
-                            expansion=None) -> tuple[int, str]:
-            return 0, "bg"
+                            expansion=None) -> tuple[int, str, int]:
+            return 0, "bg", 0
 
         server._run_background = fake_background
 

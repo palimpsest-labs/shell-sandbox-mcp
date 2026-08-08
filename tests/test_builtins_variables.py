@@ -581,7 +581,7 @@ class ShellRunVariablesTest(unittest.TestCase):
 
         def fake_background(segments, work_dir, expansion=None,
                             *, shell_env=None, stage_env_overrides=None):
-            return 0, "bg"
+            return 0, "bg", 0
 
         server._run_background = fake_background
 
@@ -769,7 +769,7 @@ class ShellRunVariablesTest(unittest.TestCase):
 
         def fake_background(segments, work_dir, expansion=None,
                             *, shell_env=None, stage_env_overrides=None):
-            return 0, "bg"
+            return 0, "bg", 0
 
         server._run_background = fake_background
 
@@ -838,3 +838,93 @@ class ShellRunVariablesTest(unittest.TestCase):
         # Sentinel check
         for a in second["args"]:
             self.assertNotIn("\x01", a, f"Sentinel byte in arg: {a!r}")
+
+
+# ---------------------------------------------------------------------------
+# Special-variable tests ($?, $$, $!, $-)
+# ---------------------------------------------------------------------------
+
+
+class SpecialVarTest(unittest.TestCase):
+    """Tests for $?, $$, $!, $- special variables (Phase D)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.allowed = Path(tempfile.gettempdir()) / ("sandbox-sv-" + os.urandom(4).hex())
+        self.allowed.mkdir()
+        self._orig_segment = server._run_segment
+        self._orig_pipeline = server._run_pipeline
+        self._orig_background = server._run_background
+
+    def tearDown(self) -> None:
+        import shutil
+        server._run_segment = self._orig_segment
+        server._run_pipeline = self._orig_pipeline
+        server._run_background = self._orig_background
+        shutil.rmtree(self.allowed, ignore_errors=True)
+        self._tmp.cleanup()
+
+    def _stub_segment_with_args(self) -> list[dict]:
+        """Stub _run_segment to capture resolved args."""
+        calls: list[dict] = []
+        def fake_segment(command, work_dir, timeout, expansion=None, **kwargs):
+            from shell_sandbox_mcp.server import _extract_redirects, CommandNode as CN
+            if isinstance(command, CN):
+                args, _, _ = _extract_redirects(command, expansion, work_dir)
+            else:
+                args = [str(command)]
+            calls.append({"args": args, "work_dir": str(work_dir)})
+            return 0, ""
+        server._run_segment = fake_segment
+
+        def fake_pipeline(segments, work_dir, timeout, expansion=None, **kwargs):
+            return 0, ""
+
+        server._run_pipeline = fake_pipeline
+
+        def fake_background(segments, work_dir, expansion=None, **kwargs):
+            return 0, "bg", 0
+
+        server._run_background = fake_background
+        return calls
+
+    def _run(self, command: str) -> str:
+        return server.shell_run(command, cwd=str(self.allowed))
+
+    def test_dollar_question_after_failing_command(self) -> None:
+        """$? should be the exit code of the previous command."""
+        result = self._run("false; echo $?")
+        # false returns exit code 1, so $? should be 1
+        self.assertIn("1", result)
+
+    def test_dollar_dollar_stable(self) -> None:
+        """$$ should be the MCP server PID, visible in expanded args."""
+        import os
+        calls = self._stub_segment_with_args()
+        self._run("echo $$")
+        pid = str(os.getpid())
+        # The expanded arg should contain the PID
+        self.assertTrue(
+            any(pid in a for c in calls for a in c.get("args", [])),
+            f"Expected PID {pid} in calls: {calls}"
+        )
+
+    def test_dollar_dash_empty(self) -> None:
+        """$- should be empty (no shell flags active)."""
+        calls = self._stub_segment_with_args()
+        self._run("echo $-")
+        # $- expands to empty string, so args should be ['echo'] (empty arg dropped)
+        self.assertTrue(
+            any(c.get("args") == ["echo"] for c in calls),
+            f"Expected ['echo'] in calls: {calls}"
+        )
+
+    def test_dollar_bang_after_background(self) -> None:
+        """$! should expand to empty when last_bg_pid is 0 (no valid bg PID)."""
+        calls = self._stub_segment_with_args()
+        self._run("echo $!")
+        # When no background command has been run, $! is empty
+        self.assertTrue(
+            any(c.get("args") == ["echo"] for c in calls),
+            f"Expected ['echo'] in calls: {calls}"
+        )

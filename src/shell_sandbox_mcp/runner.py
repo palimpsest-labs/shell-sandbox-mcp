@@ -38,7 +38,23 @@ from . import config as _config
 if TYPE_CHECKING:
     from .variables import VariableStore
 
-__all__ = ["Runner", "Result"]
+__all__ = ["Runner", "Result", "LoopSignal"]
+
+
+class LoopSignal(Exception):
+    """Raised by ``break`` / ``continue`` builtins to signal loop control flow.
+
+    Attributes:
+        kind:  ``"break"`` or ``"continue"``.
+        count: Nesting level (≥1).  Each loop handler decrements it; the
+               loop that catches ``count ≤ 1`` acts on the signal.
+    """
+
+    def __init__(self, kind: str, count: int = 1) -> None:
+        assert kind in ("break", "continue"), f"LoopSignal kind must be 'break' or 'continue', got {kind!r}"
+        super().__init__(kind)
+        self.kind = kind
+        self.count = max(1, count)
 
 
 def _expand_for_word(
@@ -48,16 +64,20 @@ def _expand_for_word(
     depth: int,
     base_env: dict[str, str],
     srv,
-) -> str:
+    positional: tuple[str, ...] = (),
+) -> list[str]:
     """Expand a single word from the for-loop's ``in`` list.
 
     Uses the existing ``_expand_command`` machinery on a synthetic ``echo``
     command so that ``$()``, ``$VAR``, and glob expansion all apply.  Strips
     the leading ``echo`` (first arg) to recover the expanded word value.
     Returns the original *raw_word* unchanged on any expansion failure.
+
+    Returns a LIST of strings to support ``"$@"`` fan-out: a word
+    containing a quoted ``$@`` may expand to multiple argv entries.
     """
     if raw_word == "":
-        return ""
+        return [""]
 
     try:
         expanded, expansion, program = srv._expand_command(
@@ -66,24 +86,26 @@ def _expand_for_word(
             env=base_env,
         )
     except (ParseError, ValueError):
-        return raw_word  # fallback: literal
+        return [raw_word]  # fallback: literal
 
     if program is None:
-        return raw_word
+        return [raw_word]
+
+    expansion.positional_tuple = positional
 
     chains = program_to_chain(program)
     if not chains or not chains[0][1]:
-        return raw_word
+        return [raw_word]
 
     from .parser import _extract_from_node
     args, _, _ = _extract_from_node(chains[0][1][0], expansion, work_dir)
     if not args or args[0] != "__for_expand":
-        return raw_word
-    # The expanded word is everything after the synthetic command name.
-    # If there are multiple words (e.g. glob expansion), join them.
+        return [raw_word]
+    # The expanded words are everything after the synthetic command name.
+    # If there are multiple words (e.g. "$@" fan-out), return them all.
     if len(args) == 1:
-        return ""
-    return " ".join(args[1:])
+        return [""]
+    return args[1:]
 
 
 def _match_case_pattern(subject: str, pattern_text: str, store: "VariableStore") -> bool:
@@ -282,6 +304,8 @@ class Runner:
     skipped: bool = False
     outputs: list[str] = field(default_factory=list)
     stages: list = field(default_factory=list)
+    _in_loop: bool = False  # True when Runner is executing inside a for/while/until body
+    _loop_depth: int = 0    # Tracks loop nesting depth for LoopSignal propagation
 
     def run_chain(self, chains: list, timeout: int, structured: bool = False) -> "str | Result":
         """Walk a parsed chain and return the joined output string.
@@ -347,11 +371,13 @@ class Runner:
                     continue
 
             if backgrounded:
-                _rc, out = srv._run_background(
+                _rc, out, _pid = srv._run_background(
                     nodes, self.work_dir, expansion=self.expansion,
                 )
                 self.ran_any = True
                 # Leave prev_rc unchanged — backgrounded exit code is unknown.
+                if self.variables is not None:
+                    self.variables.last_bg_pid = _pid
                 self.stages.append({"command": joined, "output": out, "rc": None})
             elif len(nodes) == 1:
                 rc, out = srv._run_segment(
@@ -407,6 +433,7 @@ class Runner:
             _try_set,
             _try_shift,
             _try_source,
+            _try_break_continue,
         )
 
         srv = _get_server()
@@ -443,6 +470,7 @@ class Runner:
                 continue
 
             # Re-expand with the current variable store.
+            store.last_rc = self.prev_rc
             env = store.env_for_expansion()
             try:
                 expanded, expansion, program = srv._expand_command(
@@ -454,6 +482,9 @@ class Runner:
                 self.prev_rc = 1
                 self.ran_any = True
                 continue
+
+            if expansion is not None:
+                expansion.positional_tuple = store.positional
 
             if program is None:
                 self.outputs.append("Command parse error.")
@@ -477,10 +508,16 @@ class Runner:
             if not bg and len(cmd_nodes) == 1:
                 node = cmd_nodes[0]
                 if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode, FuncNode, GroupNode)):
-                    rc, out = self._run_compound(
-                        node, store, self.work_dir, timeout, depth,
-                        joined_for_stage=joined,
-                    )
+                    try:
+                        rc, out = self._run_compound(
+                            node, store, self.work_dir, timeout, depth,
+                            joined_for_stage=joined,
+                        )
+                    except LoopSignal as sig:
+                        if self._loop_depth > 0:
+                            raise
+                        out = f"{sig.kind}: only meaningful in a `for`, `while`, or `until` loop"
+                        rc = 1
                     self.prev_rc = rc
                     self.ran_any = True
                     self.stages.append({"command": joined, "output": out, "rc": rc})
@@ -558,6 +595,34 @@ class Runner:
                     if rc_val != 0 and not out_val:
                         return f"Exit code: {rc_val}", rc_val
                     return out_val, rc_val
+
+                # --- break / continue ---
+                brk_kind, brk_count, brk_rc = _try_break_continue(
+                    cmd_node, expansion, self.work_dir,
+                )
+                if brk_kind is not None:
+                    if brk_rc != 0:
+                        # Bad argument — emit diagnostic with rc=1, loop continues
+                        out, rc = _builtin_result(
+                            1, f"{brk_kind}: invalid argument"
+                        )
+                        if out:
+                            self.outputs.append(out)
+                        self.stages.append({"command": joined, "output": out, "rc": rc})
+                        self.prev_rc = rc
+                        self.ran_any = True
+                        continue
+                    if self._in_loop:
+                        raise LoopSignal(brk_kind, brk_count)
+                    else:
+                        msg = f"{brk_kind}: only meaningful in a `for`, `while`, or `until` loop"
+                        out, rc = _builtin_result(1, msg)
+                        if out:
+                            self.outputs.append(out)
+                        self.stages.append({"command": joined, "output": out, "rc": rc})
+                        self.prev_rc = rc
+                        self.ran_any = True
+                        continue
 
                 # --- function invocation dispatch ---
                 args, _, _ = srv._extract_redirects(cmd_node, expansion, self.work_dir)
@@ -688,10 +753,16 @@ class Runner:
             if not bg and len(nodes) == 1:
                 node = nodes[0]
                 if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode, FuncNode, GroupNode)):
-                    rc, out = self._run_compound(
-                        node, store, self.work_dir, timeout, depth,
-                        joined_for_stage=joined,
-                    )
+                    try:
+                        rc, out = self._run_compound(
+                            node, store, self.work_dir, timeout, depth,
+                            joined_for_stage=joined,
+                        )
+                    except LoopSignal as sig:
+                        if self._loop_depth > 0:
+                            raise
+                        out = f"{sig.kind}: only meaningful in a `for`, `while`, or `until` loop"
+                        rc = 1
                     self.prev_rc = rc
                     self.ran_any = True
                     self.stages.append({"command": joined, "output": out, "rc": rc})
@@ -730,11 +801,12 @@ class Runner:
             base = store.env_for_subprocess()
 
             if bg:
-                _rc, out = srv._run_background(
+                _rc, out, _pid = srv._run_background(
                     nodes, self.work_dir, expansion=expansion,
                     shell_env=base, stage_env_overrides=stage_env_overrides if stage_env_overrides else None,
                 )
                 self.ran_any = True
+                store.last_bg_pid = _pid
                 self.stages.append({"command": joined, "output": out, "rc": None})
             elif len(nodes) == 1:
                 rc, out = srv._run_segment(
@@ -979,25 +1051,78 @@ class Runner:
         last_rc = 0
         iterations = 0
 
-        while iterations < MAX_LOOP_ITER:
-            rc, out = self._run_body(
-                node.cond, store, work_dir, timeout, depth,
-            )
-            if out:
-                outputs.append(out)
-            # while: enter body if rc==0; until: enter body if rc!=0
-            enter = (rc == 0) if not node.until else (rc != 0)
-            if not enter:
-                last_rc = rc
-                break
-            # Enter body
-            brc, bout = self._run_body(
-                node.body, store, work_dir, timeout, depth,
-            )
-            if bout:
-                outputs.append(bout)
-            last_rc = brc
-            iterations += 1
+        self._loop_depth += 1
+        self._in_loop = True
+        reraise_sig = None
+        try:
+            while iterations < MAX_LOOP_ITER:
+                try:
+                    rc, out = self._run_body(
+                        node.cond, store, work_dir, timeout, depth,
+                    )
+                except LoopSignal as sig:
+                    if sig.kind == "break":
+                        if sig.count <= 1:
+                            last_rc = 0
+                            break  # exit the while loop
+                        else:
+                            reraise_sig = LoopSignal("break", sig.count - 1)
+                            break
+                    else:  # continue
+                        if sig.count <= 1:
+                            last_rc = 0
+                            iterations += 1
+                            continue  # next iteration
+                        else:
+                            reraise_sig = LoopSignal("continue", sig.count - 1)
+                            break
+                if reraise_sig is not None:
+                    break  # exit while, re-raise handled after cleanup
+                if out:
+                    outputs.append(out)
+                # while: enter body if rc==0; until: enter body if rc!=0
+                enter = (rc == 0) if not node.until else (rc != 0)
+                if not enter:
+                    last_rc = rc
+                    break
+                # Enter body
+                try:
+                    brc, bout = self._run_body(
+                        node.body, store, work_dir, timeout, depth,
+                    )
+                except LoopSignal as sig:
+                    if sig.kind == "break":
+                        if sig.count <= 1:
+                            last_rc = 0
+                            break  # exit the while loop
+                        else:
+                            reraise_sig = LoopSignal("break", sig.count - 1)
+                            break
+                    else:  # continue
+                        if sig.count <= 1:
+                            last_rc = 0
+                            iterations += 1
+                            continue  # next iteration
+                        else:
+                            reraise_sig = LoopSignal("continue", sig.count - 1)
+                            break
+                if reraise_sig is not None:
+                    break  # exit while, re-raise handled after cleanup
+                if bout:
+                    outputs.append(bout)
+                last_rc = brc
+                iterations += 1
+        except Exception:
+            # Defensive cleanup: only reached for unexpected errors
+            # (LoopSignal is caught by the inner handler above).
+            self._loop_depth -= 1
+            self._in_loop = False
+            raise
+        else:
+            self._loop_depth -= 1
+            self._in_loop = False
+            if reraise_sig is not None:
+                raise reraise_sig
 
         if iterations >= MAX_LOOP_ITER:
             outputs.append(
@@ -1026,20 +1151,51 @@ class Runner:
         in_words: list[str] = []
         for raw_word in node.in_words:
             expanded = _expand_for_word(raw_word, work_dir, timeout, depth,
-                                        base_env, srv)
-            in_words.append(expanded)
+                                        base_env, srv, positional=store.positional)
+            in_words.extend(expanded)
 
         outputs: list[str] = []
         last_rc = 0
 
-        for word_value in in_words:
-            store.set_local(node.var_name, word_value)
-            rc, out = self._run_body(
-                node.body, store, work_dir, timeout, depth,
-            )
-            if out:
-                outputs.append(out)
-            last_rc = rc
+        self._loop_depth += 1
+        self._in_loop = True
+        reraise_sig = None
+        try:
+            for word_value in in_words:
+                store.set_local(node.var_name, word_value)
+                try:
+                    rc, out = self._run_body(
+                        node.body, store, work_dir, timeout, depth,
+                    )
+                except LoopSignal as sig:
+                    if sig.kind == "break":
+                        if sig.count <= 1:
+                            last_rc = 0
+                            break  # exit the for loop
+                        else:
+                            reraise_sig = LoopSignal("break", sig.count - 1)
+                            break
+                    else:  # continue
+                        if sig.count <= 1:
+                            last_rc = 0
+                            continue  # next iteration
+                        else:
+                            reraise_sig = LoopSignal("continue", sig.count - 1)
+                            break
+                if out:
+                    outputs.append(out)
+                last_rc = rc
+        except Exception:
+            # Defensive cleanup: only reached for unexpected errors
+            # (LoopSignal is caught by the inner handler above).
+            self._loop_depth -= 1
+            self._in_loop = False
+            raise
+        else:
+            self._loop_depth -= 1
+            self._in_loop = False
+            if reraise_sig is not None:
+                raise reraise_sig
 
         if not outputs:
             return last_rc, ""
@@ -1063,6 +1219,7 @@ class Runner:
         if not body_text.strip():
             return 0, ""
 
+        store.last_rc = self.prev_rc
         env = store.env_for_expansion()
         try:
             expanded, expansion, program = srv._expand_command(
@@ -1086,6 +1243,8 @@ class Runner:
             expansion=expansion,
             variables=store,
         )
+        sub_runner._in_loop = self._in_loop
+        sub_runner._loop_depth = self._loop_depth
         result = sub_runner.run_command(
             body_text, timeout, depth=depth + 1, structured=True,
         )
@@ -1119,8 +1278,9 @@ class Runner:
         env = store.env_for_expansion()
 
         # Expand subject through existing machinery.
-        subject = _expand_for_word(node.subject, work_dir, timeout, depth,
-                                   env, srv)
+        expanded = _expand_for_word(node.subject, work_dir, timeout, depth,
+                                    env, srv, positional=store.positional)
+        subject = " ".join(expanded) if expanded else ""
 
         for clause in node.clauses:
             if _match_case_pattern(subject, clause.pattern, store):
@@ -1161,7 +1321,10 @@ class Runner:
             script_name=store.script_name,
             func_depth=store.func_depth,
         )
-        return self._run_body(node.body, isolated_store, work_dir, timeout, depth)
+        try:
+            return self._run_body(node.body, isolated_store, work_dir, timeout, depth)
+        except LoopSignal as sig:
+            return 1, f"{sig.kind}: only meaningful in a `for`, `while`, or `until` loop"
 
     # ------------------------------------------------------------------
     # function call
@@ -1186,7 +1349,10 @@ class Runner:
         store.positional = tuple(args)
         store.func_depth += 1
         try:
-            return self._run_body(body_text, store, work_dir, timeout, depth)
+            try:
+                return self._run_body(body_text, store, work_dir, timeout, depth)
+            except LoopSignal as sig:
+                return 1, f"{sig.kind}: only meaningful in a `for`, `while`, or `until` loop"
         finally:
             store.positional = saved_positional
             store.func_depth -= 1

@@ -738,7 +738,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
             )
 
         server._build_invocation = fake_build
-        rc, out = server._run_background(
+        rc, out, _pid = server._run_background(
             [f"echo hi > {outfile}"], self.root,
         )
         self.assertEqual(rc, 0)
@@ -759,7 +759,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
             )
 
         server._build_invocation = fake_build
-        rc, out = server._run_background(
+        rc, out, _pid = server._run_background(
             [f"echo hi 2> {errfile}"], self.root,
         )
         self.assertEqual(rc, 0)
@@ -792,7 +792,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
 
         server._build_invocation = fake_build
         # Pass CommandNode directly — no sentinel string reconstruction
-        rc, out = server._run_background(
+        rc, out, _pid = server._run_background(
             [cmd_node], self.root, expansion=exp,
         )
         self.assertEqual(rc, 0)
@@ -832,7 +832,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
         finally:
             server._capture_stdout = orig
         cmd_node = prog.chains[0].pipeline.commands[0]
-        rc, out = server._run_background(
+        rc, out, _pid = server._run_background(
             [cmd_node], self.root, expansion=exp,
         )
         self.assertEqual(rc, 0)
@@ -862,7 +862,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
             return server.EmptyInvocation()
 
         server._build_invocation = fake_build
-        rc, out = server._run_background(
+        rc, out, _pid = server._run_background(
             ["echo hi", "cat << H0"], self.root,
         )
         self.assertEqual(rc, 1)
@@ -900,7 +900,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
             )
 
         server._build_invocation = fake_build
-        rc, out = server._run_background(
+        rc, out, _pid = server._run_background(
             [f"cat < {infile}"], self.root,
         )
         self.assertEqual(rc, 0)
@@ -947,7 +947,7 @@ class RunBackgroundRedirectTest(unittest.TestCase):
             )
 
         server._build_invocation = fake_build
-        rc, out = server._run_background(
+        rc, out, _pid = server._run_background(
             ["cat"], self.root,
         )
         self.assertEqual(rc, 0)

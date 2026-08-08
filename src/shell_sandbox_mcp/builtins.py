@@ -275,6 +275,13 @@ def _try_unset(
 ) -> tuple[bool, Optional[str], Optional[int]]:
     """Handle ``unset [name ...]`` builtin.
 
+    Supports POSIX ``-f`` / ``-v`` flags:
+
+    - ``unset -f NAME…`` — remove from ``store.functions`` only.
+    - ``unset -v NAME…`` — remove from ``store.variables``/``exported`` only
+      (the current default behaviour).
+    - ``unset NAME…`` (no flag) — remove from BOTH.
+
     Returns ``(True, output, rc)`` when *cmd* is ``unset``, else
     ``(False, None, None)``.
     """
@@ -283,8 +290,39 @@ def _try_unset(
     if not args or args[0] != "unset":
         return False, None, None
 
-    for arg in args[1:]:
-        store.unset(arg)
+    # Parse flags: -f (functions), -v (variables).
+    mode: Optional[str] = None  # None = both, "f" = functions only, "v" = vars only
+    idx = 1
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "-f":
+            if mode == "v":
+                return True, "unset: -f and -v are mutually exclusive", 1
+            mode = "f"
+            idx += 1
+        elif arg == "-v":
+            if mode == "f":
+                return True, "unset: -f and -v are mutually exclusive", 1
+            mode = "v"
+            idx += 1
+        elif arg == "--":
+            idx += 1
+            break
+        elif arg.startswith("-"):
+            # Unknown flag — POSIX: still process names, ignore unknown flags
+            idx += 1
+        else:
+            break
+
+    for arg in args[idx:]:
+        if mode is None:
+            # No flag: remove from both
+            store.unset(arg)
+            store.functions.pop(arg, None)
+        elif mode == "f":
+            store.functions.pop(arg, None)
+        else:  # mode == "v"
+            store.unset(arg)
     return True, "", 0
 
 
@@ -423,3 +461,51 @@ def _try_source(
     runner = Runner(work_dir=work_dir, default_timeout=timeout, variables=store)
     out = runner.run_command(contents, timeout, structured=False, depth=depth + 1)
     return True, out, runner.prev_rc
+
+
+# ---------------------------------------------------------------------------
+# break / continue detection
+# ---------------------------------------------------------------------------
+
+
+def _try_break_continue(
+    cmd,
+    expansion: Optional[Expansion],
+    work_dir: Optional[Path],
+) -> tuple[Optional[str], Optional[int], int]:
+    """Detect and validate ``break [n]`` / ``continue [n]``.
+
+    Returns ``(kind, count, rc)``:
+
+    - *kind* is ``"break"``, ``"continue"``, or ``None`` (not a break/continue
+      command — caller falls through to normal dispatch).
+    - *count* is the (optional) positive-integer argument, default 1.
+    - *rc* is 0 on success, 1 on bad argument (e.g. ``break abc``,
+      ``break 0``).  On bad args the kind is still returned so the caller
+      can emit the diagnostic with rc=1.
+
+    This is a PURE validator — it does NOT raise :class:`LoopSignal`.
+    The caller (:class:`Runner`) decides whether to raise.
+    """
+    srv = _get_server()
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    if not args or args[0] not in ("break", "continue"):
+        return None, None, 0
+
+    kind = args[0]
+    count = 1
+
+    if len(args) > 2:
+        # Too many arguments → error, but kind still returned so caller
+        # can produce the right diagnostic.
+        return kind, 1, 1
+
+    if len(args) == 2:
+        try:
+            count = int(args[1])
+        except ValueError:
+            return kind, 1, 1
+        if count < 1:
+            return kind, 1, 1
+
+    return kind, count, 0

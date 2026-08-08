@@ -90,11 +90,14 @@ class FuncExecutionTest(unittest.TestCase):
         (self.allowed / "sub").mkdir()
         self._orig_segment = server._run_segment
         self._orig_pipeline = server._run_pipeline
+        # Clear session-level functions to prevent cross-test pollution.
+        server._SESSION_FUNCTIONS.clear()
 
     def tearDown(self) -> None:
         _remove_stubs(self._orig_segment, self._orig_pipeline)
         shutil.rmtree(self.allowed, ignore_errors=True)
         self._tmp.cleanup()
+        server._SESSION_FUNCTIONS.clear()
 
     # ------------------------------------------------------------------
     # Function definition + call
@@ -389,3 +392,150 @@ class FuncExecutionTest(unittest.TestCase):
         )
         # VAR should be 'x' after the group.
         self.assertIn("x", result)
+
+
+# ---------------------------------------------------------------------------
+# Cross-call function persistence
+# ---------------------------------------------------------------------------
+
+
+class CrossCallPersistenceTest(unittest.TestCase):
+    """Tests that function definitions persist across shell_run calls."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.allowed = Path(tempfile.gettempdir()) / ("sandbox-cc-" + os.urandom(4).hex())
+        self.allowed.mkdir()
+        self._orig_segment = server._run_segment
+        self._orig_pipeline = server._run_pipeline
+        self._orig_background = server._run_background
+        server._SESSION_FUNCTIONS.clear()
+
+    def tearDown(self) -> None:
+        _remove_stubs(self._orig_segment, self._orig_pipeline)
+        server._run_background = self._orig_background
+        shutil.rmtree(self.allowed, ignore_errors=True)
+        self._tmp.cleanup()
+        server._SESSION_FUNCTIONS.clear()
+
+    def test_function_persists_across_calls(self) -> None:
+        """Define a function in call 1; call it in call 2 — it should still work."""
+        calls1 = _install_stubs()
+        try:
+            result1 = server.shell_run(
+                "myfunc() { echo hello; }",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        self.assertNotIn("Exit code: 1", result1)
+
+        # Call 2: invoke the function — install fresh stubs
+        calls2 = _install_stubs()
+        try:
+            result2 = server.shell_run(
+                "myfunc",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        # The function call should have been dispatched to echo hello via stub
+        self.assertTrue(
+            any("echo" in c.get("args", "") for c in calls2),
+            f"Expected echo in calls: {calls2}"
+        )
+
+    def test_unset_f_removes_function(self) -> None:
+        """unset -f NAME should remove a function but leave variables intact."""
+        _install_stubs()
+        try:
+            server.shell_run(
+                "myfunc2() { echo world; }",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        calls = _install_stubs()
+        try:
+            server.shell_run(
+                "MYVAR=42; unset -f myfunc2; echo $MYVAR",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        # echo $MYVAR should expand to echo 42 via the stub
+        self.assertTrue(
+            any("42" in c.get("args", "") for c in calls),
+            f"Expected 42 in calls: {calls}"
+        )
+
+        # Now calling myfunc2 should fail
+        calls2 = _install_stubs()
+        try:
+            server.shell_run(
+                "myfunc2",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        # Should not have dispatched to echo world
+        self.assertFalse(
+            any("world" in c.get("args", "") for c in calls2),
+            f"Expected no world in calls: {calls2}"
+        )
+
+    def test_unset_no_flag_removes_both(self) -> None:
+        """unset NAME (no flag) removes from both variables and functions."""
+        _install_stubs()
+        try:
+            server.shell_run(
+                "myfunc3() { echo both; }",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        # Call 2: set var, unset both function and var, echo var
+        calls = _install_stubs()
+        try:
+            server.shell_run(
+                "BOTH=yes; unset myfunc3 BOTH; echo BOTH=$BOTH",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        # echo BOTH=$BOTH → BOTH should be unset, so args should show echo BOTH=
+        self.assertTrue(
+            any("BOTH=" in c.get("args", "") for c in calls),
+            f"Expected BOTH= in calls: {calls}"
+        )
+
+        # Call 3: function should be gone
+        calls2 = _install_stubs()
+        try:
+            server.shell_run(
+                "myfunc3",
+                cwd=str(self.allowed),
+                timeout=30,
+            )
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+        # Should not have dispatched to echo both
+        self.assertFalse(
+            any("both" in c.get("args", "") for c in calls2),
+            f"Expected no both in calls: {calls2}"
+        )

@@ -10,6 +10,7 @@ reach subprocesses (all base vars exported by default). ``unset PATH``
 removes from both.
 """
 
+import os
 from dataclasses import dataclass, field
 
 from .config import _base_env
@@ -38,6 +39,11 @@ class VariableStore:
 
     # Function call depth counter (for recursion cap).
     func_depth: int = 0
+
+    # Special variables — set by Runner before expansion.
+    # $? = last exit code, $$ = MCP server PID, $! = last bg PID, $- = shell flags.
+    last_rc: int = 0
+    last_bg_pid: int = 0
 
     # ------------------------------------------------------------------
     # lookup
@@ -99,6 +105,11 @@ class VariableStore:
         env["#"] = str(len(self.positional))
         env["@"] = " ".join(self.positional)
         env["*"] = " ".join(self.positional)
+        # Special variables
+        env["?"] = str(self.last_rc)
+        env["$"] = str(os.getpid())
+        env["!"] = str(self.last_bg_pid) if self.last_bg_pid else ""
+        env["-"] = ""
         return env
 
     def env_for_subprocess(self) -> dict[str, str]:

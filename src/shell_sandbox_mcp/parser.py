@@ -28,7 +28,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Optional
+from typing import Callable, Iterable, Literal, Mapping, Optional
 
 from .config import MAX_HEREDOC_BODY, MAX_SUBST_COUNT, MAX_SUBST_DEPTH, MAX_SUBST_OUTPUT
 
@@ -43,13 +43,13 @@ _SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
 # (${#VAR} length operator), or a digit, or @ or * (positional parameters).
 # The full braced span is brace-counted later in _lex_varref_braced /
 # _find_braced_end, so this only has to recognise the opening form.
-_BRACED_VAR_GUARD = re.compile(r"^\$\{(?:[A-Za-z_]|#|[0-9@*])")
+_BRACED_VAR_GUARD = re.compile(r"^\$\{(?:[A-Za-z_]|#|[0-9@*?$!-])")
 _VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Variable assignment and builtin detection helpers (used by split_chains /
 # segment_needs_variable_state).  Module-level so the detection is cheap.
 _ASSIGN_WORD_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
-_BUILTIN_NAMES = {"export", "unset", "set", "shift", "source", "."}
+_BUILTIN_NAMES = {"export", "unset", "set", "shift", "source", ".", "break", "continue"}
 
 
 def _find_braced_end(text: str, start: int) -> Optional[int]:
@@ -93,6 +93,9 @@ class Expansion:
     """
     _arg_values: dict[str, str] = field(default_factory=dict)
     _heredoc_bodies: dict[str, str] = field(default_factory=dict)
+    at_split_keys: set[str] = field(default_factory=set)
+    star_join_keys: set[str] = field(default_factory=set)
+    positional_tuple: tuple[str, ...] = ()
 
     # -- public opaque API ------------------------------------------------
 
@@ -302,6 +305,8 @@ class WordPart:
     raw: str = ""                          # raw text for serialization (defaults to text)
     is_sentinel: bool = False              # True if this is a subst/heredoc sentinel
     is_quoted: bool = False                # True if originated inside quotes
+    is_at_split: bool = False              # True if this is a quoted "$@" fan-out sentinel
+    is_star_join: bool = False             # True if this is a quoted "$*" IFS-joined sentinel
 
     @property
     def is_arg_sentinel(self) -> bool:
@@ -632,8 +637,8 @@ class Lexer:
             if nxt and (nxt.isalpha() or nxt == '_'):
                 self._lex_varref()
                 return
-            # Positional parameters: $0..$9, $#, $@, $*
-            if nxt and nxt in "0123456789#@*":
+            # Positional / special parameters: $0..$9, $#, $@, $*, $?, $$, $!, $-
+            if nxt and nxt in "0123456789#@*$?!-":
                 self._emit(TokenKind.VARREF, nxt)
                 self._advance(2)  # skip $ + the char
                 return
@@ -1411,11 +1416,11 @@ def _build_ast(
 
         # Try to match a regular variable name at the start.
         m = _VAR_NAME_RE.match(raw)
-        # If no regular name, try a positional-parameter name (digits or #@*).
+        # If no regular name, try a positional-parameter name (digits or #@*$?!-).
         if m is None:
-            if raw and (raw[0].isdigit() or raw[0] in "#@*"):
+            if raw and (raw[0].isdigit() or raw[0] in "#@*$?!-"):
                 # Extract the positional name: digits, or a single #/@/*
-                if raw[0] in "#@*":
+                if raw[0] in "#@*$?!-":
                     name = raw[0]
                     rest = raw[1:]
                 else:
@@ -1743,6 +1748,25 @@ def _build_ast(
                             )
                             parts.append(wp)
                             i = i + 1 + len(var_name)
+                        elif nxt2 and nxt2 in "0123456789#@*?$!-":
+                            flush()
+                            raw_subst = raw[i:i + 2]  # "$" + single char
+                            var_name = nxt2
+                            sentinel = _emit_arg_sentinel(raw_subst, var_name, is_subst=False)
+                            is_at = (nxt2 == "@")
+                            is_star = (nxt2 == "*")
+                            wp = WordPart(
+                                text=sentinel, raw=raw_subst,
+                                is_sentinel=True, is_quoted=True,
+                                is_at_split=is_at,
+                                is_star_join=is_star,
+                            )
+                            if is_at:
+                                expansion.at_split_keys.add(wp.text)
+                            if is_star:
+                                expansion.star_join_keys.add(wp.text)
+                            parts.append(wp)
+                            i += 2
                         else:
                             current_text.append(ch)
                             current_raw.append(ch)
@@ -3146,15 +3170,18 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
 # ---------------------------------------------------------------------------
 
 
-def segment_needs_variable_state(seg_text: str) -> bool:
+def segment_needs_variable_state(seg_text: str, known_functions: Iterable[str] = ()) -> bool:
     """Return True if *seg_text* contains a variable assignment, a builtin
-    (``export``, ``unset``, ``set``, ``shift``, ``source``, ``.``), or a
+    (``export``, ``unset``, ``set``, ``shift``, ``source``, ``.``), a
     control-flow keyword (``if``, ``while``, ``until``, ``for``, ``case``,
-    ``function``) in ANY pipeline stage position (including after ``|``).
+    ``function``), or a known user-defined function name in ANY pipeline
+    stage position (including after ``|``).
 
     Uses :class:`Lexer` so redirect operators (``2>``, ``>>``, ``<``, etc.)
     and their targets are skipped at each pipe boundary.
     """
+    _known_functions_set = frozenset(known_functions)
+
     try:
         tokens = Lexer(seg_text).tokenize()
     except (ParseError, ValueError):
@@ -3190,6 +3217,13 @@ def segment_needs_variable_state(seg_text: str) -> bool:
             return True
         if t.kind == TokenKind.FUNC_PARENS:
             return True
+        # Special-var VARREF tokens ($?, $$, $!, $-) ALWAYS need the
+        # stateful path regardless of position, because the non-stateful path
+        # doesn't inject special variables into the expansion env.  Check
+        # this BEFORE the skip_stage guard so it fires even after a
+        # non-builtin first word set skip_stage.
+        if t.kind == TokenKind.VARREF and t.value in "?$!-":
+            return True
         if skip_stage:
             continue
         if t.kind in _REDIRECT_KINDS:
@@ -3209,6 +3243,9 @@ def segment_needs_variable_state(seg_text: str) -> bool:
                 return True
             # Check control-flow keywords
             if t.value in _COMPOUND_KEYWORDS:
+                return True
+            # Check known user-defined functions (cross-call persistence)
+            if t.value in _known_functions_set:
                 return True
             # First non-redirect word of this stage — not a builtin/assignment,
             # skip rest of this stage
@@ -3422,36 +3459,77 @@ def _extract_from_node(
 
     Mirrors every validation and error string of ``_extract_from_string``
     so the two paths produce identical results.
+
+    Supports ``"$@"`` fan-out: a quoted ``$@`` inside a Word splits the
+    Word into one argv entry per positional parameter.  ``"$*"`` joins
+    positional parameters with a single space into one arg.  The fan-out
+    relies on ``expansion.positional_tuple`` being set before calling.
     """
     args: list[str] = []
     redirects: list[Redirect] = []
 
     for w in cmd.words:
-        resolved = ""
-        pattern = ""
-        glob_active = False
+        # In-flight fields: each dict will become one argv entry at end-of-Word.
+        # Seeded with a single empty field.
+        fields: list = [{"resolved": "", "pattern": "", "glob_active": False}]
+
         for p in w.parts:
-            if p.is_arg_sentinel and expansion is not None:
+            if p.is_at_split and expansion is not None:
+                # Fan-out "$@" — one field per positional.
+                positionals = expansion.positional_tuple
+                if not positionals:
+                    # Zero positionals: no-op — the current field stays as-is.
+                    # This yields "prepost" for pre"$@"post with no positionals.
+                    continue
+                # Append the first positional to the LAST in-flight field.
+                fields[-1]["resolved"] += positionals[0]
+                # "$@" is quoted → pattern uses glob.escape.
+                fields[-1]["pattern"] += _glob.escape(positionals[0])
+                # For subsequent positionals, start new fields.
+                for pos in positionals[1:]:
+                    fields.append({
+                        "resolved": pos,
+                        "pattern": _glob.escape(pos),
+                        "glob_active": False,
+                    })
+            elif p.is_star_join and expansion is not None:
+                # Quoted "$*" — space-join all positionals into a single value.
+                joined = " ".join(expansion.positional_tuple)
+                fields[-1]["resolved"] += joined
+                # "$*" is quoted → pattern uses glob.escape.
+                fields[-1]["pattern"] += _glob.escape(joined)
+            elif p.is_at_split and expansion is None:
+                # No expansion → sentinel literal text (shouldn't happen in
+                # practice but be defensive).
+                fields[-1]["resolved"] += p.text
+                fields[-1]["pattern"] += p.text
+            elif p.is_arg_sentinel and expansion is not None:
                 val = expansion.arg_for(p)
                 val = val if val is not None else p.text
-                resolved += val
+                fields[-1]["resolved"] += val
                 if p.is_quoted:
-                    pattern += _glob.escape(val)
+                    fields[-1]["pattern"] += _glob.escape(val)
                 else:
-                    pattern += val
+                    fields[-1]["pattern"] += val
                     if any(c in val for c in "*?["):
-                        glob_active = True
+                        fields[-1]["glob_active"] = True
             else:
-                resolved += p.text
+                # Plain text, hd sentinel, or arg sentinel with no expansion.
+                fields[-1]["resolved"] += p.text
                 if p.is_quoted:
-                    pattern += _glob.escape(p.text)
+                    fields[-1]["pattern"] += _glob.escape(p.text)
                 else:
-                    pattern += p.text
+                    fields[-1]["pattern"] += p.text
                     if any(c in p.text for c in "*?["):
-                        glob_active = True
-        if resolved:
-            if work_dir is not None and glob_active:
-                matches = _expand_glob_arg(pattern, work_dir)
+                        fields[-1]["glob_active"] = True
+
+        # Emit each non-empty in-flight field as an argv entry.
+        for f in fields:
+            resolved = f["resolved"]
+            if not resolved:
+                continue
+            if work_dir is not None and f["glob_active"]:
+                matches = _expand_glob_arg(f["pattern"], work_dir)
                 if matches:
                     args.extend(matches)          # sorted/unique order from glob
                 else:

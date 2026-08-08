@@ -348,11 +348,11 @@ class LiteralFallbackTest(unittest.TestCase):
     def test_unknown_case_pattern_literal(self) -> None:
         _assert_both_equal(self, "echo ${HOME^foo}", ["echo", "${HOME^foo}"])
 
-    def test_dollar_dollar_literal(self) -> None:
-        _assert_both_equal(self, "echo $$", ["echo", "$$"])
+    def test_dollar_dollar_resolves(self) -> None:
+        _assert_both_equal(self, "echo $$", ["echo", "11111"], env={**ENV, "$": "11111", "?": "0"})
 
-    def test_dollar_question_literal(self) -> None:
-        _assert_both_equal(self, "echo $?", ["echo", "$?"])
+    def test_dollar_question_resolves(self) -> None:
+        _assert_both_equal(self, "echo $?", ["echo", "0"], env={**ENV, "$": "11111", "?": "0"})
 
     def test_dollar_zero_literal(self) -> None:
         # Phase C: $0 is now a positional parameter (not literal).

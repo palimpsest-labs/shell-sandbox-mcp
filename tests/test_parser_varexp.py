@@ -6,11 +6,12 @@ Validates that:
 - Braced "${VAR}" expands.
 - Single-quoted '$VAR' is literal.
 - Escaped \$VAR (unquoted and dq) is literal.
-- Special params: $$ and $? are literal; $0, $1, $@ are positional parameters
+- Special params: $$ and $? are now special-variable lookups (PID, last exit code);
+  $0, $1, $@ are positional parameters
   (Phase C) that resolve to empty when no positional params are supplied.
 - Braced-default ${VAR:-x} expands (new parameter-expansion operators live in
   test_parser_param_exp.py; plain ${VAR} stays a straight env lookup).
-- $$ is literal, $(( is still rejected.
+- $$ resolves via special-variable lookup, $(( is still rejected.
 - $ at EOL is literal.
 - var-then-subst ordering: $A$(echo b).
 - Adjacent text: a$HOMEb → a (POSIX: $HOMEb is var HOMEb, unset).
@@ -253,11 +254,11 @@ class SpecialParamTest(unittest.TestCase):
     """$$ and $? stay literal.  $0, $1, $@ are now positional parameters
     (Phase C), resolving to empty when no positional params are provided."""
 
-    def test_dollar_dollar_literal(self) -> None:
-        _assert_both_equal(self, "echo $$", ["echo", "$$"])
+    def test_dollar_dollar_resolves(self) -> None:
+        _assert_both_equal(self, "echo $$", ["echo", "11111"], env={"$": "11111", "?": "0"})
 
-    def test_dollar_question_literal(self) -> None:
-        _assert_both_equal(self, "echo $?", ["echo", "$?"])
+    def test_dollar_question_resolves(self) -> None:
+        _assert_both_equal(self, "echo $?", ["echo", "0"], env={"$": "11111", "?": "0"})
 
     def test_dollar_zero_literal(self) -> None:
         # Phase C: $0 is a positional parameter, resolves to empty → dropped.
@@ -393,10 +394,10 @@ class ScannerExpansionTest(unittest.TestCase):
         self.assertIn("$HOME", cleaned)
 
     def test_special_param_no_sentinel(self) -> None:
-        """$$ should NOT produce a sentinel."""
+        """$? / $$ / $! / $- now produce sentinels (special-variable lookup)."""
         cleaned, exp, prog = _parse("echo $$")
-        self.assertFalse(_any_arg_sentinel(prog))
-        self.assertIn("$$", cleaned)
+        # $$ is now a VARREF — it DOES produce a sentinel
+        self.assertTrue(_any_arg_sentinel(prog))
 
 
 # ---------------------------------------------------------------------------
