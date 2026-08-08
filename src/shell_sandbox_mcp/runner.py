@@ -18,12 +18,66 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from .executor import _get_server
-from .parser import Expansion
+from .parser import (
+    CommandNode,
+    Expansion,
+    ForNode,
+    IfNode,
+    ParseError,
+    WhileNode,
+    program_to_chain,
+)
+from .config import MAX_LOOP_ITER
 
 if TYPE_CHECKING:
     from .variables import VariableStore
 
 __all__ = ["Runner", "Result"]
+
+
+def _expand_for_word(
+    raw_word: str,
+    work_dir: Path,
+    timeout: int,
+    depth: int,
+    base_env: dict[str, str],
+    srv,
+) -> str:
+    """Expand a single word from the for-loop's ``in`` list.
+
+    Uses the existing ``_expand_command`` machinery on a synthetic ``echo``
+    command so that ``$()``, ``$VAR``, and glob expansion all apply.  Strips
+    the leading ``echo`` (first arg) to recover the expanded word value.
+    Returns the original *raw_word* unchanged on any expansion failure.
+    """
+    if raw_word == "":
+        return ""
+
+    try:
+        expanded, expansion, program = srv._expand_command(
+            f"__for_expand {raw_word}",
+            work_dir, timeout, depth + 1,
+            env=base_env,
+        )
+    except (ParseError, ValueError):
+        return raw_word  # fallback: literal
+
+    if program is None:
+        return raw_word
+
+    chains = program_to_chain(program)
+    if not chains or not chains[0][1]:
+        return raw_word
+
+    from .parser import _extract_from_node
+    args, _, _ = _extract_from_node(chains[0][1][0], expansion, work_dir)
+    if not args or args[0] != "__for_expand":
+        return raw_word
+    # The expanded word is everything after the synthetic command name.
+    # If there are multiple words (e.g. glob expansion), join them.
+    if len(args) == 1:
+        return ""
+    return " ".join(args[1:])
 
 
 @dataclass
@@ -282,6 +336,23 @@ class Runner:
             if not cmd_nodes:
                 continue
 
+            # Compound command dispatch (if/while/until/for).
+            # Must be checked BEFORE assignment-prefix / builtin processing
+            # because compounds are not regular CommandNodes.
+            if not bg and len(cmd_nodes) == 1:
+                node = cmd_nodes[0]
+                if isinstance(node, (IfNode, WhileNode, ForNode)):
+                    rc, out = self._run_compound(
+                        node, store, self.work_dir, timeout, depth,
+                        joined_for_stage=joined,
+                    )
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    if out:
+                        self.outputs.append(out)
+                    continue
+
             # Per-stage detection: assignment prefix, builtins, cd, timeout
             prefix_maps: list[dict[str, str]] = []    # all prefixes (for pure-assignment branch)
             remaining_nodes: list = []                 # stages with commands to run
@@ -422,8 +493,8 @@ class Runner:
                 self.ran_any = True
                 continue
 
-            # cd builtin
-            if not bg and len(nodes) == 1:
+            # cd builtin — skip compounds (they are handled later).
+            if not bg and len(nodes) == 1 and isinstance(nodes[0], CommandNode):
                 new_dir, cd_err = srv._try_cd(nodes[0], self.work_dir, expansion)
                 if cd_err is not None:
                     self.outputs.append(cd_err)
@@ -436,6 +507,34 @@ class Runner:
                     self.prev_rc = 0
                     self.ran_any = True
                     self.stages.append({"command": joined, "output": "", "rc": 0})
+                    continue
+
+            # Compound command dispatch (if/while/until/for).
+            # Compounds must be the sole element of their pipeline and
+            # cannot be backgrounded.  They route through the stateful
+            # execution path so they have access to the VariableStore.
+            #
+            # This is the second dispatch point (the first is above, at
+            # the top of the segment-processing loop).  The first dispatch
+            # catches compounds immediately from cmd_nodes before any
+            # prefix/builtin/cd processing.  This second dispatch handles
+            # the (currently unreachable but defensive) case where a
+            # compound survives through prefix-extraction and reappears
+            # in *nodes*.  Consolidation would require restructuring the
+            # entire prefix/builtin/cd block; keeping both is simpler and
+            # harmless.
+            if not bg and len(nodes) == 1:
+                node = nodes[0]
+                if isinstance(node, (IfNode, WhileNode, ForNode)):
+                    rc, out = self._run_compound(
+                        node, store, self.work_dir, timeout, depth,
+                        joined_for_stage=joined,
+                    )
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    if out:
+                        self.outputs.append(out)
                     continue
 
             # Per-stage builtin handling in multi-stage pipelines.
@@ -629,3 +728,191 @@ class Runner:
             return f"builtin not handled: {name}", 1
 
         return _builtin_result(rc, out)
+
+    # ------------------------------------------------------------------
+    # Compound command execution (if / while / until / for)
+    # ------------------------------------------------------------------
+
+    def _run_compound(
+        self,
+        node: "IfNode | WhileNode | ForNode",
+        store: "VariableStore",
+        work_dir: "Path",
+        timeout: int,
+        depth: int,
+        *,
+        joined_for_stage: str,
+    ) -> tuple[int, str]:
+        """Execute a compound command and return ``(rc, output)``.
+
+        *node* is one of :class:`IfNode`, :class:`WhileNode`, or
+        :class:`ForNode`.  The body text is re-parsed and executed with a
+        fresh per-body :class:`Runner` that shares *store* (so variable
+        mutations persist) but uses a snapshot of *work_dir* (so ``cd``
+        inside a body does NOT leak).
+        """
+        if isinstance(node, IfNode):
+            return self._run_if(node, store, work_dir, timeout, depth,
+                                joined_for_stage=joined_for_stage)
+        elif isinstance(node, WhileNode):
+            return self._run_while_until(node, store, work_dir, timeout, depth,
+                                         joined_for_stage=joined_for_stage)
+        elif isinstance(node, ForNode):
+            return self._run_for(node, store, work_dir, timeout, depth,
+                                 joined_for_stage=joined_for_stage)
+        else:
+            return 1, f"unknown compound: {type(node).__name__}"
+
+    def _run_if(
+        self, node: IfNode, store, work_dir, timeout, depth,
+        *, joined_for_stage: str,
+    ) -> tuple[int, str]:
+        """Execute an if/elif/else/fi construct."""
+        outputs: list[str] = []
+        for branch in node.branches:
+            rc, out = self._run_body(
+                branch.cond, store, work_dir, timeout, depth,
+            )
+            if out:
+                outputs.append(out)
+            if rc == 0:
+                # Condition true — run this branch's body and return.
+                brc, bout = self._run_body(
+                    branch.body, store, work_dir, timeout, depth,
+                )
+                if bout:
+                    outputs.append(bout)
+                return brc, "\n".join(outputs) if outputs else ""
+            # else: fall through to elif/else
+        # No branch matched — run else_body if present.
+        if node.else_body is not None:
+            rc, out = self._run_body(
+                node.else_body, store, work_dir, timeout, depth,
+            )
+            if out:
+                outputs.append(out)
+            return rc, "\n".join(outputs) if outputs else ""
+        return 0, "\n".join(outputs) if outputs else ""
+
+    def _run_while_until(
+        self, node: WhileNode, store, work_dir, timeout, depth,
+        *, joined_for_stage: str,
+    ) -> tuple[int, str]:
+        """Execute a while/until loop with MAX_LOOP_ITER cap."""
+        outputs: list[str] = []
+        last_rc = 0
+        iterations = 0
+
+        while iterations < MAX_LOOP_ITER:
+            rc, out = self._run_body(
+                node.cond, store, work_dir, timeout, depth,
+            )
+            if out:
+                outputs.append(out)
+            # while: enter body if rc==0; until: enter body if rc!=0
+            enter = (rc == 0) if not node.until else (rc != 0)
+            if not enter:
+                last_rc = rc
+                break
+            # Enter body
+            brc, bout = self._run_body(
+                node.body, store, work_dir, timeout, depth,
+            )
+            if bout:
+                outputs.append(bout)
+            last_rc = brc
+            iterations += 1
+
+        if iterations >= MAX_LOOP_ITER:
+            outputs.append(
+                f"loop exceeded MAX_LOOP_ITER ({MAX_LOOP_ITER}) iterations"
+            )
+            return 1, "\n".join(outputs) if outputs else ""
+
+        return last_rc, "\n".join(outputs) if outputs else ""
+
+    def _run_for(
+        self, node: ForNode, store, work_dir, timeout, depth,
+        *, joined_for_stage: str,
+    ) -> tuple[int, str]:
+        """Execute an AST-native for-loop.
+
+        The loop variable persists after the loop (matching POSIX semantics):
+        it is left at the value from the last iteration, or unset if the
+        ``in`` word list was empty.
+        """
+        srv = _get_server()
+        from .config import _base_env
+
+        base_env = _base_env()
+
+        # Expand in-words through the existing expansion machinery.
+        in_words: list[str] = []
+        for raw_word in node.in_words:
+            expanded = _expand_for_word(raw_word, work_dir, timeout, depth,
+                                        base_env, srv)
+            in_words.append(expanded)
+
+        outputs: list[str] = []
+        last_rc = 0
+
+        for word_value in in_words:
+            store.set_local(node.var_name, word_value)
+            rc, out = self._run_body(
+                node.body, store, work_dir, timeout, depth,
+            )
+            if out:
+                outputs.append(out)
+            last_rc = rc
+
+        if not outputs:
+            return last_rc, ""
+        return last_rc, "\n".join(outputs)
+
+    def _run_body(
+        self,
+        body_text: str,
+        store: "VariableStore",
+        work_dir: "Path",
+        timeout: int,
+        depth: int,
+    ) -> tuple[int, str]:
+        """Re-parse *body_text* and execute it with a fresh sub-Runner.
+
+        The sub-Runner SHARES *store* (so variable mutations persist) but
+        gets a snapshot of *work_dir* (so ``cd`` inside a body doesn't leak).
+        """
+        srv = _get_server()
+
+        if not body_text.strip():
+            return 0, ""
+
+        env = store.env_for_expansion()
+        try:
+            expanded, expansion, program = srv._expand_command(
+                body_text, work_dir, timeout, depth + 1,
+                env=env,
+            )
+        except (ParseError, ValueError) as e:
+            return 1, str(e)
+
+        if program is None:
+            return 1, "Command parse error."
+
+        chains = program_to_chain(program)
+        if not chains:
+            return 0, ""
+
+        # Create a fresh Runner that SHARES the variable store.
+        sub_runner = Runner(
+            work_dir=Path(str(work_dir)),  # snapshot
+            default_timeout=timeout,
+            expansion=expansion,
+            variables=store,
+        )
+        result = sub_runner.run_command(
+            body_text, timeout, depth=depth + 1, structured=True,
+        )
+        # structured=True guarantees a Result object.
+        assert isinstance(result, Result)
+        return result.rc, result.text

@@ -351,8 +351,13 @@ class CommandNode:
 
 @dataclass(frozen=True)
 class PipelineNode:
-    """A pipe-connected sequence of commands."""
-    commands: tuple[CommandNode, ...] = ()
+    """A pipe-connected sequence of commands (may contain compound commands).
+
+    Invariant: a compound command (IfNode/WhileNode/ForNode) MUST be the sole
+    element of its PipelineNode.  ``_run_segment`` / ``_run_pipeline`` should
+    never receive a compound — they are intercepted higher up.
+    """
+    commands: tuple["CommandLike", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -367,6 +372,72 @@ class AndOrNode:
 class ProgramNode:
     """Top-level program: list of and-or chains."""
     chains: tuple[AndOrNode, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Compound command AST nodes (if/while/until/for)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class IfBranch:
+    """A single branch of an if/elif: condition text + body text."""
+    cond: str
+    body: str
+
+
+@dataclass(frozen=True)
+class IfNode:
+    """``if cond; then body; elif cond; then body; else body; fi``."""
+    branches: tuple[IfBranch, ...]
+    else_body: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class WhileNode:
+    """``while cond; do body; done`` or ``until cond; do body; done``."""
+    until: bool
+    cond: str
+    body: str
+
+
+@dataclass(frozen=True)
+class ForNode:
+    """``for var in words; do body; done`` — AST-native for-loop."""
+    var_name: str
+    in_words: tuple[str, ...]
+    body: str
+
+
+CompoundCommand = "IfNode | WhileNode | ForNode"
+CommandLike = "CommandNode | CompoundCommand"
+
+
+# ---------------------------------------------------------------------------
+# Reserved words for AST-native control flow
+# ---------------------------------------------------------------------------
+
+_RESERVED_WORDS = frozenset({
+    "if", "elif", "else", "then", "fi",
+    "for", "in", "do", "done",
+    "while", "until",
+    "case", "esac",
+    "function",
+})
+
+# For-loop variable name validator (moved from builtins.py).
+_FOR_VAR_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def _is_reserved(tok: Token, word: str) -> bool:
+    """Return True if *tok* is an unquoted WORD matching *word* (a reserved word).
+
+    Quoted forms like ``"if"`` or ``'while'`` lex with quote chars preserved
+    and are NOT keywords (correct POSIX behaviour).  Escaped ``\\if`` lexes
+    as ``"i"`` (also not a keyword).
+    """
+    if tok.kind != TokenKind.WORD:
+        return False
+    return tok.value == word
 
 
 # ---------------------------------------------------------------------------
@@ -957,6 +1028,7 @@ def _build_ast(
     tokens: list[Token],
     expansion: Expansion,
     *,
+    command: str = "",
     capture_fn=None,
     env=None,
     depth: int = 0,
@@ -1545,11 +1617,19 @@ def _build_ast(
 
     def _parse_pipeline() -> Optional[PipelineNode]:
         nonlocal pos
-        commands: list[CommandNode] = []
+        commands: list[CommandLike] = []
         while True:
             _skip_ws()
             cmd = _parse_command()
             if cmd is not None:
+                # Compound commands must be the sole element of a pipeline.
+                if isinstance(cmd, (IfNode, WhileNode, ForNode)):
+                    if commands:
+                        raise ParseError(
+                            "compound command cannot appear in a pipe"
+                        )
+                    commands.append(cmd)
+                    break
                 commands.append(cmd)
 
             _skip_ws()
@@ -1561,10 +1641,367 @@ def _build_ast(
 
         if not commands:
             return None
+
+        # After the loop: if the pipeline ends with a compound command,
+        # a trailing | is illegal (the compound must be the sole element).
+        _skip_ws()
+        t = _peek()
+        if t is not None and t.kind == TokenKind.PIPE:
+            if any(isinstance(c, (IfNode, WhileNode, ForNode)) for c in commands):
+                raise ParseError(
+                    "compound command cannot appear in a pipe"
+                )
+
         return PipelineNode(commands=tuple(commands))
 
-    def _parse_command() -> Optional[CommandNode]:
+    # ------------------------------------------------------------------
+    # _slice_body — token-level body scanner for compound commands
+    # ------------------------------------------------------------------
+
+    def _slice_body(
+        terminators: frozenset[str],
+        *,
+        track_nesting: bool = True,
+    ) -> tuple[str, int]:
+        """Scan tokens from *pos* forward, tracking compound nesting.
+
+        Returns ``(body_text, token_index_of_terminator)`` where *body_text*
+        is ``command[start_pos : terminator_token.pos]`` (verbatim text) and
+        *token_index_of_terminator* is the index of the matching token so the
+        caller can ``_consume()`` it.
+
+        *terminators* are the reserved words that end this body at depth 0
+        (e.g. ``{"then"}``, ``{"done"}``, ``{"fi"}``, ``{"elif","else","fi"}``).
+
+        Raises :class:`ParseError` for unexpected reserved words at depth 0
+        or missing terminators at EOF.
+        """
         nonlocal pos
+        _skip_ws()
+        if pos >= n:
+            expected = "|".join(sorted(terminators))
+            raise ParseError(
+                f"unexpected EOF looking for '{expected}'"
+            )
+
+        body_start = tokens[pos].pos
+        depth = 0
+        expect_command = True  # first token after opening keyword is at cmd position
+
+        # Compound openers / closers that affect nesting depth.
+        _COMPOUND_OPENERS = frozenset({"if", "for", "while", "until", "case", "("})
+        _COMPOUND_CLOSERS = frozenset({"fi", "done", "esac", ")"})
+
+        # Keywords that are ALWAYS recognized as terminators, even without
+        # a preceding separator (then/do/else/elif).  These are "unconditional
+        # keywords" in POSIX — they terminate the preceding construct regardless
+        # of whether there's a ; or newline before them.
+        _ALWAYS_KEYWORD = frozenset({"then", "do", "else", "elif"})
+
+        while pos < n:
+            t = tokens[pos]
+            kind = t.kind
+
+            # Whitespace / newlines — skip; newline acts as command separator.
+            if kind == TokenKind.WS:
+                pos += 1
+                continue
+            if kind == TokenKind.NEWLINE:
+                expect_command = True
+                pos += 1
+                continue
+
+            # Chain operators reset expect_command.
+            if kind in (TokenKind.SEMI, TokenKind.AND_AND,
+                        TokenKind.OR_OR, TokenKind.PIPE, TokenKind.BG):
+                expect_command = True
+                pos += 1
+                continue
+
+            # REDIRECT operators — not at command position, skip them and target.
+            _REDIRECT_KINDS = frozenset({
+                TokenKind.R_OUT, TokenKind.R_APPEND, TokenKind.R_IN,
+                TokenKind.R_FD_DUP, TokenKind.R_HEREDOC,
+                TokenKind.R_HEREDOC_STRIP, TokenKind.R_HERESTRING,
+            })
+            if kind in _REDIRECT_KINDS:
+                expect_command = False
+                pos += 1
+                # For heredocs/here-strings where tok.body is already set,
+                # the lexer consumed the delimiter and body; there is no
+                # target WORD to skip (matching _parse_command's handling).
+                # Reset expect_command because the heredoc body consumed
+                # all intervening newlines — the next token is at command
+                # position.
+                if kind in (TokenKind.R_HEREDOC, TokenKind.R_HEREDOC_STRIP,
+                            TokenKind.R_HERESTRING) and t.body is not None:
+                    expect_command = True
+                    continue
+                # Skip the redirect target WORD if present
+                _skip_ws()
+                if pos < n and tokens[pos].kind == TokenKind.WORD:
+                    pos += 1
+                continue
+
+            # SUBST / VARREF — not a keyword, just consume.
+            if kind in (TokenKind.SUBST, TokenKind.VARREF):
+                expect_command = False
+                pos += 1
+                continue
+
+            # WORD — check for reserved words.
+            if kind == TokenKind.WORD:
+                word = t.value
+                if expect_command and track_nesting and word in _COMPOUND_OPENERS:
+                    depth += 1
+                    expect_command = False
+                    pos += 1
+                    continue
+                if expect_command and track_nesting and word in _COMPOUND_CLOSERS:
+                    if depth > 0:
+                        depth -= 1
+                        expect_command = False
+                        pos += 1
+                        continue
+                    # depth == 0: this is a closer. Is it our terminator?
+                    if word in terminators:
+                        body_end = t.pos
+                        return command[body_start:body_end], pos
+                    raise ParseError(f"unexpected '{word}'")
+                if expect_command and word in terminators:
+                    # Found our terminator at depth 0.
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
+                # Always-keyword terminators (then/do/else/elif) are
+                # recognized even without a preceding separator.
+                if word in _ALWAYS_KEYWORD and word in terminators:
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
+                # An always-keyword at command position at depth 0 that's
+                # NOT a valid terminator is a syntax error (e.g. bare "then"
+                # or "do" at the top level of a body that isn't looking for
+                # them).  At depth > 0 they belong to a nested compound.
+                if expect_command and depth == 0 and word in _ALWAYS_KEYWORD:
+                    raise ParseError(f"unexpected '{word}'")
+                # An always-keyword at depth > 0 resets expect_command so the
+                # next word is at command position for nested compound
+                # tracking (matching split_chains' _CMD_START_KW behaviour).
+                if word in _ALWAYS_KEYWORD:
+                    expect_command = True
+                    pos += 1
+                    continue
+                # Not at command position or not a keyword — consume.
+                expect_command = False
+                pos += 1
+                continue
+
+            # Unknown token — consume and reset.
+            expect_command = False
+            pos += 1
+
+        # EOF — missing terminator.
+        expected = "|".join(sorted(terminators))
+        raise ParseError(f"unexpected EOF looking for '{expected}'")
+
+    # ------------------------------------------------------------------
+    # _parse_if — parse if/elif/else/fi
+    # ------------------------------------------------------------------
+
+    def _parse_if() -> IfNode:
+        """Parse ``if COND; then BODY; [elif COND; then BODY;] [else BODY;] fi``.
+
+        Caller has already detected the ``if`` keyword and is about to consume it.
+        """
+        nonlocal pos
+        _skip_ws()
+        if_tok = _consume()
+        assert if_tok is not None and _is_reserved(if_tok, "if")
+
+        branches: list[IfBranch] = []
+
+        # --- if branch ---
+        cond_text, _ = _slice_body(frozenset({"then"}))
+        if not cond_text.strip().rstrip(";").strip():
+            raise ParseError("expected command after 'if'")
+        _skip_ws()
+        then_tok = _consume()
+        if then_tok is None or not _is_reserved(then_tok, "then"):
+            raise ParseError("expected 'then'")
+        body_text, _ = _slice_body(frozenset({"elif", "else", "fi"}))
+        branches.append(IfBranch(cond=cond_text, body=body_text))
+
+        # --- elif / else / fi ---
+        else_body: Optional[str] = None
+        while pos < n:
+            _skip_ws()
+            t = _peek()
+            if t is None:
+                raise ParseError("unexpected EOF looking for 'fi'")
+            if _is_reserved(t, "elif"):
+                _consume()
+                cond_text, _ = _slice_body(frozenset({"then"}))
+                if not cond_text.strip().rstrip(";").strip():
+                    raise ParseError("expected command after 'elif'")
+                _skip_ws()
+                then_tok = _consume()
+                if then_tok is None or not _is_reserved(then_tok, "then"):
+                    raise ParseError("expected 'then'")
+                body_text, _ = _slice_body(frozenset({"elif", "else", "fi"}))
+                branches.append(IfBranch(cond=cond_text, body=body_text))
+            elif _is_reserved(t, "else"):
+                _consume()
+                else_body_text, _ = _slice_body(frozenset({"fi"}))
+                else_body = else_body_text
+                _skip_ws()
+                fi_tok = _consume()
+                if fi_tok is None or not _is_reserved(fi_tok, "fi"):
+                    raise ParseError("expected 'fi'")
+                break
+            elif _is_reserved(t, "fi"):
+                _consume()
+                break
+            else:
+                raise ParseError(f"unexpected '{t.value}'")
+
+        return IfNode(branches=tuple(branches), else_body=else_body)
+
+    # ------------------------------------------------------------------
+    # _parse_while — parse while/until/do/done
+    # ------------------------------------------------------------------
+
+    def _parse_while(until: bool) -> WhileNode:
+        """Parse ``while COND; do BODY; done`` or ``until COND; do BODY; done``.
+
+        Caller has already detected the ``while`` or ``until`` keyword.
+        """
+        nonlocal pos
+        _skip_ws()
+        kw_tok = _consume()
+        assert kw_tok is not None
+
+        cond_text, _ = _slice_body(frozenset({"do"}))
+        kw_name = "until" if until else "while"
+        if not cond_text.strip().rstrip(";").strip():
+            raise ParseError(f"expected command after '{kw_name}'")
+        _skip_ws()
+        do_tok = _consume()
+        if do_tok is None or not _is_reserved(do_tok, "do"):
+            raise ParseError("expected 'do'")
+        body_text, _ = _slice_body(frozenset({"done"}))
+        _skip_ws()
+        done_tok = _consume()
+        if done_tok is None or not _is_reserved(done_tok, "done"):
+            raise ParseError("expected 'done'")
+
+        return WhileNode(until=until, cond=cond_text, body=body_text)
+
+    # ------------------------------------------------------------------
+    # _parse_for — AST-native for-loop parser
+    # ------------------------------------------------------------------
+
+    def _parse_for() -> ForNode:
+        """Parse ``for VAR [in WORD…] [;] do BODY done``.
+
+        Caller has already detected the ``for`` keyword.
+        """
+        nonlocal pos
+        _skip_ws()
+        for_tok = _consume()
+        assert for_tok is not None and _is_reserved(for_tok, "for")
+
+        # Read variable name.
+        _skip_ws()
+        var_tok = _consume()
+        if var_tok is None or var_tok.kind != TokenKind.WORD:
+            raise ParseError("for: missing variable name")
+        var_name = var_tok.value
+        if not _FOR_VAR_RE.match(var_name):
+            raise ParseError(f"for: invalid variable name '{var_name}'")
+
+        # Collect in-words (optional).
+        in_words: list[str] = []
+        _skip_ws()
+        t = _peek()
+        if t is not None and _is_reserved(t, "in"):
+            _consume()  # consume 'in'
+            # Collect words until 'do', ';', or end.
+            while True:
+                _skip_ws()
+                t2 = _peek()
+                if t2 is None:
+                    raise ParseError("for: missing 'do'")
+                if t2.kind == TokenKind.SEMI:
+                    _consume()
+                    break
+                if _is_reserved(t2, "do"):
+                    break
+                if t2.kind == TokenKind.WORD:
+                    _consume()
+                    in_words.append(t2.value)
+                elif t2.kind == TokenKind.SUBST:
+                    # $() in in-words — collect the raw text for re-expansion
+                    _consume()
+                    in_words.append("$(" + t2.value + ")")
+                elif t2.kind == TokenKind.VARREF:
+                    _consume()
+                    in_words.append("$" + t2.value)
+                else:
+                    raise ParseError(f"for: unexpected token in word list: {t2.kind}")
+        elif t is not None and t.kind == TokenKind.SEMI:
+            _consume()
+        elif t is not None and _is_reserved(t, "do"):
+            pass  # no in-clause, do directly
+        # else: no in-clause, no semicolon — should be 'do' next
+
+        # Consume optional ';' then 'do'.
+        _skip_ws()
+        t = _peek()
+        if t is not None and t.kind == TokenKind.SEMI:
+            _consume()
+            _skip_ws()
+            t = _peek()
+
+        if t is None or not _is_reserved(t, "do"):
+            raise ParseError("for: expected 'do'")
+        _consume()  # consume 'do'
+
+        body_text, _ = _slice_body(frozenset({"done"}))
+        _skip_ws()
+        done_tok = _consume()
+        if done_tok is None or not _is_reserved(done_tok, "done"):
+            raise ParseError("for: expected 'done'")
+
+        return ForNode(
+            var_name=var_name,
+            in_words=tuple(in_words),
+            body=body_text,
+        )
+
+    def _parse_command() -> Optional[CommandLike]:
+        nonlocal pos
+
+        # ---- reserved-word dispatch ----
+        # Peek past whitespace for a reserved word at command position.
+        saved_pos = pos
+        _skip_ws()
+        t = _peek()
+        if t is not None and t.kind == TokenKind.WORD:
+            if _is_reserved(t, "if"):
+                return _parse_if()
+            if _is_reserved(t, "while"):
+                return _parse_while(until=False)
+            if _is_reserved(t, "until"):
+                return _parse_while(until=True)
+            if _is_reserved(t, "for"):
+                return _parse_for()
+            # Reserved words that should never appear at command position
+            # (they only make sense inside a compound body).
+            if t.value in ("fi", "then", "else", "elif", "do", "done",
+                           "esac", "case", "function", "in"):
+                raise ParseError(f"unexpected '{t.value}'")
+        # Restore position for normal command parsing.
+        pos = saved_pos
+
         words: list[Word] = []
         redirects: list[RedirectSpec] = []
         current_parts: list[WordPart] = []
@@ -1830,13 +2267,20 @@ def _serialize_pipeline(pipeline: PipelineNode, sentinel: bool = False) -> str:
     return " | ".join(s for s in cmd_strs if s)
 
 
-def _serialize_command(cmd: CommandNode, sentinel: bool = False) -> str:
-    """Return a display string for *cmd*.
+def _serialize_command(cmd: "CommandLike", sentinel: bool = False) -> str:
+    """Return a display string for *cmd* (a :class:`CommandNode` or compound).
 
     When *sentinel* is True, words and redirect targets use the sentinel form
     (for :func:`serialize_program`); otherwise the human-readable display form
     is used (for :func:`cmd_to_display` and :func:`split_legacy`).
     """
+    if isinstance(cmd, IfNode):
+        return "<if statement>"
+    if isinstance(cmd, WhileNode):
+        return "<while loop>" if not cmd.until else "<until loop>"
+    if isinstance(cmd, ForNode):
+        return "<for loop>"
+
     if sentinel:
         word_serialize = lambda w: w.serialized()  # noqa: E731
         target_serialize = lambda t: t.serialized()  # noqa: E731
@@ -1895,17 +2339,17 @@ def split_legacy(command: str) -> list[tuple[Optional[str], list[str], bool]]:
 
 def program_to_chain(
     program: ProgramNode,
-) -> list[tuple[Optional[str], list[CommandNode], bool]]:
+) -> list[tuple[Optional[str], list["CommandLike"], bool]]:
     """Project a ProgramNode to the legacy chain format.
 
-    Returns ``[(operator, [CommandNode...], backgrounded), ...]``.
+    Returns ``[(operator, [CommandLike...], backgrounded), ...]``.
     This is the AST-native equivalent of ``split_legacy`` for use by the
     live execution path so it can walk the AST directly.
 
     Empty pipelines are dropped (matching ``split_legacy``'s empty-drop
     semantics) so that ``_run_pipeline`` never receives an empty list.
     """
-    result: list[tuple[Optional[str], list[CommandNode], bool]] = []
+    result: list[tuple[Optional[str], list["CommandLike"], bool]] = []
     for chain in program.chains:
         if not chain.pipeline.commands:
             continue  # drop empty pipeline (parity with split_legacy)
@@ -1935,21 +2379,66 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     the Lexer absorbs ``$(...)`` and heredoc bodies internally, any
     ``SEMI`` / ``AND_AND`` / ``OR_OR`` / ``BG`` / ``NEWLINE`` token in
     the stream is guaranteed to be at the top level.
-    """
-    _SEPARATOR_KINDS = frozenset({
-        TokenKind.SEMI, TokenKind.AND_AND, TokenKind.OR_OR,
-        TokenKind.BG, TokenKind.NEWLINE,
-    })
 
+    Compound constructs (``if``/``while``/``until``/``for``/``case``) are
+    tracked so that ``;`` / ``&&`` / ``||`` / ``|`` inside their bodies
+    are NOT treated as chain separators.  Nested compound depth is
+    maintained via open/close keyword pairing.
+    """
     tokens = Lexer(command).tokenize()
 
-    # Collect (start_pos, end_pos, kind) for each separator
-    separators: list[tuple[int, int, TokenKind]] = []
-    for t in tokens:
-        if t.kind in _SEPARATOR_KINDS:
-            separators.append((t.pos, t.pos + len(t.value), t.kind))
+    # First pass: compute which separators are at depth 0 (outside compounds).
+    _COMPOUND_OPENERS = frozenset({"if", "for", "while", "until", "case", "("})
+    _COMPOUND_CLOSERS = frozenset({"fi", "done", "esac", ")"})
+    # Keywords that start a new command context (like chain separators).
+    _CMD_START_KW = frozenset({"then", "else", "elif", "do"})
 
-    if not separators:
+    depth = 0
+    expect_command = True
+    depth_0_seps: set[int] = set()  # set of token indices for depth-0 separators
+
+    for i, t in enumerate(tokens):
+        kind = t.kind
+        if kind == TokenKind.WS:
+            continue
+        if kind == TokenKind.NEWLINE:
+            if depth == 0:
+                depth_0_seps.add(i)
+            expect_command = True
+            continue
+        # Chain separators: ; && || & — but NOT | (pipe stays in segment).
+        if kind in (TokenKind.SEMI, TokenKind.AND_AND,
+                    TokenKind.OR_OR, TokenKind.BG):
+            if depth == 0:
+                depth_0_seps.add(i)
+            expect_command = True
+            continue
+        # Pipe resets command position (pipeline stage boundary) but is
+        # NOT a chain separator — the whole pipeline stays in one segment.
+        if kind == TokenKind.PIPE:
+            expect_command = True
+            continue
+        if kind == TokenKind.WORD and expect_command:
+            word = t.value
+            if word in _COMPOUND_OPENERS:
+                depth += 1
+                expect_command = False
+                continue
+            if word in _COMPOUND_CLOSERS:
+                if depth > 0:
+                    depth -= 1
+                expect_command = False
+                continue
+        # Words that mark command boundaries (do/then/else/elif) reset
+        # expect_command so the next word is at command position (needed
+        # for nested compounds like ``for ...; do if ...; fi; done``).
+        if kind == TokenKind.WORD and t.value in _CMD_START_KW:
+            expect_command = True
+            continue
+        expect_command = False
+
+    # Second pass: build segments, only splitting at depth-0 separators.
+    if not depth_0_seps:
         stripped = command.strip()
         if not stripped:
             return []
@@ -1959,18 +2448,20 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     prev_end = 0
     next_op: Optional[str] = None
 
-    for sep_start, sep_end, kind in separators:
-        # Segment text BEFORE this separator
-        seg_text = command[prev_end:sep_start].strip()
+    for i, t in enumerate(tokens):
+        if i not in depth_0_seps:
+            continue
+        kind = t.kind
+        sep_start = t.pos
+        sep_end = t.pos + len(t.value)
 
-        # Is this segment backgrounded? (closed by &)
+        seg_text = command[prev_end:sep_start].strip()
         bg = (kind == TokenKind.BG)
 
         if seg_text:
             result.append((next_op, seg_text, bg))
-            next_op = None  # consumed
+            next_op = None
 
-        # Determine the operator for the NEXT segment
         if kind == TokenKind.SEMI:
             next_op = ";"
         elif kind == TokenKind.AND_AND:
@@ -1982,7 +2473,7 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
 
         prev_end = sep_end
 
-    # Final segment (after the last separator)
+    # Final segment
     last_seg = command[prev_end:].strip()
     if last_seg:
         result.append((next_op, last_seg, False))
@@ -1996,9 +2487,10 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
 
 
 def segment_needs_variable_state(seg_text: str) -> bool:
-    """Return True if *seg_text* contains a variable assignment or a builtin
-    (``export``, ``unset``, ``set``, ``shift``, ``source``, ``.``) in ANY
-    pipeline stage position (including after ``|``).
+    """Return True if *seg_text* contains a variable assignment, a builtin
+    (``export``, ``unset``, ``set``, ``shift``, ``source``, ``.``), or a
+    control-flow keyword (``if``, ``while``, ``until``, ``for``, ``case``,
+    ``function``) in ANY pipeline stage position (including after ``|``).
 
     Uses :class:`Lexer` so redirect operators (``2>``, ``>>``, ``<``, etc.)
     and their targets are skipped at each pipe boundary.
@@ -2012,6 +2504,11 @@ def segment_needs_variable_state(seg_text: str) -> bool:
         TokenKind.R_OUT, TokenKind.R_APPEND, TokenKind.R_IN,
         TokenKind.R_FD_DUP, TokenKind.R_HEREDOC,
         TokenKind.R_HEREDOC_STRIP, TokenKind.R_HERESTRING,
+    })
+
+    # Control-flow keywords that require the stateful execution path.
+    _COMPOUND_KEYWORDS = frozenset({
+        "if", "while", "until", "for", "case", "function",
     })
 
     expect_redirect_target = False
@@ -2041,6 +2538,9 @@ def segment_needs_variable_state(seg_text: str) -> bool:
             # Check builtin names
             if t.value in _BUILTIN_NAMES:
                 return True
+            # Check control-flow keywords
+            if t.value in _COMPOUND_KEYWORDS:
+                return True
             # First non-redirect word of this stage — not a builtin/assignment,
             # skip rest of this stage
             skip_stage = True
@@ -2058,7 +2558,7 @@ def segment_needs_variable_state(seg_text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def cmd_to_display(cmd: CommandNode) -> str:
+def cmd_to_display(cmd: "CommandLike") -> str:
     """Return a human-readable display string for *cmd*."""
     return _serialize_command(cmd)
 
@@ -2400,6 +2900,7 @@ def parse_command(
     tokens = Lexer(command).tokenize()
     program = _build_ast(
         tokens, expansion,
+        command=command,
         capture_fn=capture_fn,
         env=env,
         depth=depth,

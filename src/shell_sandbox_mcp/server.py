@@ -20,9 +20,12 @@ from mcp.server.fastmcp import FastMCP
 from .parser import (  # noqa: F401
     CommandNode,
     Expansion,
+    ForNode,
+    IfNode,
     ParseError,
     ProgramNode,
     Redirect,
+    WhileNode,
     _expand_subst_in_text as _parser_expand_subst_in_text,
     _serialize_command,
     _serialize_pipeline,
@@ -46,6 +49,7 @@ from .config import (  # noqa: F401
     DEFAULT_TIMEOUT,
     EXTRA_REDIRECT_ROOTS,
     MAX_HEREDOC_BODY,
+    MAX_LOOP_ITER,
     MAX_OUTPUT,
     MAX_SUBST_COUNT,
     MAX_SUBST_DEPTH,
@@ -115,7 +119,6 @@ from .builtins import (  # noqa: F401
     _split_assignment_prefix,
     _try_cd,
     _try_export,
-    _try_for_loop,
     _try_set,
     _try_shift,
     _try_source,
@@ -225,8 +228,19 @@ def shell_run(
     (the sandbox has no positional parameters).  ``$()``, ``$VAR``,
     ``cd``, ``timeout``, pipes, and redirects all work inside the body.
     ``cd`` inside the body does NOT persist across iterations or out of the
-    loop.  The for-loop must be the **entire command string** — it cannot
-    appear mid-chain with ``;``, ``&&``, or ``||``.
+    loop.  The for-loop body may contain nested control flow
+    (``if``/``while``/``until``/``for``).  The loop variable persists after
+    the loop (matching POSIX semantics).
+
+    ``if CONDITION; then BODY; [elif CONDITION; then BODY;] [else BODY;] fi``
+    runs the first branch whose condition succeeds (exit code 0), or the
+    ``else`` branch if none match.  Conditions are shell command lists whose
+    exit code determines truth.
+
+    ``while CONDITION; do BODY; done`` and ``until CONDITION; do BODY; done``
+    loop while (or until) the condition succeeds, capped at
+    ``MAX_LOOP_ITER`` iterations.  Conditions and bodies may contain nested
+    control flow.
 
     ``VAR=value`` as a standalone statement sets a shell variable for the
     remainder of the same ``shell_run`` call (e.g. ``VAR=hello; echo $VAR``).
@@ -318,13 +332,6 @@ def shell_run(
     if err:
         return _structured_error(1, err)
 
-    # for-loop builtin — detect and execute the entire command as a for-loop
-    # before expansion so the body is re-parsed per iteration with the loop
-    # variable bound.  Returns None when the command is NOT a for-loop.
-    loop = _try_for_loop(command, work_dir, timeout, depth=0)
-    if loop is not None:
-        return _structured_error(loop[1], loop[0])
-
     # Variable assignment + builtins gate: lex-only detection to decide
     # whether to take the per-chain re-expansion path (Approach A).  If NO
     # segment starts with an assignment word or one of the new builtins,
@@ -411,8 +418,14 @@ def shell_list() -> str:
     lines.append("    'for VAR [in WORD…] [;] do BODY done' iterates over the word list,")
     lines.append("    re-parsing the body with $VAR bound to each word. $(), $VAR, cd,")
     lines.append("    timeout, pipes, and redirects all work inside the body. cd inside")
-    lines.append("    the body does NOT persist across iterations. The for-loop must be")
-    lines.append("    the entire command (not mid-chain with ;, &&, or ||).")
+    lines.append("    the body does NOT persist across iterations. The body may contain")
+    lines.append("    nested control flow (if/while/until/for). The loop variable")
+    lines.append("    persists after the loop (matching POSIX semantics).")
+    lines.append("")
+    lines.append("    'if COND; then BODY; [elif ...] [else ...] fi',")
+    lines.append("    'while COND; do BODY; done', and 'until COND; do BODY; done'")
+    lines.append("    provide POSIX-compatible control flow. Conditions are shell")
+    lines.append(f"    command lists; loops are capped at {MAX_LOOP_ITER} iterations.")
     lines.append("")
     lines.append(f"Sandbox binary: {SANDBOX_BIN.resolve()}")
     lines.append(f"Allowed directories: {', '.join(DEFAULT_ALLOWED_DIRS)}")
