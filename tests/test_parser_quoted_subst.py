@@ -370,10 +370,10 @@ class QuotedSubstASTParityTest(unittest.TestCase):
         )
 
     def test_dq_empty_subst_parity(self) -> None:
-        """Empty $() output -- whole-word dropped (unified on AST path)."""
+        """Quoted empty $() output -- one empty arg (POSIX), not dropped."""
         self._assert_parity(
             'echo "$(echo -n)"',
-            ["echo"],
+            ["echo", ""],
             {"echo -n": ""},
         )
 

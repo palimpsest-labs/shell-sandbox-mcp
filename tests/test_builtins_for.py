@@ -104,6 +104,21 @@ class ForLoopTest(unittest.TestCase):
         finally:
             _remove_stubs(self._orig_segment, self._orig_pipeline)
 
+    def test_quoted_empty_word_one_iteration(self) -> None:
+        """for i in \"\"; do echo $i; done → one iteration (empty word)."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                'for i in ""; do echo $i; done',
+                cwd=str(self.allowed), timeout=30,
+            )
+            # The quoted empty word still iterates once. Inside the loop
+            # unquoted $i with an empty value expands to zero args → "echo".
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["args"], "echo")
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
     def test_no_in_clause_do_no_semicolon(self) -> None:
         """for i do echo hi; done → zero iterations."""
         calls = _install_stubs()

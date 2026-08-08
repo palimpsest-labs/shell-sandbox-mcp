@@ -239,6 +239,24 @@ class FieldSplitEndToEndTest(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(args, ["echo"])
 
+    def test_quoted_empty_not_dropped(self):
+        # "X" quoted with empty value → one empty argv entry (POSIX), kept.
+        args, err = _extract_ast('echo "$Z"', env=ENV)
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", ""])
+
+    def test_quoted_empty_var(self):
+        # Quoted empty variable (X="") → one empty arg, not dropped.
+        args, err = _extract_ast('echo "$X"', env={"X": ""})
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", ""])
+
+    def test_quoted_empty_var_mid_word(self):
+        # Quoted empty var glued to non-empty text → non-empty result.
+        args, err = _extract_ast('echo "a$X"b', env={"X": ""})
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "ab"])
+
     # -- whitespace-only value (X="   ") -----------------------------------
 
     def test_whitespace_only_dropped(self):

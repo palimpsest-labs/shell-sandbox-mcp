@@ -163,6 +163,42 @@ class AtSplitFanOutTest(unittest.TestCase):
         # Glob should be escaped in pattern; resolved stays literal.
         self.assertEqual(args, ["echo", "a*", "b?"])
 
+    def test_at_with_one_empty_positional(self) -> None:
+        """Quoted '$@' with one empty positional → one empty arg (POSIX)."""
+        args, _, err = _extract('echo "$@"', positional=("",))
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", ""])
+
+    def test_at_with_mixed_empty_positionals(self) -> None:
+        """Quoted '$@' with ('a','','b') → ['a','','b'] (empty kept)."""
+        args, _, err = _extract('echo "$@"', positional=("a", "", "b"))
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "a", "", "b"])
+
+    def test_at_with_all_empty_positionals(self) -> None:
+        """Quoted '$@' with ('','','') → three empty args."""
+        args, _, err = _extract('echo "$@"', positional=("", "", ""))
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "", "", ""])
+
+    def test_star_join_zero_positionals(self) -> None:
+        """Quoted '$*' with zero positionals → one empty arg (POSIX)."""
+        args, _, err = _extract('echo "$*"', positional=())
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", ""])
+
+    def test_star_join_with_one_empty_positional(self) -> None:
+        """Quoted '$*' with one empty positional → one empty arg."""
+        args, _, err = _extract('echo "$*"', positional=("",))
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", ""])
+
+    def test_pre_at_post_with_one_empty_positional(self) -> None:
+        """pre'$@'post with ('',) → ['prepost'] (empty merges into prefix)."""
+        args, _, err = _extract('echo pre"$@"post', positional=("",))
+        self.assertIsNone(err)
+        self.assertEqual(args, ["echo", "prepost"])
+
 
 # ---------------------------------------------------------------------------
 # Assignment prefix + "$@"

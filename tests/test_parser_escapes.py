@@ -1,8 +1,26 @@
+import tempfile
 import unittest
+from pathlib import Path
+from typing import Mapping
+
 from shell_sandbox_mcp.parser import (
     Expansion, ParseError,
-    extract_redirects, parse_command,
+    extract_redirects, parse_command, program_to_chain,
 )
+
+
+def _extract(cmd: str, env: Mapping[str, str]) -> list[str]:
+    """Parse *cmd* with *env* and return the extracted args (AST path)."""
+    with tempfile.TemporaryDirectory() as td:
+        _cleaned, exp, prog = parse_command(
+            cmd, lambda i: (0, b""), Path(td), 30, 0, env=env,
+        )
+        chain = program_to_chain(prog)
+        cmd_node = chain[0][1][0]
+        args, _redirs, err = extract_redirects(cmd_node, exp)
+        if err is not None:
+            raise AssertionError(f"extract error for {cmd!r}: {err}")
+        return args
 
 
 class HeredocBackslashDelimTest(unittest.TestCase):
@@ -64,15 +82,33 @@ class LegacyBehaviorTest(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(args, ["echo", "foo>bar"])
 
-    def test_empty_quotes_dropped(self):
+    def test_empty_quotes_kept(self):
+        # POSIX: a quoted empty string is still one (empty) argv entry.
         args, redirs, err = extract_redirects('echo ""')
         self.assertIsNone(err)
-        self.assertEqual(args, ["echo"])
+        self.assertEqual(args, ["echo", ""])
 
-    def test_empty_single_quotes_dropped(self):
+    def test_empty_single_quotes_kept(self):
         args, redirs, err = extract_redirects("echo ''")
         self.assertIsNone(err)
-        self.assertEqual(args, ["echo"])
+        self.assertEqual(args, ["echo", ""])
+
+    def test_empty_quotes_before_empty_var_kept(self):
+        # ""$X with X="" → the "" literal is a genuine empty arg (POSIX),
+        # even though it's adjacent to an expansion sentinel.
+        self.assertEqual(_extract('echo ""$X', {"X": ""}), ["echo", ""])
+
+    def test_empty_var_then_quotes_kept(self):
+        # $X"" with X="" → same: the trailing "" literal is preserved.
+        self.assertEqual(_extract('echo $X""', {"X": ""}), ["echo", ""])
+
+    def test_empty_quotes_around_empty_var_kept(self):
+        # "$X" with X="" → the quoted empty expansion is preserved.
+        self.assertEqual(_extract('echo "$X"', {"X": ""}), ["echo", ""])
+
+    def test_empty_var_adjacent_no_spurious_arg(self):
+        # "a$X"b with X="" → no extra empty arg; text just concatenates.
+        self.assertEqual(_extract('echo "a$X"b', {"X": ""}), ["echo", "ab"])
 
 
 class ParseErrorSubclassTest(unittest.TestCase):

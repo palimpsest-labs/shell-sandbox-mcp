@@ -47,6 +47,10 @@ DEFAULT_TIMEOUT = 30
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 1_000_000  # 1 MB
 
+# Defense-in-depth argv ceiling per command (conservative vs Linux ARG_MAX
+# ~2 MiB). Explicit error, not truncation, when exceeded.
+MAX_ARGS = 10_000
+
 # Limits for command substitution / heredoc expansion (parser + executor).
 MAX_SUBST_DEPTH = 8
 MAX_SUBST_COUNT = 256

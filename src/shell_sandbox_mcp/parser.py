@@ -30,7 +30,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Mapping, Optional
 
-from .config import MAX_HEREDOC_BODY, MAX_SUBST_COUNT, MAX_SUBST_DEPTH, MAX_SUBST_OUTPUT
+from .config import (
+    MAX_ARGS,
+    MAX_HEREDOC_BODY,
+    MAX_SUBST_COUNT,
+    MAX_SUBST_DEPTH,
+    MAX_SUBST_OUTPUT,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -3643,19 +3649,29 @@ def _extract_from_node(
                     continue
                 # Append the first positional to the LAST in-flight field.
                 fields[-1]["resolved"] += positionals[0]
+                # Quoted empty "$@" first positional on an empty field must
+                # be preserved.
+                if positionals[0] == "" and not fields[-1].get("resolved"):
+                    fields[-1]["keep_if_empty"] = True
                 # "$@" is quoted → pattern uses glob.escape.
                 fields[-1]["pattern"] += _glob.escape(positionals[0])
                 # For subsequent positionals, start new fields.
                 for pos in positionals[1:]:
-                    fields.append({
+                    new_field = {
                         "resolved": pos,
                         "pattern": _glob.escape(pos),
                         "glob_active": False,
-                    })
+                    }
+                    if pos == "":
+                        new_field["keep_if_empty"] = True
+                    fields.append(new_field)
             elif p.is_star_join and expansion is not None:
                 # Quoted "$*" — space-join all positionals into a single value.
                 joined = " ".join(expansion.positional_tuple)
                 fields[-1]["resolved"] += joined
+                # Quoted "$*" joining to "" on an empty field → one empty arg.
+                if joined == "" and not fields[-1].get("resolved"):
+                    fields[-1]["keep_if_empty"] = True
                 # "$*" is quoted → pattern uses glob.escape.
                 fields[-1]["pattern"] += _glob.escape(joined)
             elif p.is_at_split and expansion is None:
@@ -3703,6 +3719,10 @@ def _extract_from_node(
                 else:
                     # ---- no field splitting (quoted or disabled) -----------
                     fields[-1]["resolved"] += val
+                    # Quoted empty expansion on an empty field must be kept.
+                    if p.is_quoted and val == "" and \
+                            not fields[-1].get("resolved"):
+                        fields[-1]["keep_if_empty"] = True
                     if p.is_quoted:
                         fields[-1]["pattern"] += _glob.escape(val)
                     else:
@@ -3712,6 +3732,19 @@ def _extract_from_node(
             else:
                 # Plain text, hd sentinel, or arg sentinel with no expansion.
                 fields[-1]["resolved"] += p.text
+                # Quoted empty literal ("" / '') on an empty field is an argv
+                # entry (POSIX), not a dropped word.  The lexer emits the
+                # quote delimiter adjacent to a sentinel as a 1-char raw part
+                # ('"' / "'") — e.g. the two delimiters of "$@" or "$X" — while
+                # a genuine "" / '' literal has a 2-char raw ('""' / "''").
+                # Only genuine literals force keep_if_empty, so structural
+                # delimiters around "$@"/$X never create a spurious empty arg,
+                # yet ""$X / $X"" (adjacent to a sentinel) still do.
+                if p.is_quoted and p.text == "" and \
+                        len(p.raw) >= 2 and \
+                        p.raw[0] == p.raw[-1] and \
+                        not fields[-1].get("resolved"):
+                    fields[-1]["keep_if_empty"] = True
                 if p.is_quoted:
                     fields[-1]["pattern"] += _glob.escape(p.text)
                 else:
@@ -3729,10 +3762,22 @@ def _extract_from_node(
             if work_dir is not None and f["glob_active"]:
                 matches = _expand_glob_arg(f["pattern"], work_dir)
                 if matches:
+                    if len(args) + len(matches) > MAX_ARGS:
+                        return [], [], (
+                            f"Argument list too long (max {MAX_ARGS})"
+                        )
                     args.extend(matches)          # sorted/unique order from glob
                 else:
+                    if len(args) + 1 > MAX_ARGS:
+                        return [], [], (
+                            f"Argument list too long (max {MAX_ARGS})"
+                        )
                     args.append(_expand_tilde(resolved))   # POSIX: unmatched glob stays literal
             else:
+                if len(args) + 1 > MAX_ARGS:
+                    return [], [], (
+                        f"Argument list too long (max {MAX_ARGS})"
+                    )
                 args.append(_expand_tilde(resolved))
 
     for rs in cmd.redirects:

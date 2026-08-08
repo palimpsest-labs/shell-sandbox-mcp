@@ -10,9 +10,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from shell_sandbox_mcp import containment
-from shell_sandbox_mcp.config import EXTRA_REDIRECT_ROOTS
+from shell_sandbox_mcp.config import EXTRA_REDIRECT_ROOTS, MAX_ARGS
 from shell_sandbox_mcp.parser import (
     Expansion,
     ParseError,
@@ -192,6 +193,41 @@ class GlobAbsoluteTest(unittest.TestCase):
             args,
             ["echo", str(self.abs / "alpha.log"), str(self.abs / "beta.log")],
         )
+
+
+class MaxArgsTest(unittest.TestCase):
+    """MAX_ARGS ceiling on argv entries (defense-in-depth)."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.wd = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def test_max_args_exceeded_glob(self):
+        # A glob fanning out to MAX_ARGS+1 matches is an explicit error.
+        big = [f"f{i}" for i in range(MAX_ARGS + 1)]
+        with mock.patch(
+            "shell_sandbox_mcp.parser._expand_glob_arg", return_value=big
+        ):
+            args, redirs, err = extract_redirects("echo *", None, self.wd)
+        self.assertEqual(args, [])
+        self.assertIn(f"Argument list too long (max {MAX_ARGS})", err or "")
+
+    def test_max_args_exceeded_literal(self):
+        # >MAX_ARGS literal argv entries → explicit error, not truncation.
+        words = " ".join(f"w{i}" for i in range(MAX_ARGS + 1))
+        args, redirs, err = extract_redirects(f"echo {words}", None, self.wd)
+        self.assertEqual(args, [])
+        self.assertIn(f"Argument list too long (max {MAX_ARGS})", err or "")
+
+    def test_max_args_exactly(self):
+        # Exactly MAX_ARGS argv entries succeed.
+        words = " ".join(f"w{i}" for i in range(MAX_ARGS - 1))
+        args, redirs, err = extract_redirects(f"echo {words}", None, self.wd)
+        self.assertIsNone(err)
+        self.assertEqual(len(args), MAX_ARGS)
 
 
 if __name__ == "__main__":
