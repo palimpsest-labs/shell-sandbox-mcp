@@ -256,6 +256,45 @@ class ShellRunTimeoutTest(unittest.TestCase):
         self.assertEqual(to_val, 30)  # DEFAULT_TIMEOUT
         self.assertIn("out:echo hello", out)
 
+    # ------------------------------------------------------------------
+    # timeout N <builtin> — single-stage builtins resolve in-process
+    # (not stubbed, so they run through run_command's builtin dispatch)
+    # ------------------------------------------------------------------
+
+    def test_timeout_export(self) -> None:
+        """timeout 3 export X=1 → builtin runs in-process, rc 0, no output."""
+        out = self._run("timeout 3 export X=1")
+        self.assertEqual(out, "(no output)")
+
+    def test_timeout_unset(self) -> None:
+        """timeout 1 unset FOO → builtin runs in-process, rc 0, no output."""
+        out = self._run("timeout 1 unset FOO")
+        self.assertEqual(out, "(no output)")
+
+    def test_timeout_set(self) -> None:
+        """timeout 2 set A=b → builtin runs in-process, rc 0, no output."""
+        out = self._run("timeout 2 set A=b")
+        self.assertEqual(out, "(no output)")
+
+    def test_timeout_shift(self) -> None:
+        """timeout 7 shift → builtin runs in-process, rc 1 (no positional args)."""
+        out = self._run("timeout 7 shift")
+        self.assertIn("Exit code: 1", out)
+
+    def test_timeout_source(self) -> None:
+        """timeout 5 source s.sh → builtin runs in-process, sourcing the file."""
+        script = self.allowed / "s.sh"
+        script.write_text("SOURCED_VAR=fromscript\n")
+        out = self._run("timeout 5 source s.sh")
+        # Source of a pure-assignment script is silent; rc 0.  Any error from
+        # mis-resolution (e.g. "Command not allowed: source") would surface here.
+        self.assertEqual(out, "(no output)")
+
+    def test_env_prefix_timeout_builtin(self) -> None:
+        """VAR=1 timeout 5 export X=1 → env prefix + timeout + builtin."""
+        out = self._run("VAR=1 timeout 5 export X=1")
+        self.assertEqual(out, "(no output)")
+
 
 # ---------------------------------------------------------------------------
 # _apply_timeout_builtin unit tests (direct function calls)

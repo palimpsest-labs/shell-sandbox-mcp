@@ -586,9 +586,39 @@ class Runner:
                 for k, v in pm.items():
                     store.set_local(k, v)
 
+            # timeout builtin — strip `timeout N` BEFORE builtin/cd/allowlist
+            # dispatch so a single-stage `timeout N <builtin>` resolves the
+            # builtin (not `timeout`).
+            nodes, eff_to, terr = srv._apply_timeout_builtin(
+                remaining_nodes, expansion, bg, timeout,
+                work_dir=self.work_dir,
+            )
+            if terr is not None:
+                self.outputs.append(terr)
+                self.stages.append({"command": joined, "output": terr, "rc": 1})
+                self.prev_rc = 1
+                self.ran_any = True
+                continue
+
+            # cd builtin — skip compounds (they are handled later).
+            if not bg and len(nodes) == 1 and isinstance(nodes[0], CommandNode):
+                new_dir, cd_err = srv._try_cd(nodes[0], self.work_dir, expansion)
+                if cd_err is not None:
+                    self.outputs.append(cd_err)
+                    self.stages.append({"command": joined, "output": cd_err, "rc": 1})
+                    self.prev_rc = 1
+                    self.ran_any = True
+                    continue
+                if new_dir is not None:
+                    self.work_dir = new_dir
+                    self.prev_rc = 0
+                    self.ran_any = True
+                    self.stages.append({"command": joined, "output": "", "rc": 0})
+                    continue
+
             # Builtin interception (single-stage non-bg only)
-            if not bg and len(remaining_nodes) == 1:
-                cmd_node = remaining_nodes[0]
+            if not bg and len(nodes) == 1:
+                cmd_node = nodes[0]
 
                 def _builtin_result(rc_val: int, out_val: str) -> tuple[str, int]:
                     """Format builtin output: prepend 'Exit code: N' when rc != 0."""
@@ -708,34 +738,6 @@ class Runner:
                     self.ran_any = True
                     continue
 
-            # timeout builtin
-            nodes, eff_to, terr = srv._apply_timeout_builtin(
-                remaining_nodes, expansion, bg, timeout,
-                work_dir=self.work_dir,
-            )
-            if terr is not None:
-                self.outputs.append(terr)
-                self.stages.append({"command": joined, "output": terr, "rc": 1})
-                self.prev_rc = 1
-                self.ran_any = True
-                continue
-
-            # cd builtin — skip compounds (they are handled later).
-            if not bg and len(nodes) == 1 and isinstance(nodes[0], CommandNode):
-                new_dir, cd_err = srv._try_cd(nodes[0], self.work_dir, expansion)
-                if cd_err is not None:
-                    self.outputs.append(cd_err)
-                    self.stages.append({"command": joined, "output": cd_err, "rc": 1})
-                    self.prev_rc = 1
-                    self.ran_any = True
-                    continue
-                if new_dir is not None:
-                    self.work_dir = new_dir
-                    self.prev_rc = 0
-                    self.ran_any = True
-                    self.stages.append({"command": joined, "output": "", "rc": 0})
-                    continue
-
             # Compound command dispatch (if/while/until/for).
             # Compounds must be the sole element of their pipeline and
             # cannot be backgrounded.  They route through the stateful
@@ -794,8 +796,19 @@ class Runner:
                     if out:
                         self.outputs.append(out)
                     continue
-                # Single-stage builtin already handled above — fall through
-                # (should not happen; defense in depth)
+                # Single-stage builtin reaching this point (defense in depth —
+                # normally handled by the single-stage block above, or routed to
+                # run_command by the lex-gate).  Dispatch it properly instead of
+                # falling through to subprocess dispatch.
+                out, rc = self._exec_pipeline_builtin(
+                    kinds[0], nodes[0], expansion, timeout, depth,
+                )
+                self.prev_rc = rc
+                self.ran_any = True
+                self.stages.append({"command": joined, "output": out, "rc": rc})
+                if out:
+                    self.outputs.append(out)
+                continue
 
             # Build stage environment: base = exported vars; per-stage overrides
             base = store.env_for_subprocess()

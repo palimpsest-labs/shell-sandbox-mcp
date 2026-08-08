@@ -327,6 +327,25 @@ class MixedPipelineTest(unittest.TestCase):
                 self.assertIsNotNone(injected)
                 self.assertIn(b"ok", injected)
 
+    def test_timeout_export_pipeline(self) -> None:
+        """timeout 3 export X=1 | cat → timeout stripped, export builtin
+        resolves and feeds cat (start_index=1 subprocess)."""
+        self._stub_execution()
+        out = self._run("timeout 3 export X=1 | cat")
+        found = False
+        for c in self.pipeline_calls:
+            if c.get("start_index") == 1:
+                found = True
+                break
+        self.assertTrue(found,
+                        f"No subprocess call with start_index=1: {self.pipeline_calls}")
+
+    def test_timeout_pure_subprocess_pipeline_fastpath(self) -> None:
+        """timeout 3 echo hi | wc -l → pure subprocess fast path preserved."""
+        self._stub_execution()
+        out = self._run("timeout 3 echo hi | wc -l")
+        self.assertIn("pipeline-ok", out.lower())
+
     # ------------------------------------------------------------------
     # X=1 export Y=2 | echo hi
     # ------------------------------------------------------------------

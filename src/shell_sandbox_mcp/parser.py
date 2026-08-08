@@ -3200,6 +3200,7 @@ def segment_needs_variable_state(seg_text: str, known_functions: Iterable[str] =
 
     expect_redirect_target = False
     skip_stage = False  # True after first non-builtin/assignment word of a stage
+    skip_count = 0      # words to skip before re-checking (timeout's duration arg)
     for t in tokens:
         if t.kind in (TokenKind.WS, TokenKind.NEWLINE):
             continue
@@ -3207,6 +3208,12 @@ def segment_needs_variable_state(seg_text: str, known_functions: Iterable[str] =
             # Reset state at pipe boundary — check the first word of each stage
             expect_redirect_target = False
             skip_stage = False
+            skip_count = 0
+            continue
+        if skip_count:
+            # Skip `timeout`'s duration word, then let the following word be
+            # checked against the builtin/assignment/compound/function lists.
+            skip_count -= 1
             continue
         # LPAREN, LBRACE, FUNC_PARENS — always require stateful execution,
         # even when not at the first word position (they can appear after
@@ -3238,6 +3245,13 @@ def segment_needs_variable_state(seg_text: str, known_functions: Iterable[str] =
             # Check assignment: VAR=value
             if _ASSIGN_WORD_RE.match(t.value):
                 return True
+            # `timeout N <cmd>` — the leading builtin-ish `timeout` token is
+            # not itself in _BUILTIN_NAMES, but the word AFTER the duration may
+            # be a builtin/assignment.  Skip the duration word and re-check the
+            # following word instead of permanently skipping this stage.
+            if t.value == "timeout":
+                skip_count = 1
+                continue
             # Check builtin names
             if t.value in _BUILTIN_NAMES:
                 return True

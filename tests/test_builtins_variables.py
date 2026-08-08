@@ -170,6 +170,49 @@ class SegmentNeedsStateTest(unittest.TestCase):
     def test_varref_first_word_then_stage2_positive(self) -> None:
         self.assertTrue(segment_needs_variable_state("$VAR | set X=1"))
 
+    # ------------------------------------------------------------------
+    # timeout N <builtin> — the lex gate must look past the duration word
+    # ------------------------------------------------------------------
+
+    def test_timeout_source_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout 5 source s.sh"))
+
+    def test_timeout_export_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout 5 export X=1"))
+
+    def test_timeout_unset_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout 5 unset FOO"))
+
+    def test_timeout_set_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout 5 set A=b"))
+
+    def test_timeout_shift_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout 5 shift"))
+
+    def test_timeout_dot_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout 5 . s.sh"))
+
+    def test_timeout_sleep_negative(self) -> None:
+        self.assertFalse(segment_needs_variable_state("timeout 5 sleep 1"))
+
+    def test_timeout_echo_negative(self) -> None:
+        self.assertFalse(segment_needs_variable_state("timeout 3 echo hi"))
+
+    def test_timeout_git_negative(self) -> None:
+        self.assertFalse(segment_needs_variable_state("timeout 5 git status"))
+
+    def test_timeout_non_numeric_duration_source_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout abc source s.sh"))
+
+    def test_source_then_timeout_pipe_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("source s.sh | timeout 5 wc -l"))
+
+    def test_timeout_export_pipe_stage2_positive(self) -> None:
+        self.assertTrue(segment_needs_variable_state("timeout 5 export X=1 | wc -l"))
+
+    def test_timeout_sleep_pipe_negative(self) -> None:
+        self.assertFalse(segment_needs_variable_state("timeout 5 sleep 1 | grep x"))
+
 
 # ============================================================================
 # VariableStore unit tests
