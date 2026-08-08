@@ -24,6 +24,13 @@ MUSL_TOOLCHAIN = REPO_ROOT / "bin" / "musl-toolchain"
 # This is the sandbox's `python3` command.
 PYTHON_MUSL_INSTALL = REPO_ROOT / "bin" / "python-musl" / "install"
 PYTHON_MUSL_BIN = PYTHON_MUSL_INSTALL / "bin" / "python3.12"
+# Musl rtlib directory (dynamic linker + libc.so) for running dynamically-linked
+# musl binaries produced by the vendored gcc.  The loader is directly executable
+# and has no PT_INTERP of its own; local binaries whose baked PT_INTERP
+# (/lib/ld-musl-x86_64.so.1) doesn't exist on the glibc host are retried via
+# execv(loader, [loader, "--library-path", rtlib, binary, args...]).
+MUSL_RTLIB = PYTHON_MUSL_INSTALL / "lib" / "rtlib"
+MUSL_LOADER = MUSL_RTLIB / "ld-musl-x86_64.so.1"
 DEFAULT_ALLOWED_DIRS = [
     str(Path.home() / "projects"),
     "/tmp",

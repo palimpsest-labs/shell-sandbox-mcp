@@ -11,6 +11,8 @@ from typing import Optional
 from .config import (
     BUSYBOX_BIN,
     COSMO_TOOLCHAIN,
+    MUSL_LOADER,
+    MUSL_RTLIB,
     MUSL_TOOLCHAIN,
     PYTHON_MUSL_INSTALL,
     REPO_ROOT,
@@ -160,6 +162,16 @@ def _python_musl_paths(work_dir: Optional[Path] = None) -> list[str]:
     loader.
     """
     return [str(PYTHON_MUSL_INSTALL.resolve())]
+
+
+def _musl_rtlib_paths(work_dir: Optional[Path] = None) -> list[str]:
+    """Return the vendored musl rtlib directory (loader + libc.so) so local
+    dynamically-linked musl binaries can be run via loader fallback.
+
+    The loader is at ``MUSL_LOADER`` and ``libc.so`` is alongside it; unveiling
+    the entire rtlib directory rx makes both visible to the kernel.
+    """
+    return [str(MUSL_RTLIB.resolve())]
 
 
 COMMANDS = {
@@ -499,6 +511,11 @@ def _resolve_command(
                     "promises": "stdio rpath wpath cpath prot_exec",
                     "description": f"Local binary under cwd: {binary}",
                     "is_local_binary": True,
+                    "extra_unveil_rx": _musl_rtlib_paths,
+                    "env": {
+                        "SANDBOX_MUSL_LOADER": str(MUSL_LOADER.resolve()),
+                        "SANDBOX_MUSL_RTLIB": str(MUSL_RTLIB.resolve()),
+                    },
                 }
             return binary, args, cfg
 

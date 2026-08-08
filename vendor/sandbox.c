@@ -139,6 +139,24 @@ int main(int argc, char *argv[]) {
        access is granted. */
     if (unveil_list_from_env("SANDBOX_UNVEIL_RX", "rx") != 0)
         return 1;
+    /* Musl loader fallback: if SANDBOX_MUSL_LOADER and SANDBOX_MUSL_RTLIB are
+       set, unveil them rx so the fallback execv can map the loader and libc.so
+       for dynamically-linked musl binaries whose baked PT_INTERP
+       (/lib/ld-musl-x86_64.so.1) does not exist on the glibc host. */
+    const char *musl_loader = getenv("SANDBOX_MUSL_LOADER");
+    const char *musl_rtlib  = getenv("SANDBOX_MUSL_RTLIB");
+    if (musl_loader && musl_loader[0] && musl_rtlib && musl_rtlib[0]) {
+        if (unveil(musl_loader, "rx") != 0 && errno != ENOENT) {
+            fprintf(stderr, "sandbox: unveil('%s', 'rx') failed: %s\n",
+                    musl_loader, strerror(errno));
+            return 1;
+        }
+        if (unveil(musl_rtlib, "rx") != 0 && errno != ENOENT) {
+            fprintf(stderr, "sandbox: unveil('%s', 'rx') failed: %s\n",
+                    musl_rtlib, strerror(errno));
+            return 1;
+        }
+    }
     /* Lock unveil — no further paths can be added */
     if (unveil(NULL, NULL) != 0) {
         fprintf(stderr, "sandbox: unveil lock failed: %s\n", strerror(errno));
@@ -169,7 +187,30 @@ int main(int argc, char *argv[]) {
     /* Exec the command */
     execvp(cmd, &argv[sep + 1]);
 
-    /* execvp only returns on error */
+    /* execvp only returns on error.
+       If the error is ENOENT and the musl loader env vars are set, retry:
+       the binary may be a dynamically-linked musl binary whose baked
+       PT_INTERP (/lib/ld-musl-x86_64.so.1) doesn't exist on this glibc
+       host.  Fall back to execv(loader, [loader, "--library-path", rtlib,
+       cmd, args...]) — the loader has no PT_INTERP of its own and can be
+       exec'd directly. */
+    if (errno == ENOENT && musl_loader && musl_loader[0]
+        && musl_rtlib && musl_rtlib[0]) {
+        int nargs = argc - (sep + 1);      /* cmd + user args */
+        int new_argc = 3 + nargs;           /* loader, --library-path, rtlib */
+        char **new_argv = malloc((new_argc + 1) * sizeof(char *));
+        if (new_argv) {
+            new_argv[0] = (char *)musl_loader;
+            new_argv[1] = "--library-path";
+            new_argv[2] = (char *)musl_rtlib;
+            for (int i = 0; i < nargs; i++)
+                new_argv[3 + i] = argv[sep + 1 + i];
+            new_argv[new_argc] = NULL;
+            execv(musl_loader, new_argv);
+            free(new_argv);
+        }
+    }
+
     fprintf(stderr, "sandbox: exec '%s' failed: %s\n", cmd, strerror(errno));
     return 1;
 }
