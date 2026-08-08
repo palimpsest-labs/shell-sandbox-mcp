@@ -258,5 +258,63 @@ class LexerQuoteStateTest(unittest.TestCase):
         self.assertEqual(len(redirs), 0)
 
 
+class PositionalParameterLexingTest(unittest.TestCase):
+    """Test that $1, $#, $@, $* lex as VARREF tokens."""
+
+    def _tokenize(self, command: str):
+        from shell_sandbox_mcp.parser import Lexer
+        return Lexer(command).tokenize()
+
+    def test_dollar1_varref(self) -> None:
+        tokens = self._tokenize("echo $1")
+        varrefs = [t for t in tokens if t.kind == TokenKind.VARREF and t.value == "1"]
+        self.assertEqual(len(varrefs), 1)
+
+    def test_dollar_hash_varref(self) -> None:
+        tokens = self._tokenize("echo $#")
+        varrefs = [t for t in tokens if t.kind == TokenKind.VARREF and t.value == "#"]
+        self.assertEqual(len(varrefs), 1)
+
+    def test_dollar_at_varref(self) -> None:
+        tokens = self._tokenize("echo $@")
+        varrefs = [t for t in tokens if t.kind == TokenKind.VARREF and t.value == "@"]
+        self.assertEqual(len(varrefs), 1)
+
+    def test_dollar_star_varref(self) -> None:
+        tokens = self._tokenize("echo $*")
+        varrefs = [t for t in tokens if t.kind == TokenKind.VARREF and t.value == "*"]
+        self.assertEqual(len(varrefs), 1)
+
+    def test_dollar0_varref(self) -> None:
+        tokens = self._tokenize("echo $0")
+        varrefs = [t for t in tokens if t.kind == TokenKind.VARREF and t.value == "0"]
+        self.assertEqual(len(varrefs), 1)
+
+
+class FuncParensLexingTest(unittest.TestCase):
+    """Test that FUNC_PARENS tokens are emitted for function definitions."""
+
+    def _tokenize(self, command: str):
+        from shell_sandbox_mcp.parser import Lexer
+        return Lexer(command).tokenize()
+
+    def test_posix_func_parens_emitted(self) -> None:
+        tokens = self._tokenize("f() echo hi")
+        kinds = [t.kind for t in tokens]
+        self.assertIn(TokenKind.FUNC_PARENS, kinds)
+
+    def test_func_parens_not_emitted_for_keyword_form(self) -> None:
+        """function f echo — no FUNC_PARENS."""
+        tokens = self._tokenize("function f echo hi")
+        kinds = [t.kind for t in tokens]
+        self.assertNotIn(TokenKind.FUNC_PARENS, kinds)
+
+    def test_func_parens_emitted_for_keyword_with_parens(self) -> None:
+        """function f() echo — has FUNC_PARENS."""
+        tokens = self._tokenize("function f() echo hi")
+        kinds = [t.kind for t in tokens]
+        self.assertIn(TokenKind.FUNC_PARENS, kinds)
+
+
 if __name__ == "__main__":
     unittest.main()

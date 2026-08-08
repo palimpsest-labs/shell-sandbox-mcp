@@ -39,11 +39,11 @@ from .config import MAX_HEREDOC_BODY, MAX_SUBST_COUNT, MAX_SUBST_DEPTH, MAX_SUBS
 
 _SENTINEL_ARG = re.compile(r"\x01A(\d+)\x01")
 _SENTINEL_HD  = re.compile(r"\x01H(\d+)\x01")
-# Prefix guard: any ${X... where X starts a variable name (or '#' for the
-# ${#VAR} length operator).  The full braced span is brace-counted later in
-# _lex_varref_braced / _find_braced_end, so this only has to recognise the
-# opening form.  Special params (${10}, ${}, $#, ...) fall through to literal.
-_BRACED_VAR_GUARD = re.compile(r"^\$\{(?:[A-Za-z_]|#)")
+# Prefix guard: any ${X... where X starts a variable name, or #
+# (${#VAR} length operator), or a digit, or @ or * (positional parameters).
+# The full braced span is brace-counted later in _lex_varref_braced /
+# _find_braced_end, so this only has to recognise the opening form.
+_BRACED_VAR_GUARD = re.compile(r"^\$\{(?:[A-Za-z_]|#|[0-9@*])")
 _VAR_NAME_RE   = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Variable assignment and builtin detection helpers (used by split_chains /
@@ -269,6 +269,11 @@ class TokenKind(enum.Enum):
     RPAREN = 41         # )  (matching open paren)
     DSEMI = 42          # ;;  (case clause terminator)
 
+    # Function definition and brace groups
+    FUNC_PARENS = 43    # ()  (function definition parens — pos at LPAREN)
+    LBRACE = 44         # {   (at command position — brace group)
+    RBRACE = 45         # }   (matching closing brace)
+
 
 # ---------------------------------------------------------------------------
 # Token
@@ -433,7 +438,20 @@ class SubshellNode:
     body: str
 
 
-CompoundCommand = "IfNode | WhileNode | ForNode | CaseNode | SubshellNode"
+@dataclass(frozen=True)
+class FuncNode:
+    """``f() body`` or ``function f body`` — function definition."""
+    name: str
+    body: str
+
+
+@dataclass(frozen=True)
+class GroupNode:
+    """``{ command; ...; }`` — brace group command (no variable isolation)."""
+    body: str
+
+
+CompoundCommand = "IfNode | WhileNode | ForNode | CaseNode | SubshellNode | FuncNode | GroupNode"
 CommandLike = "CommandNode | CompoundCommand"
 
 
@@ -453,7 +471,7 @@ _RESERVED_WORDS = frozenset({
 _FOR_VAR_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 # Compound command types for pipe-rejection checks.
-_COMPOUND_TYPES = (IfNode, WhileNode, ForNode, CaseNode, SubshellNode)
+_COMPOUND_TYPES = (IfNode, WhileNode, ForNode, CaseNode, SubshellNode, FuncNode, GroupNode)
 
 
 def _is_reserved(tok: Token, word: str) -> bool:
@@ -490,6 +508,7 @@ class Lexer:
         self._tokens: list[Token] = []
         self._replay_mode = replay_mode
         self._paren_depth: int = 0
+        self._brace_depth: int = 0
         # Track case/esac nesting so ')' after a case-pattern can be
         # distinguished from a subshell-closing ')' (BLOCKER 1).
         self._case_nesting: int = 0
@@ -535,9 +554,10 @@ class Lexer:
                 continue
             if k in (TokenKind.SEMI, TokenKind.AND_AND, TokenKind.OR_OR,
                      TokenKind.PIPE, TokenKind.BG, TokenKind.LPAREN,
-                     TokenKind.DSEMI):
+                     TokenKind.DSEMI, TokenKind.FUNC_PARENS,
+                     TokenKind.LBRACE):
                 return True
-            if k == TokenKind.WORD and t.value in ("then", "do", "else", "elif", "in"):
+            if k == TokenKind.WORD and t.value in ("then", "do", "else", "elif", "in", "function"):
                 return True
             return False
         return True
@@ -611,6 +631,11 @@ class Lexer:
                 return
             if nxt and (nxt.isalpha() or nxt == '_'):
                 self._lex_varref()
+                return
+            # Positional parameters: $0..$9, $#, $@, $*
+            if nxt and nxt in "0123456789#@*":
+                self._emit(TokenKind.VARREF, nxt)
+                self._advance(2)  # skip $ + the char
                 return
             # else fall through to _lex_word (literal $)
 
@@ -744,6 +769,33 @@ class Lexer:
         if len(rem) >= 2 and rem[0].isdigit() and rem[1] == '>':
             fd = int(rem[0])
             raise ParseError(f"Redirects only support fds 1 and 2 (got {fd})")
+
+        # --- function definition: name() at command position ---
+        if self._at_command_pos():
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\(\)', rem)
+            if m:
+                after = rem[m.end():]
+                if not after or after[0] in (' ', '\t', '\n', ';', '&', '|', '<', '>', '#'):
+                    name = m.group(1)
+                    self._emit(TokenKind.WORD, name)
+                    self._advance(len(name))
+                    self._emit(TokenKind.FUNC_PARENS, '()')
+                    self._advance(2)  # skip ()
+                    return
+
+        # --- brace group: { at command position ---
+        if c == '{' and self._at_command_pos():
+            self._emit(TokenKind.LBRACE, '{')
+            self._advance()
+            self._brace_depth += 1
+            return
+
+        # --- closing brace (only when inside a brace group) ---
+        if c == '}' and self._brace_depth > 0:
+            self._emit(TokenKind.RBRACE, '}')
+            self._advance()
+            self._brace_depth -= 1
+            return
 
         # -- none of the above: it's a regular word --
         _before_word_cmd_pos = self._at_command_pos()
@@ -1351,10 +1403,68 @@ def _build_ast(
             if _VAR_NAME_RE.fullmatch(name):
                 val = env.get(name, "") if env else ""
                 return str(len(val))
+            # ${#1} — length of positional parameter $1
+            if name.isdigit() or name in "@*":
+                val = env.get(name, "") if env else ""
+                return str(len(val))
             return "${" + raw + "}"
 
+        # Try to match a regular variable name at the start.
         m = _VAR_NAME_RE.match(raw)
+        # If no regular name, try a positional-parameter name (digits or #@*).
         if m is None:
+            if raw and (raw[0].isdigit() or raw[0] in "#@*"):
+                # Extract the positional name: digits, or a single #/@/*
+                if raw[0] in "#@*":
+                    name = raw[0]
+                    rest = raw[1:]
+                else:
+                    # Extract leading digits
+                    j = 0
+                    while j < len(raw) and raw[j].isdigit():
+                        j += 1
+                    name = raw[:j]
+                    rest = raw[j:]
+                value = env.get(name, "") if env else ""
+                if not rest:
+                    return value
+                # Operator forms on positional params (e.g. ${1:-default})
+                if rest.startswith(':-') or rest.startswith(':='):
+                    operand = rest[2:]
+                    if not value:
+                        return _expand_operand(operand, d)
+                    return value
+                if rest.startswith(':?'):
+                    msg = rest[2:]
+                    if not value:
+                        if msg:
+                            msg = _expand_operand(msg, d)
+                        else:
+                            msg = "parameter not set or null"
+                        raise ValueError(msg)
+                    return value
+                if rest.startswith(':+'):
+                    operand = rest[2:]
+                    if value:
+                        return _expand_operand(operand, d)
+                    return ""
+                if rest.startswith(':'):
+                    segs = rest[1:].split(':', 1)
+                    off_str = segs[0]
+                    len_str = segs[1] if len(segs) > 1 else ""
+                    if off_str == "" or not off_str.isdigit():
+                        return "${" + raw + "}"
+                    offset = int(off_str)
+                    vlen = len(value)
+                    start_idx = min(offset, vlen)
+                    if len_str == "":
+                        return value[start_idx:]
+                    if not len_str.isdigit():
+                        return "${" + raw + "}"
+                    length = int(len_str)
+                    end_idx = min(start_idx + length, vlen)
+                    return value[start_idx:end_idx]
+                return "${" + raw + "}"
             return "${" + raw + "}"
         name = m.group(0)
         rest = raw[m.end():]
@@ -1462,8 +1572,10 @@ def _build_ast(
                 value = value[:MAX_SUBST_OUTPUT]
             else:
                 # VARREF: plain variable names resolve straight from env;
-                # anything else is a parameter expansion operator form.
-                if _VAR_NAME_RE.fullmatch(name):
+                # positional parameters ($1, $#, $@, $*, $0 etc.) are also
+                # looked up directly.  Anything else is a parameter
+                # expansion operator form (e.g. ${1:-default}).
+                if _VAR_NAME_RE.fullmatch(name) or name.isdigit() or name in "#@*":
                     value = env.get(name, "") if env else ""
                 else:
                     value = _expand_param(name, depth)
@@ -1787,6 +1899,7 @@ def _build_ast(
         *,
         track_nesting: bool = True,
         unconditional_terminators: frozenset[str] = frozenset(),
+        chain_terminators: frozenset["TokenKind"] = frozenset(),
     ) -> tuple[str, int]:
         """Scan tokens from *pos* forward, tracking compound nesting.
 
@@ -1801,6 +1914,10 @@ def _build_ast(
         *unconditional_terminators* are words recognised even when NOT at
         command position (used for ``esac`` when no ``;;`` precedes it).
 
+        *chain_terminators* are TokenKinds that, when encountered at depth 0
+        (all depths zero), also terminate the slice.  Used for function
+        bodies that end at ``;``, ``&&``, ``||``, ``&``, or newline.
+
         Raises :class:`ParseError` for unexpected reserved words at depth 0
         or missing terminators at EOF.
         """
@@ -1808,6 +1925,8 @@ def _build_ast(
         _skip_ws()
         if pos >= n:
             expected = "|".join(sorted(terminators))
+            if chain_terminators:
+                expected = f"{expected} or chain separator"
             raise ParseError(
                 f"unexpected EOF looking for '{expected}'"
             )
@@ -1815,6 +1934,7 @@ def _build_ast(
         body_start = tokens[pos].pos
         depth = 0           # tracks (…) subshell nesting (LPAREN/RPAREN)
         compound_depth = 0  # tracks if/for/while/until/case … fi/done/esac
+        brace_depth = 0     # tracks { } brace group nesting (LBRACE/RBRACE)
         compound_stack: list[str] = []  # which compound opened each level
         _in_case_compound = False       # set when the most recent compound is 'case'
         expect_command = True  # first token after opening keyword is at cmd position
@@ -1839,6 +1959,10 @@ def _build_ast(
                 pos += 1
                 continue
             if kind == TokenKind.NEWLINE:
+                # chain_terminators check: NEWLINE terminates the body
+                if depth == 0 and compound_depth == 0 and brace_depth == 0 and TokenKind.NEWLINE in chain_terminators:
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
                 expect_command = True
                 pos += 1
                 continue
@@ -1846,6 +1970,10 @@ def _build_ast(
             # Chain operators reset expect_command.
             if kind in (TokenKind.SEMI, TokenKind.AND_AND,
                         TokenKind.OR_OR, TokenKind.PIPE, TokenKind.BG):
+                # chain_terminators check: if this kind terminates the body
+                if depth == 0 and compound_depth == 0 and brace_depth == 0 and kind in chain_terminators:
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
                 expect_command = True
                 pos += 1
                 continue
@@ -1901,6 +2029,31 @@ def _build_ast(
                     body_end = t.pos
                     return command[body_start:body_end], pos
                 raise ParseError("unexpected ')'")
+
+            # LBRACE — open a brace group (depth tracking).
+            if kind == TokenKind.LBRACE:
+                brace_depth += 1
+                expect_command = True
+                pos += 1
+                continue
+
+            # RBRACE — close a brace group or act as a terminator.
+            if kind == TokenKind.RBRACE:
+                if brace_depth > 0:
+                    brace_depth -= 1
+                    expect_command = False
+                    pos += 1
+                    continue
+                # Not inside a brace group — check if it's our terminator.
+                if "}" in terminators and depth == 0 and compound_depth == 0:
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
+                raise ParseError("unexpected '}'")
+
+            # FUNC_PARENS — function definition parens, no depth effect.
+            if kind == TokenKind.FUNC_PARENS:
+                pos += 1
+                continue
 
             # DSEMI — case-clause terminator.
             if kind == TokenKind.DSEMI:
@@ -1999,6 +2152,14 @@ def _build_ast(
 
         # EOF — missing terminator.
         expected = "|".join(sorted(terminators))
+        # When chain_terminators is set, EOF is a valid end-of-body
+        # (the body extends to the end of the input).
+        if chain_terminators:
+            body_end = len(command)
+            # Body ends at the last non-WS position before EOF.
+            # Use the command length — trim trailing whitespace.
+            body_text = command[body_start:body_end]
+            return body_text.rstrip(), pos
         raise ParseError(f"unexpected EOF looking for '{expected}'")
 
     # ------------------------------------------------------------------
@@ -2323,6 +2484,95 @@ def _build_ast(
             raise ParseError("subshell: missing ')'")
         return SubshellNode(body=body_text)
 
+    def _parse_function(*, keyword_form: bool) -> FuncNode:
+        """Parse ``f() body`` or ``function f body``.
+
+        *keyword_form* is True for ``function f [()] body``, False for
+        ``f() body`` (POSIX form).
+        """
+        nonlocal pos
+
+        if keyword_form:
+            _skip_ws()
+            kw_tok = _consume()
+            assert kw_tok is not None and _is_reserved(kw_tok, "function")
+            _skip_ws()
+            name_tok = _consume()
+            if name_tok is None:
+                raise ParseError("function: missing name")
+            if name_tok.kind == TokenKind.FUNC_PARENS:
+                raise ParseError("function: expected name, got '()'")
+            if name_tok.kind != TokenKind.WORD:
+                raise ParseError("function: missing name")
+            name = name_tok.value
+            if not _FOR_VAR_RE.match(name):
+                raise ParseError(f"function: invalid name '{name}'")
+            # Optionally consume FUNC_PARENS.
+            _skip_ws()
+            t = _peek()
+            if t is not None and t.kind == TokenKind.FUNC_PARENS:
+                _consume()
+        else:
+            _skip_ws()
+            name_tok = _consume()
+            assert name_tok is not None and name_tok.kind == TokenKind.WORD
+            name = name_tok.value
+            if not _FOR_VAR_RE.match(name):
+                raise ParseError(f"function: invalid name '{name}'")
+            _skip_ws()
+            parens = _consume()
+            if parens is None or parens.kind != TokenKind.FUNC_PARENS:
+                raise ParseError("function: expected '()'")
+
+        # Validate name against reserved words.
+        if name in _RESERVED_WORDS:
+            if keyword_form:
+                raise ParseError(f"function: '{name}' is a reserved word")
+            else:
+                raise ParseError(f"'{name}' is a reserved word, cannot be a function name")
+
+        # Slice body: terminated by chain separators at depth 0.
+        _CHAIN_SEPS = frozenset({
+            TokenKind.SEMI, TokenKind.AND_AND,
+            TokenKind.OR_OR, TokenKind.BG, TokenKind.NEWLINE,
+        })
+        body_text, _ = _slice_body(
+            frozenset(),
+            chain_terminators=_CHAIN_SEPS,
+        )
+        if not body_text.strip():
+            raise ParseError("function: missing body")
+
+        # S2: if the body starts with '{', require the matching '}' at
+        # definition time (ParseError if missing) rather than deferring
+        # the error to call time.
+        stripped = body_text.strip()
+        if stripped.startswith('{'):
+            if _find_braced_end(stripped, 0) is None:
+                raise ParseError("function: missing '}'")
+
+        # Cap body length at MAX_HEREDOC_BODY.
+        body_text = body_text[:MAX_HEREDOC_BODY]
+
+        return FuncNode(name=name, body=body_text)
+
+    def _parse_group() -> GroupNode:
+        """Parse ``{ command; ...; }`` — brace group command.
+
+        Caller has already detected the LBRACE token.
+        """
+        nonlocal pos
+        _skip_ws()
+        lbrace = _consume()
+        assert lbrace is not None and lbrace.kind == TokenKind.LBRACE
+
+        body_text, _ = _slice_body(frozenset({"}"}))
+        _skip_ws()
+        rbrace = _consume()
+        if rbrace is None or rbrace.kind != TokenKind.RBRACE:
+            raise ParseError("group: missing '}'")
+        return GroupNode(body=body_text)
+
     def _parse_command() -> Optional[CommandLike]:
         nonlocal pos
 
@@ -2342,14 +2592,32 @@ def _build_ast(
                 return _parse_for()
             if _is_reserved(t, "case"):
                 return _parse_case()
+            if _is_reserved(t, "function"):
+                return _parse_function(keyword_form=True)
             # Reserved words that should never appear at command position
             # (they only make sense inside a compound body).
             if t.value in ("fi", "then", "else", "elif", "do", "done",
-                           "esac", "function", "in"):
+                           "esac", "in"):
                 raise ParseError(f"unexpected '{t.value}'")
+            # POSIX function definition: name() body
+            if _FOR_VAR_RE.match(t.value):
+                # Check if next non-WS token is FUNC_PARENS
+                saved2 = pos
+                pos += 1  # consume the name WORD
+                _skip_ws()
+                nxt = _peek()
+                pos = saved2
+                if nxt is not None and nxt.kind == TokenKind.FUNC_PARENS:
+                    return _parse_function(keyword_form=False)
         # LPAREN at command position — subshell.
         if t is not None and t.kind == TokenKind.LPAREN:
             return _parse_subshell()
+        # LBRACE at command position — brace group.
+        if t is not None and t.kind == TokenKind.LBRACE:
+            return _parse_group()
+        # Defensive: bare FUNC_PARENS without a name.
+        if t is not None and t.kind == TokenKind.FUNC_PARENS:
+            raise ParseError("unexpected '()'")
         # Restore position for normal command parsing.
         pos = saved_pos
 
@@ -2635,6 +2903,10 @@ def _serialize_command(cmd: "CommandLike", sentinel: bool = False) -> str:
         return "<case statement>"
     if isinstance(cmd, SubshellNode):
         return "<subshell>"
+    if isinstance(cmd, FuncNode):
+        return f"<function def: {cmd.name}>"
+    if isinstance(cmd, GroupNode):
+        return "<brace group>"
 
     if sentinel:
         word_serialize = lambda w: w.serialized()  # noqa: E731
@@ -2738,7 +3010,8 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     Compound constructs (``if``/``while``/``until``/``for``/``case``) are
     tracked so that ``;`` / ``&&`` / ``||`` / ``|`` inside their bodies
     are NOT treated as chain separators.  Nested compound depth is
-    maintained via open/close keyword pairing.
+    maintained via open/close keyword pairing.  Brace groups (``{ }``)
+    are also tracked.
     """
     tokens = Lexer(command).tokenize()
 
@@ -2785,6 +3058,20 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
             if depth > 0:
                 depth -= 1
             expect_command = False
+            continue
+        # LBRACE / RBRACE — track brace group depth.
+        if kind == TokenKind.LBRACE:
+            depth += 1
+            expect_command = True
+            continue
+        if kind == TokenKind.RBRACE:
+            if depth > 0:
+                depth -= 1
+            expect_command = False
+            continue
+        # FUNC_PARENS — reset expect_command (function definition boundary).
+        if kind == TokenKind.FUNC_PARENS:
+            expect_command = True
             continue
         # DSEMI — NOT a chain separator, but resets command position
         # (so esac after ;; is at command position).
@@ -2894,6 +3181,15 @@ def segment_needs_variable_state(seg_text: str) -> bool:
             expect_redirect_target = False
             skip_stage = False
             continue
+        # LPAREN, LBRACE, FUNC_PARENS — always require stateful execution,
+        # even when not at the first word position (they can appear after
+        # a function name that already set skip_stage).
+        if t.kind == TokenKind.LPAREN:
+            return True
+        if t.kind == TokenKind.LBRACE:
+            return True
+        if t.kind == TokenKind.FUNC_PARENS:
+            return True
         if skip_stage:
             continue
         if t.kind in _REDIRECT_KINDS:
@@ -2904,9 +3200,6 @@ def segment_needs_variable_state(seg_text: str) -> bool:
             # This token is the redirect target (WORD, SUBST, or VARREF) — skip it
             expect_redirect_target = False
             continue
-        # LPAREN at command position — subshell, requires stateful execution.
-        if t.kind == TokenKind.LPAREN:
-            return True
         if t.kind == TokenKind.WORD:
             # Check assignment: VAR=value
             if _ASSIGN_WORD_RE.match(t.value):

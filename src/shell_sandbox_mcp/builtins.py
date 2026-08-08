@@ -335,20 +335,31 @@ def _try_shift(
     """Handle ``shift [n]`` builtin.
 
     Returns ``(True, output, rc)`` when *cmd* is ``shift``, else
-    ``(False, None, None)``.  Always returns rc=1 (no positional params).
+    ``(False, None, None)``.  Pops from ``store.positional`` when
+    positional parameters are available; returns rc=1 when empty.
     """
     srv = _get_server()
     args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
     if not args or args[0] != "shift":
         return False, None, None
 
+    n = 1
     if len(args) > 1:
         try:
-            int(args[1])
+            n = int(args[1])
         except ValueError:
             return True, f"shift: invalid argument: {args[1]}", 1
 
-    return True, "", 1  # no positional parameters in the sandbox
+    if n < 1:
+        return True, f"shift: non-positive argument: {n}", 1
+
+    pos = list(store.positional)
+    if len(pos) < n:
+        store.positional = ()
+        return True, "", 1
+
+    store.positional = tuple(pos[n:])
+    return True, "", 0
 
 
 def _try_source(

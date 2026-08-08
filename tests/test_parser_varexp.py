@@ -6,7 +6,8 @@ Validates that:
 - Braced "${VAR}" expands.
 - Single-quoted '$VAR' is literal.
 - Escaped \$VAR (unquoted and dq) is literal.
-- Special params ($$ $? $0 $1 $@) are literal.
+- Special params: $$ and $? are literal; $0, $1, $@ are positional parameters
+  (Phase C) that resolve to empty when no positional params are supplied.
 - Braced-default ${VAR:-x} expands (new parameter-expansion operators live in
   test_parser_param_exp.py; plain ${VAR} stays a straight env lookup).
 - $$ is literal, $(( is still rejected.
@@ -249,7 +250,8 @@ class AdjacentTextTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class SpecialParamTest(unittest.TestCase):
-    """$$, $?, $0, $1, $@ must stay literal."""
+    """$$ and $? stay literal.  $0, $1, $@ are now positional parameters
+    (Phase C), resolving to empty when no positional params are provided."""
 
     def test_dollar_dollar_literal(self) -> None:
         _assert_both_equal(self, "echo $$", ["echo", "$$"])
@@ -258,13 +260,16 @@ class SpecialParamTest(unittest.TestCase):
         _assert_both_equal(self, "echo $?", ["echo", "$?"])
 
     def test_dollar_zero_literal(self) -> None:
-        _assert_both_equal(self, "echo $0", ["echo", "$0"])
+        # Phase C: $0 is a positional parameter, resolves to empty → dropped.
+        _assert_both_equal(self, "echo $0", ["echo"])
 
     def test_dollar_one_literal(self) -> None:
-        _assert_both_equal(self, "echo $1", ["echo", "$1"])
+        # Phase C: $1 is a positional parameter, resolves to empty → dropped.
+        _assert_both_equal(self, "echo $1", ["echo"])
 
     def test_dollar_at_literal(self) -> None:
-        _assert_both_equal(self, "echo $@", ["echo", "$@"])
+        # Phase C: $@ is a positional parameter, resolves to empty → dropped.
+        _assert_both_equal(self, "echo $@", ["echo"])
 
 
 # ---------------------------------------------------------------------------

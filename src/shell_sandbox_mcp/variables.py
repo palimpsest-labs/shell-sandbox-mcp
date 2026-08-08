@@ -29,6 +29,16 @@ class VariableStore:
     variables: dict[str, str] = field(default_factory=lambda: dict(_base_env()))
     exported: set[str] = field(default_factory=lambda: set(_base_env().keys()))
 
+    # Positional parameters ($1, $2, …) and script name ($0).
+    positional: tuple[str, ...] = ()
+    script_name: str = ""
+
+    # User-defined functions: name → body text.
+    functions: dict[str, str] = field(default_factory=dict)
+
+    # Function call depth counter (for recursion cap).
+    func_depth: int = 0
+
     # ------------------------------------------------------------------
     # lookup
     # ------------------------------------------------------------------
@@ -74,8 +84,22 @@ class VariableStore:
         return name in self.exported
 
     def env_for_expansion(self) -> dict[str, str]:
-        """Return the FULL dict (exported + local) for ``${VAR}`` expansion."""
-        return dict(self.variables)
+        """Return the FULL dict (exported + local + positional) for ``${VAR}`` expansion.
+
+        Positional parameters are layered AFTER the base dict so they
+        override.  ``$0`` is ``script_name``, ``$#`` is the count, and
+        ``$@`` / ``$*`` are space-joined (word-splitting is deferred — a
+        simplified space-join is used for now).
+        """
+        env = dict(self.variables)
+        # Positional parameters
+        env["0"] = self.script_name
+        for i, arg in enumerate(self.positional, 1):
+            env[str(i)] = arg
+        env["#"] = str(len(self.positional))
+        env["@"] = " ".join(self.positional)
+        env["*"] = " ".join(self.positional)
+        return env
 
     def env_for_subprocess(self) -> dict[str, str]:
         """Return only exported vars for subprocess environments."""

@@ -24,6 +24,8 @@ from .parser import (
     CommandNode,
     Expansion,
     ForNode,
+    FuncNode,
+    GroupNode,
     IfNode,
     ParseError,
     SubshellNode,
@@ -31,6 +33,7 @@ from .parser import (
     program_to_chain,
 )
 from .config import MAX_LOOP_ITER
+from . import config as _config
 
 if TYPE_CHECKING:
     from .variables import VariableStore
@@ -473,7 +476,7 @@ class Runner:
             # because compounds are not regular CommandNodes.
             if not bg and len(cmd_nodes) == 1:
                 node = cmd_nodes[0]
-                if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode)):
+                if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode, FuncNode, GroupNode)):
                     rc, out = self._run_compound(
                         node, store, self.work_dir, timeout, depth,
                         joined_for_stage=joined,
@@ -555,6 +558,33 @@ class Runner:
                     if rc_val != 0 and not out_val:
                         return f"Exit code: {rc_val}", rc_val
                     return out_val, rc_val
+
+                # --- function invocation dispatch ---
+                args, _, _ = srv._extract_redirects(cmd_node, expansion, self.work_dir)
+                if args and args[0] in store.functions:
+                    if store.func_depth >= _config.MAX_FUNC_DEPTH:
+                        err_msg = (
+                            f"function recursion depth limit"
+                            f" ({_config.MAX_FUNC_DEPTH}) exceeded"
+                        )
+                        out, rc = _builtin_result(1, err_msg)
+                        if out:
+                            self.outputs.append(out)
+                        self.stages.append({"command": joined, "output": out, "rc": rc})
+                        self.prev_rc = rc
+                        self.ran_any = True
+                        continue
+                    rc, out = self._run_function_call(
+                        store.functions[args[0]], args[1:], args[0],
+                        store, self.work_dir, timeout, depth,
+                    )
+                    out, rc = _builtin_result(rc, out)
+                    if out:
+                        self.outputs.append(out)
+                    self.stages.append({"command": joined, "output": out, "rc": rc})
+                    self.prev_rc = rc
+                    self.ran_any = True
+                    continue
 
                 # Try export
                 handled, out, rc = _try_export(cmd_node, expansion, self.work_dir, store)
@@ -657,7 +687,7 @@ class Runner:
             # harmless.
             if not bg and len(nodes) == 1:
                 node = nodes[0]
-                if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode)):
+                if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode, FuncNode, GroupNode)):
                     rc, out = self._run_compound(
                         node, store, self.work_dir, timeout, depth,
                         joined_for_stage=joined,
@@ -867,7 +897,7 @@ class Runner:
 
     def _run_compound(
         self,
-        node: "IfNode | WhileNode | ForNode",
+        node: "IfNode | WhileNode | ForNode | CaseNode | SubshellNode | FuncNode | GroupNode",
         store: "VariableStore",
         work_dir: "Path",
         timeout: int,
@@ -877,11 +907,12 @@ class Runner:
     ) -> tuple[int, str]:
         """Execute a compound command and return ``(rc, output)``.
 
-        *node* is one of :class:`IfNode`, :class:`WhileNode`, or
-        :class:`ForNode`.  The body text is re-parsed and executed with a
-        fresh per-body :class:`Runner` that shares *store* (so variable
-        mutations persist) but uses a snapshot of *work_dir* (so ``cd``
-        inside a body does NOT leak).
+        *node* is one of :class:`IfNode`, :class:`WhileNode`,
+        :class:`ForNode`, :class:`CaseNode`, :class:`SubshellNode`,
+        :class:`FuncNode`, or :class:`GroupNode`.  The body text is
+        re-parsed and executed with a fresh per-body :class:`Runner` that
+        shares *store* (so variable mutations persist) but uses a snapshot
+        of *work_dir* (so ``cd`` inside a body does NOT leak).
         """
         if isinstance(node, IfNode):
             return self._run_if(node, store, work_dir, timeout, depth,
@@ -898,6 +929,13 @@ class Runner:
         elif isinstance(node, SubshellNode):
             return self._run_subshell(node, store, work_dir, timeout, depth,
                                       joined_for_stage=joined_for_stage)
+        elif isinstance(node, FuncNode):
+            # Function definition: store body, rc=0, no output.
+            store.functions[node.name] = node.body
+            return 0, ""
+        elif isinstance(node, GroupNode):
+            return self._run_group(node, store, work_dir, timeout, depth,
+                                   joined_for_stage=joined_for_stage)
         else:
             return 1, f"unknown compound: {type(node).__name__}"
 
@@ -1118,5 +1156,58 @@ class Runner:
             store,
             variables=dict(store.variables),
             exported=set(store.exported),
+            functions=dict(store.functions),
+            positional=store.positional,
+            script_name=store.script_name,
+            func_depth=store.func_depth,
         )
         return self._run_body(node.body, isolated_store, work_dir, timeout, depth)
+
+    # ------------------------------------------------------------------
+    # function call
+    # ------------------------------------------------------------------
+
+    def _run_function_call(
+        self,
+        body_text: str,
+        args: list[str],
+        func_name: str,
+        store: "VariableStore",
+        work_dir: "Path",
+        timeout: int,
+        depth: int,
+    ) -> tuple[int, str]:
+        """Execute a user-defined function call.
+
+        Saves/restores positional parameters, bumps func_depth, and
+        executes the function body.  ``$0`` (script_name) is NOT changed.
+        """
+        saved_positional = store.positional
+        store.positional = tuple(args)
+        store.func_depth += 1
+        try:
+            return self._run_body(body_text, store, work_dir, timeout, depth)
+        finally:
+            store.positional = saved_positional
+            store.func_depth -= 1
+
+    # ------------------------------------------------------------------
+    # brace group { ... }
+    # ------------------------------------------------------------------
+
+    def _run_group(
+        self,
+        node: GroupNode,
+        store: "VariableStore",
+        work_dir: "Path",
+        timeout: int,
+        depth: int,
+        *,
+        joined_for_stage: str,
+    ) -> tuple[int, str]:
+        """Execute a brace group ``{ command; ...; }``.
+
+        No variable isolation — the body runs with the same store.
+        ``cd`` does not leak (handled by ``_run_body``'s work_dir snapshot).
+        """
+        return self._run_body(node.body, store, work_dir, timeout, depth)

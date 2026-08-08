@@ -355,12 +355,17 @@ class LiteralFallbackTest(unittest.TestCase):
         _assert_both_equal(self, "echo $?", ["echo", "$?"])
 
     def test_dollar_zero_literal(self) -> None:
-        _assert_both_equal(self, "echo $0", ["echo", "$0"])
+        # Phase C: $0 is now a positional parameter (not literal).
+        # With no positional params provided, it resolves to empty → word dropped.
+        _assert_both_equal(self, "echo $0", ["echo"])
 
     def test_braced_number_literal(self) -> None:
-        _assert_both_equal(self, "echo ${10}", ["echo", "${10}"])
+        # Phase C: ${10} is now a positional parameter (braced multi-digit).
+        # With no positional params provided, it resolves to empty → word dropped.
+        _assert_both_equal(self, "echo ${10}", ["echo"])
 
     def test_empty_braces_literal(self) -> None:
+        # ${} has no valid parameter name — stays literal.
         _assert_both_equal(self, "echo ${}", ["echo", "${}"])
 
     def test_unknown_literal_in_word(self) -> None:
