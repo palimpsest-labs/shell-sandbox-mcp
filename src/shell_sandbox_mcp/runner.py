@@ -65,6 +65,9 @@ def _expand_for_word(
     base_env: dict[str, str],
     srv,
     positional: tuple[str, ...] = (),
+    *,
+    field_split: bool = True,
+    ifs: Optional[str] = None,
 ) -> list[str]:
     """Expand a single word from the for-loop's ``in`` list.
 
@@ -75,6 +78,9 @@ def _expand_for_word(
 
     Returns a LIST of strings to support ``"$@"`` fan-out: a word
     containing a quoted ``$@`` may expand to multiple argv entries.
+
+    *field_split* controls IFS field splitting on unquoted expansions
+    (True for for-loop in-words, False for case-subject).
     """
     if raw_word == "":
         return [""]
@@ -92,13 +98,16 @@ def _expand_for_word(
         return [raw_word]
 
     expansion.positional_tuple = positional
+    expansion.ifs = ifs
 
     chains = program_to_chain(program)
     if not chains or not chains[0][1]:
         return [raw_word]
 
     from .parser import _extract_from_node
-    args, _, _ = _extract_from_node(chains[0][1][0], expansion, work_dir)
+    args, _, _ = _extract_from_node(
+        chains[0][1][0], expansion, work_dir, field_split=field_split,
+    )
     if not args or args[0] != "__for_expand":
         return [raw_word]
     # The expanded words are everything after the synthetic command name.
@@ -485,6 +494,7 @@ class Runner:
 
             if expansion is not None:
                 expansion.positional_tuple = store.positional
+                expansion.ifs = store.variables.get("IFS")
 
             if program is None:
                 self.outputs.append("Command parse error.")
@@ -1164,7 +1174,8 @@ class Runner:
         in_words: list[str] = []
         for raw_word in node.in_words:
             expanded = _expand_for_word(raw_word, work_dir, timeout, depth,
-                                        base_env, srv, positional=store.positional)
+                                        base_env, srv, positional=store.positional,
+                                        ifs=store.variables.get("IFS"))
             in_words.extend(expanded)
 
         outputs: list[str] = []
@@ -1245,6 +1256,9 @@ class Runner:
         if program is None:
             return 1, "Command parse error."
 
+        expansion.positional_tuple = store.positional
+        expansion.ifs = store.variables.get("IFS")
+
         chains = program_to_chain(program)
         if not chains:
             return 0, ""
@@ -1290,9 +1304,11 @@ class Runner:
         # subject expansion, so $VAR in the subject expands correctly.
         env = store.env_for_expansion()
 
-        # Expand subject through existing machinery.
+        # Expand subject through existing machinery (NO field splitting).
         expanded = _expand_for_word(node.subject, work_dir, timeout, depth,
-                                    env, srv, positional=store.positional)
+                                    env, srv, positional=store.positional,
+                                    field_split=False,
+                                    ifs=store.variables.get("IFS"))
         subject = " ".join(expanded) if expanded else ""
 
         for clause in node.clauses:

@@ -162,7 +162,7 @@ def _split_assignment_prefix(
       back to ``(None, cmd, None)`` so the caller treats it as a normal command.
     """
     srv = _get_server()
-    args, _redirects, err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if err is not None:
         return None, cmd, err
 
@@ -215,7 +215,7 @@ def _classify_builtin(cmd, expansion, work_dir) -> Optional[str]:
     probe.
     """
     srv = _get_server()
-    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if not args:
         return None
     return args[0] if args[0] in _BUILTIN_STAGE_NAMES else None
@@ -238,7 +238,7 @@ def _try_export(
     ``(False, None, None)``.
     """
     srv = _get_server()
-    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if not args or args[0] != "export":
         return False, None, None
 
@@ -286,7 +286,7 @@ def _try_unset(
     ``(False, None, None)``.
     """
     srv = _get_server()
-    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if not args or args[0] != "unset":
         return False, None, None
 
@@ -338,7 +338,7 @@ def _try_set(
     ``(False, None, None)``.
     """
     srv = _get_server()
-    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if not args or args[0] != "set":
         return False, None, None
 
@@ -377,7 +377,7 @@ def _try_shift(
     positional parameters are available; returns rc=1 when empty.
     """
     srv = _get_server()
-    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if not args or args[0] != "shift":
         return False, None, None
 
@@ -423,7 +423,7 @@ def _try_source(
     from .containment import _contained_in_any
 
     srv = _get_server()
-    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if not args:
         return False, None, None
     if args[0] not in ("source", "."):
@@ -488,7 +488,7 @@ def _try_break_continue(
     The caller (:class:`Runner`) decides whether to raise.
     """
     srv = _get_server()
-    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir)
+    args, _redirects, _err = srv._extract_redirects(cmd, expansion, work_dir, field_split=False)
     if not args or args[0] not in ("break", "continue"):
         return None, None, 0
 

@@ -1031,8 +1031,8 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
         cmd_node = prog.chains[0].pipeline.commands[0]
         args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
-        # Arg sentinel should be resolved to the single word "hello world"
-        self.assertEqual(args, ["echo", "hello world"])
+        # Unquoted $(...) → field-split by IFS: "hello world" → "hello", "world"
+        self.assertEqual(args, ["echo", "hello", "world"])
         self.assertEqual(len(redirs), 0)
 
     def test_compound_word_sentinel_resolved(self) -> None:
@@ -1091,7 +1091,8 @@ class ExtractRedirectsHeredocTest(unittest.TestCase):
         cmd_node = prog.chains[0].pipeline.commands[0]
         args, redirs, err = self._extract(cmd_node, exp)
         self.assertIsNone(err)
-        self.assertEqual(args, ["printf", "%s", "a b c"])
+        # Unquoted $(...) → field-split by IFS: "a b c" → "a", "b", "c"
+        self.assertEqual(args, ["printf", "%s", "a", "b", "c"])
 
     def test_arg_sentinel_in_redirect_target(self) -> None:
         # Parse a $() substitution to get a real sentinel WordPart + Expansion.

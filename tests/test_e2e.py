@@ -103,7 +103,7 @@ class EndToEndSmokeTest(unittest.TestCase):
         self.assertEqual(exp.heredoc_for(part), "hello world\n")
 
     def test_command_substitution_single_arg(self) -> None:
-        """Verify $(...) produces a sentinel with single-word value."""
+        """Verify $(...) with space-containing output is field-split (IFS)."""
         original = server._capture_stdout
         try:
             def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None, env=None):
@@ -114,7 +114,25 @@ class EndToEndSmokeTest(unittest.TestCase):
             part = _find_arg_sentinel(prog)
             self.assertIsNotNone(part)
             self.assertEqual(exp.arg_for(part), "a b")
-            # Use AST path for extract_redirects
+            # Unquoted $(...) → field-split by default IFS.
+            cmd_node = prog.chains[0].pipeline.commands[0]
+            args, redirs, err = _extract_redirects(cmd_node, expansion=exp)
+            self.assertEqual(args, ["echo", "a", "b"])
+        finally:
+            server._capture_stdout = original
+
+    def test_command_substitution_single_arg_quoted(self) -> None:
+        """Quoted "$(printf 'a b')" is NOT field-split (single arg)."""
+        original = server._capture_stdout
+        try:
+            def fake(command, work_dir, timeout, depth, deadline=None, subst_count=None, env=None):
+                return 0, b"a b"
+            server._capture_stdout = fake
+            cmd = 'echo "$(printf \'a b\')"'
+            expanded, exp, prog = _expand_command(cmd, self.work_dir, 30, 0)
+            part = _find_arg_sentinel(prog)
+            self.assertIsNotNone(part)
+            self.assertEqual(exp.arg_for(part), "a b")
             cmd_node = prog.chains[0].pipeline.commands[0]
             args, redirs, err = _extract_redirects(cmd_node, expansion=exp)
             self.assertEqual(args, ["echo", "a b"])

@@ -254,16 +254,16 @@ class SubstringTest(unittest.TestCase):
 
 class CaseModTest(unittest.TestCase):
     def test_lower_all(self) -> None:
-        _assert_both_equal(self, "echo ${S,,}", ["echo", "hello world"])
+        _assert_both_equal(self, "echo ${S,,}", ["echo", "hello", "world"])
 
     def test_lower_first(self) -> None:
-        _assert_both_equal(self, "echo ${S,}", ["echo", "hello World"])
+        _assert_both_equal(self, "echo ${S,}", ["echo", "hello", "World"])
 
     def test_upper_all(self) -> None:
-        _assert_both_equal(self, "echo ${X^^}", ["echo", "A B"])
+        _assert_both_equal(self, "echo ${X^^}", ["echo", "A", "B"])
 
     def test_upper_first(self) -> None:
-        _assert_both_equal(self, "echo ${X^}", ["echo", "A b"])
+        _assert_both_equal(self, "echo ${X^}", ["echo", "A", "b"])
 
     def test_case_empty(self) -> None:
         _assert_both_equal(self, "echo ${UNSET_VAR^^}", ["echo"])
@@ -286,7 +286,8 @@ class NestedExpansionTest(unittest.TestCase):
             ["echo", "hi"], outputs={"echo hi": "hi"})
 
     def test_nested_alternate(self) -> None:
-        _assert_both_equal(self, "echo ${HOME:+${X}}", ["echo", "a b"])
+        # Unquoted nested ${X} → field-split by IFS.
+        _assert_both_equal(self, "echo ${HOME:+${X}}", ["echo", "a", "b"])
 
     def test_nested_subst_alternate(self) -> None:
         _assert_both_equal(

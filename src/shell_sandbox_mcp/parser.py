@@ -96,6 +96,7 @@ class Expansion:
     at_split_keys: set[str] = field(default_factory=set)
     star_join_keys: set[str] = field(default_factory=set)
     positional_tuple: tuple[str, ...] = ()
+    ifs: Optional[str] = None  # IFS value for field splitting (None → default)
 
     # -- public opaque API ------------------------------------------------
 
@@ -3359,6 +3360,8 @@ def extract_redirects(
     segment,
     expansion: Optional[Expansion] = None,
     work_dir: Optional[Path] = None,
+    *,
+    field_split: bool = True,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """Tokenize a command segment, extracting redirect operators.
 
@@ -3369,12 +3372,16 @@ def extract_redirects(
     *work_dir*, when given, enables glob/pathname expansion on unquoted
     metacharacters in command args (not redirect targets).
 
+    *field_split*, when True (default), enables POSIX IFS field splitting
+    on unquoted ``$VAR`` expansions.  Set to False for assignment RHS,
+    ``export``/``set``/``unset`` args, and case-subject contexts.
+
     All error strings match the original ``_extract_redirects`` exactly.
     """
     if isinstance(segment, str):
-        return _extract_from_string(segment, expansion, work_dir)
+        return _extract_from_string(segment, expansion, work_dir, field_split=field_split)
     elif isinstance(segment, CommandNode):
-        return _extract_from_node(segment, expansion, work_dir)
+        return _extract_from_node(segment, expansion, work_dir, field_split=field_split)
     else:
         return [], [], f"Unsupported segment type: {type(segment).__name__}"
 
@@ -3383,6 +3390,8 @@ def _extract_from_string(
     segment: str,
     expansion: Optional[Expansion] = None,
     work_dir: Optional[Path] = None,
+    *,
+    field_split: bool = True,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """AST-projected path: lex *segment* and route through the AST.
 
@@ -3410,7 +3419,7 @@ def _extract_from_string(
     if not chain or not chain[0][1]:
         return [], [], None
 
-    return _extract_from_node(chain[0][1][0], expansion, work_dir)
+    return _extract_from_node(chain[0][1][0], expansion, work_dir, field_split=field_split)
 
 
 def _has_unbalanced_quotes(text: str) -> bool:
@@ -3432,6 +3441,130 @@ def _has_unbalanced_quotes(text: str) -> bool:
         else:
             i += 1
     return quote is not None
+
+
+# ---------------------------------------------------------------------------
+# IFS field splitting (POSIX)
+# ---------------------------------------------------------------------------
+
+_IFS_DEFAULT = " \t\n"
+_IFS_WS = frozenset(" \t\n")
+
+
+def _effective_ifs(ifs: Optional[str]) -> str:
+    """Return the effective IFS: *ifs* or the default ``" \\t\\n"``."""
+    return _IFS_DEFAULT if ifs is None else ifs
+
+
+def _field_split(value: str, ifs: str) -> list[str]:
+    """POSIX IFS field splitting of *value* using *ifs*.
+
+    Returns a list of fields.  *ifs* is guaranteed non-empty by the caller.
+
+    Rules (IEEE Std 1003.1-2017, §2.6.5):
+
+    * Empty IFS → no splitting → ``[value]``.
+    * IFS whitespace characters are FIXED to ``" \\t\\n"`` (NOT derived from
+      the current IFS value).  Runs of IFS whitespace collapse; leading and
+      trailing IFS whitespace is trimmed.
+    * Non-whitespace IFS characters are hard delimiters.  Each occurrence
+      delimits a field (consecutive non-ws delimiters yield empty fields).
+    * When the IFS contains both ws and non-ws characters, a *delimiter
+      sequence* is any maximal contiguous run of IFS characters that
+      contains at least one non-ws IFS character.  Each delimiter sequence
+      produces exactly one field boundary (no empty-field multiplication).
+      Standalone IFS whitespace runs are still subject to collapse and trim.
+    """
+    if not ifs:
+        # Empty IFS → no splitting.  But an empty value still produces
+        # no fields (consistent with the zero-fields-for-empty rule).
+        return [value] if value else []
+    if not value:
+        return []
+
+    # Partition IFS into ws and non-ws subsets.
+    ws_chars = [c for c in ifs if c in _IFS_WS]
+    nws_chars = [c for c in ifs if c not in _IFS_WS]
+
+    # Only whitespace IFS → simple word splitting + trim.
+    if not nws_chars:
+        result: list[str] = []
+        current: list[str] = []
+        for ch in value:
+            if ch in ws_chars:
+                if current:
+                    result.append(''.join(current))
+                    current = []
+            else:
+                current.append(ch)
+        if current:
+            result.append(''.join(current))
+        return result
+
+    # Only non-whitespace IFS (e.g. IFS=",") → every occurrence is a hard
+    # delimiter.  Split by any nws char, preserving empty fields.
+    if not ws_chars:
+        parts = [value]
+        for delim in nws_chars:
+            new_parts: list[str] = []
+            for p in parts:
+                new_parts.extend(p.split(delim))
+            parts = new_parts
+        return parts
+
+    # Mixed: ws + non-ws IFS.
+    # Delimiter sequences are maximal runs of IFS chars containing ≥1 non-ws
+    # char.  Standalone ws-only runs are regular ws delimiters (collapse +
+    # leading/trailing trim).
+    _ws_set = frozenset(ws_chars)
+    _nws_set = frozenset(nws_chars)
+    _all_ifs = _ws_set | _nws_set
+
+    result: list[str] = []
+    i = 0
+    n = len(value)
+    field_start = 0        # start index of the current field
+    last_was_nws = False    # did the last delimiter sequence contain non-ws?
+
+    while i < n:
+        ch = value[i]
+        if ch not in _all_ifs:
+            # Non-IFS char — part of the current field.
+            i += 1
+            last_was_nws = False
+            continue
+
+        # IFS character found.  Scan the full contiguous IFS run.
+        run_start = i
+        has_nws = False
+        while i < n and value[i] in _all_ifs:
+            if value[i] in _nws_set:
+                has_nws = True
+            i += 1
+        # ``i`` now points to the first non-IFS char after the run (or n).
+
+        if has_nws:
+            # Delimiter sequence containing non-ws → always emit the current
+            # field, even if empty (preserves empty fields from non-ws IFS).
+            result.append(value[field_start:run_start])
+            field_start = i
+            last_was_nws = True
+        else:
+            # WS-only delimiter → only emit if there is preceding content
+            # (leading/trailing ws trimmed, runs collapsed).
+            if field_start < run_start:
+                result.append(value[field_start:run_start])
+            field_start = i
+            last_was_nws = False
+
+    # Emit the final field.
+    if field_start < n:
+        result.append(value[field_start:])
+    elif last_was_nws and field_start == n and n > 0:
+        # The value ended with a non-ws delimiter sequence → trailing empty field.
+        result.append('')
+
+    return result
 
 
 def _expand_tilde(s: str) -> str:
@@ -3468,6 +3601,8 @@ def _extract_from_node(
     cmd: CommandNode,
     expansion: Optional[Expansion] = None,
     work_dir: Optional[Path] = None,
+    *,
+    field_split: bool = True,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """AST-native path: project a CommandNode to (args, redirects, err).
 
@@ -3478,9 +3613,20 @@ def _extract_from_node(
     Word into one argv entry per positional parameter.  ``"$*"`` joins
     positional parameters with a single space into one arg.  The fan-out
     relies on ``expansion.positional_tuple`` being set before calling.
+
+    Supports POSIX IFS field splitting on unquoted ``$VAR`` expansions
+    when *field_split* is True (the default).  Set to False for assignment
+    RHS, ``export``/``set``/``unset`` args, and case-subject contexts.
     """
     args: list[str] = []
     redirects: list[Redirect] = []
+
+    # Determine effective IFS for field splitting.
+    effective_ifs = ""
+    ifs_has_nws = False
+    if field_split and expansion is not None:
+        effective_ifs = _effective_ifs(expansion.ifs)
+        ifs_has_nws = any(c not in _IFS_WS for c in effective_ifs)
 
     for w in cmd.words:
         # In-flight fields: each dict will become one argv entry at end-of-Word.
@@ -3520,13 +3666,49 @@ def _extract_from_node(
             elif p.is_arg_sentinel and expansion is not None:
                 val = expansion.arg_for(p)
                 val = val if val is not None else p.text
-                fields[-1]["resolved"] += val
-                if p.is_quoted:
-                    fields[-1]["pattern"] += _glob.escape(val)
+
+                # ---- IFS field splitting (unquoted only) -------------------
+                if field_split and effective_ifs and not p.is_quoted:
+                    pieces = _field_split(val, effective_ifs)
+                    if not pieces:
+                        # Empty split → drop this expansion entirely
+                        # (e.g. X="" or X="   ").
+                        continue
+                    # First piece merges into the last in-flight field.
+                    fields[-1]["resolved"] += pieces[0]
+                    if not p.is_quoted:
+                        fields[-1]["pattern"] += pieces[0]
+                        if any(c in pieces[0] for c in "*?["):
+                            fields[-1]["glob_active"] = True
+                    else:
+                        fields[-1]["pattern"] += _glob.escape(pieces[0])
+                    # Mark current field as keep_if_empty when the first
+                    # piece is "" and IFS contains non-ws chars (POSIX:
+                    # non-ws IFS empty fields are preserved).
+                    if ifs_has_nws and pieces[0] == "" and \
+                            not fields[-1].get("resolved"):
+                        fields[-1]["keep_if_empty"] = True
+                    # Subsequent pieces push new in-flight fields (fan-out).
+                    for piece in pieces[1:]:
+                        new_field = {
+                            "resolved": piece,
+                            "pattern": piece,
+                            "glob_active": bool(
+                                any(c in piece for c in "*?[")
+                            ),
+                        }
+                        if ifs_has_nws and piece == "":
+                            new_field["keep_if_empty"] = True
+                        fields.append(new_field)
                 else:
-                    fields[-1]["pattern"] += val
-                    if any(c in val for c in "*?["):
-                        fields[-1]["glob_active"] = True
+                    # ---- no field splitting (quoted or disabled) -----------
+                    fields[-1]["resolved"] += val
+                    if p.is_quoted:
+                        fields[-1]["pattern"] += _glob.escape(val)
+                    else:
+                        fields[-1]["pattern"] += val
+                        if any(c in val for c in "*?["):
+                            fields[-1]["glob_active"] = True
             else:
                 # Plain text, hd sentinel, or arg sentinel with no expansion.
                 fields[-1]["resolved"] += p.text
@@ -3537,10 +3719,12 @@ def _extract_from_node(
                     if any(c in p.text for c in "*?["):
                         fields[-1]["glob_active"] = True
 
-        # Emit each non-empty in-flight field as an argv entry.
+        # Emit each in-flight field as an argv entry.
+        # Skip truly empty fields UNLESS they carry ``keep_if_empty``
+        # (produced by non-whitespace IFS delimiters).
         for f in fields:
             resolved = f["resolved"]
-            if not resolved:
+            if not resolved and not f.get("keep_if_empty"):
                 continue
             if work_dir is not None and f["glob_active"]:
                 matches = _expand_glob_arg(f["pattern"], work_dir)

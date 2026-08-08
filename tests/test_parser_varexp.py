@@ -178,14 +178,15 @@ class BasicVarExpansionTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Space value — no field splitting
+# Space value — with IFS field splitting (Phase E)
 # ---------------------------------------------------------------------------
 
-class NoFieldSplitTest(unittest.TestCase):
-    """$VAR expanding to a value with spaces becomes ONE arg."""
+class FieldSplitTest(unittest.TestCase):
+    """Unquoted $VAR with space-containing value is field-split by IFS."""
 
     def test_unquoted_space_value(self) -> None:
-        _assert_both_equal(self, "echo $X", ["echo", "a b"])
+        """echo $X with X='a b' → ['echo','a','b'] (IFS field splitting)."""
+        _assert_both_equal(self, "echo $X", ["echo", "a", "b"])
 
     def test_dq_space_value(self) -> None:
         _assert_both_equal(self, 'echo "$X"', ["echo", "a b"])

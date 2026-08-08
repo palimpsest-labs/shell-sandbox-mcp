@@ -116,17 +116,17 @@ class AtSplitFanOutTest(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(args, ["echo", "a b c"])
 
-    def test_unquoted_at_still_space_joins(self) -> None:
-        """Unquoted $@ still space-joins (no regression)."""
+    def test_unquoted_at_field_splits_after_join(self) -> None:
+        """Unquoted $@ join-then-split (Option J): space-join then IFS-split."""
         args, _, err = _extract("echo $@", positional=("a", "b"))
         self.assertIsNone(err)
-        self.assertEqual(args, ["echo", "a b"])
+        self.assertEqual(args, ["echo", "a", "b"])
 
-    def test_unquoted_star_still_space_joins(self) -> None:
-        """Unquoted $* still space-joins."""
+    def test_unquoted_star_field_splits_after_join(self) -> None:
+        """Unquoted $* join-then-split: space-join then IFS-split."""
         args, _, err = _extract("echo $*", positional=("a", "b"))
         self.assertIsNone(err)
-        self.assertEqual(args, ["echo", "a b"])
+        self.assertEqual(args, ["echo", "a", "b"])
 
     def test_pre_at_post_with_positionals(self) -> None:
         """pre'$@'post with 3 positionals → [pre+first, second, last+post]."""

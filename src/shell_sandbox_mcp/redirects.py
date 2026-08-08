@@ -80,6 +80,8 @@ def _extract_redirects(
     segment,
     expansion=None,
     work_dir=None,
+    *,
+    field_split: bool = True,
 ) -> tuple[list[str], list[Redirect], Optional[str]]:
     """Tokenize a command segment, extracting redirect operators.
 
@@ -87,8 +89,12 @@ def _extract_redirects(
     ``str`` (legacy path — lexes inline) or a :class:`parser.CommandNode`
     (AST-native path — uses the pre-parsed AST directly without re-lexing).
     *work_dir*, when given, enables glob/pathname expansion.
+
+    *field_split*, when True (default), enables POSIX IFS field splitting
+    on unquoted ``$VAR`` expansions.  Set to False for assignment RHS,
+    ``export``/``set``/``unset`` args, and case-subject contexts.
     """
-    return _parser_extract_redirects(segment, expansion, work_dir)
+    return _parser_extract_redirects(segment, expansion, work_dir, field_split=field_split)
 
 
 def _resolve_fd_targets(
