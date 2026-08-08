@@ -13,17 +13,20 @@ etc. keep firing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import fnmatch as _fnmatch
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from .executor import _get_server
 from .parser import (
+    CaseNode,
     CommandNode,
     Expansion,
     ForNode,
     IfNode,
     ParseError,
+    SubshellNode,
     WhileNode,
     program_to_chain,
 )
@@ -78,6 +81,135 @@ def _expand_for_word(
     if len(args) == 1:
         return ""
     return " ".join(args[1:])
+
+
+def _match_case_pattern(subject: str, pattern_text: str, store: "VariableStore") -> bool:
+    """Match *subject* against a case-clause *pattern_text*.
+
+    POSIX case pattern matching with ``|`` alternation and fnmatch globbing.
+    ``$()`` in patterns is NOT expanded in Phase B.
+
+    Phases:
+      1. Walk *pattern_text* char-by-char, expanding ``$VAR``/``${VAR}``
+         from *store*, producing a list of ``(char, is_glob_active)`` pairs.
+      2. Split on unquoted ``|`` into alternatives.
+      3. For each alternative, rebuild with ``*?[`` bracketed-escaped where
+         *is_glob_active* is False, then ``fnmatch.fnmatchcase``.
+    """
+
+    # Phase 1: expand $VAR, tracking glob-activity per character.
+    pairs: list[tuple[str, bool]] = []  # (char, glob_active)
+    i, n = 0, len(pattern_text)
+    quote: str = ""  # '' = none
+
+    def _try_expand_var(i: int, glob_active: bool) -> int | None:
+        """If $VAR / ${VAR} starts at *i*, append expanded chars to *pairs*
+        and return the new index.  Returns None when no expansion matches."""
+        nxt = pattern_text[i + 1]
+        if nxt == '{':
+            end = pattern_text.find('}', i + 2)
+            if end != -1:
+                name = pattern_text[i + 2 : end]
+                val = store.get(name) if store else ""
+                for ch in val:
+                    pairs.append((ch, glob_active))
+                return end + 1
+            return None
+        if _is_valid_var_char(nxt, first=True):
+            j = i + 1
+            while j < n and _is_valid_var_char(pattern_text[j]):
+                j += 1
+            name = pattern_text[i + 1 : j]
+            val = store.get(name) if store else ""
+            for ch in val:
+                pairs.append((ch, glob_active))
+            return j
+        return None
+
+    while i < n:
+        c = pattern_text[i]
+        if quote == "'":
+            if c == "'":
+                quote = ""
+            else:
+                pairs.append((c, False))
+            i += 1
+            continue
+        if quote == '"':
+            if c == '"':
+                quote = ""
+                i += 1
+                continue
+            if c == '\\' and i + 1 < n and pattern_text[i + 1] in ('"', '$', '\\'):
+                pairs.append((pattern_text[i + 1], False))
+                i += 2
+                continue
+            if c == '$' and i + 1 < n:
+                new_i = _try_expand_var(i, False)
+                if new_i is not None:
+                    i = new_i
+                    continue
+            pairs.append((c, False))
+            i += 1
+            continue
+        # Outside quotes
+        if c == '\\' and i + 1 < n:
+            pairs.append((pattern_text[i + 1], False))
+            i += 2
+            continue
+        if c == "'":
+            quote = "'"
+            i += 1
+            continue
+        if c == '"':
+            quote = '"'
+            i += 1
+            continue
+        if c == '$' and i + 1 < n:
+            new_i = _try_expand_var(i, True)
+            if new_i is not None:
+                i = new_i
+                continue
+        pairs.append((c, True))
+        i += 1
+
+    alt_start = 0
+    for j, (ch, active) in enumerate(pairs):
+        if ch == '|' and active:
+            escaped: list[str] = []
+            for pc, pa in pairs[alt_start:j]:
+                if pa:
+                    escaped.append(pc)
+                elif pc in '*?[':
+                    escaped.append('[' + pc + ']')
+                else:
+                    escaped.append(pc)
+            if _fnmatch.fnmatchcase(subject, "".join(escaped)):
+                return True
+            alt_start = j + 1
+    # Last alternative
+    escaped = []
+    for pc, pa in pairs[alt_start:]:
+        if pa:
+            escaped.append(pc)
+        elif pc in '*?[':
+            escaped.append('[' + pc + ']')
+        else:
+            escaped.append(pc)
+    return _fnmatch.fnmatchcase(subject, "".join(escaped))
+
+
+def _is_valid_var_char(c: str, *, first: bool = False) -> bool:
+    """Return True if *c* is a valid shell variable name character.
+
+    If *first* is True, digits are rejected (POSIX: variable names start
+    with alpha or underscore; ``$1`` is a positional parameter, not a
+    variable).  When *first* is False (default), digits are allowed for
+    subsequent characters.
+    """
+    if first:
+        return c.isalpha() or c == '_'
+    return c.isalpha() or c == '_' or c.isdigit()
 
 
 @dataclass
@@ -341,7 +473,7 @@ class Runner:
             # because compounds are not regular CommandNodes.
             if not bg and len(cmd_nodes) == 1:
                 node = cmd_nodes[0]
-                if isinstance(node, (IfNode, WhileNode, ForNode)):
+                if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode)):
                     rc, out = self._run_compound(
                         node, store, self.work_dir, timeout, depth,
                         joined_for_stage=joined,
@@ -525,7 +657,7 @@ class Runner:
             # harmless.
             if not bg and len(nodes) == 1:
                 node = nodes[0]
-                if isinstance(node, (IfNode, WhileNode, ForNode)):
+                if isinstance(node, (IfNode, WhileNode, ForNode, CaseNode, SubshellNode)):
                     rc, out = self._run_compound(
                         node, store, self.work_dir, timeout, depth,
                         joined_for_stage=joined,
@@ -760,6 +892,12 @@ class Runner:
         elif isinstance(node, ForNode):
             return self._run_for(node, store, work_dir, timeout, depth,
                                  joined_for_stage=joined_for_stage)
+        elif isinstance(node, CaseNode):
+            return self._run_case(node, store, work_dir, timeout, depth,
+                                  joined_for_stage=joined_for_stage)
+        elif isinstance(node, SubshellNode):
+            return self._run_subshell(node, store, work_dir, timeout, depth,
+                                      joined_for_stage=joined_for_stage)
         else:
             return 1, f"unknown compound: {type(node).__name__}"
 
@@ -916,3 +1054,69 @@ class Runner:
         # structured=True guarantees a Result object.
         assert isinstance(result, Result)
         return result.rc, result.text
+
+    # ------------------------------------------------------------------
+    # case / esac
+    # ------------------------------------------------------------------
+
+    def _run_case(
+        self,
+        node: CaseNode,
+        store: "VariableStore",
+        work_dir: "Path",
+        timeout: int,
+        depth: int,
+        *,
+        joined_for_stage: str,
+    ) -> tuple[int, str]:
+        """Execute a ``case`` construct: match subject against patterns.
+
+        The subject word is expanded via :func:`_expand_for_word`.  Patterns
+        are tried in order; the first matching clause's body runs.  If no
+        clause matches, returns ``(0, "")`` (POSIX).
+        """
+        srv = _get_server()
+        # Use the store's full env (including user-set variables) for
+        # subject expansion, so $VAR in the subject expands correctly.
+        env = store.env_for_expansion()
+
+        # Expand subject through existing machinery.
+        subject = _expand_for_word(node.subject, work_dir, timeout, depth,
+                                   env, srv)
+
+        for clause in node.clauses:
+            if _match_case_pattern(subject, clause.pattern, store):
+                return self._run_body(
+                    clause.body, store, work_dir, timeout, depth,
+                )
+
+        # No match — POSIX: exit 0, no output.
+        return 0, ""
+
+    # ------------------------------------------------------------------
+    # subshell ( ... )
+    # ------------------------------------------------------------------
+
+    def _run_subshell(
+        self,
+        node: SubshellNode,
+        store: "VariableStore",
+        work_dir: "Path",
+        timeout: int,
+        depth: int,
+        *,
+        joined_for_stage: str,
+    ) -> tuple[int, str]:
+        """Execute a subshell ``(command; ...)`` with variable isolation.
+
+        Creates a deep copy of *store* so assignments inside the subshell
+        do NOT leak to the parent.  ``cd`` does not leak either (already
+        handled by ``_run_body``'s work_dir snapshot).
+        """
+        # Deep-copy the variable store for isolation.
+        isolated_store = replace(
+            store,
+            variables=dict(store.variables),
+            exported=set(store.exported),
+        )
+        return self._run_body(node.body, isolated_store, work_dir, timeout, depth)

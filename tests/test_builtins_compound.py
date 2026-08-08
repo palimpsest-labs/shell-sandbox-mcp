@@ -533,5 +533,296 @@ class CompoundExecutionTest(unittest.TestCase):
             _remove_stubs(self._orig_segment, self._orig_pipeline)
 
 
-if __name__ == "__main__":
-    unittest.main()
+# ------------------------------------------------------------------
+# case / esac execution tests
+# ------------------------------------------------------------------
+
+
+class CaseExecutionTest(unittest.TestCase):
+    """Test execution of case/esac via shell_run."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.allowed = Path(tempfile.gettempdir()) / ("sandbox-case-" + os.urandom(4).hex())
+        self.allowed.mkdir()
+        (self.allowed / "sub").mkdir()
+        self._orig_segment = server._run_segment
+        self._orig_pipeline = server._run_pipeline
+
+    def tearDown(self) -> None:
+        _remove_stubs(self._orig_segment, self._orig_pipeline)
+        shutil.rmtree(self.allowed, ignore_errors=True)
+        self._tmp.cleanup()
+
+    def test_case_exact_match(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "case x in x) echo matched;; esac",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("matched", calls[0]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_glob_star(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "case hello in *) echo default;; esac",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("default", calls[0]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_no_match(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "case x in a) echo a;; b) echo b;; esac",
+                cwd=str(self.allowed), timeout=30,
+                structured=True,
+            )
+            self.assertEqual(len(calls), 0)
+            self.assertEqual(result["rc"], 0)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_pipe_alternation_match(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "case b in a|b) echo ab;; esac",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("ab", calls[0]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_default_clause(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "case x in a) echo a;; *) echo default;; esac",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("default", calls[0]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_quoted_star_literal(self) -> None:
+        """Quoted * in pattern is literal, not glob."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                'case "*" in "*") echo literal;; *) echo glob;; esac',
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("literal", calls[0]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_var_subject(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "x=hello; case $x in hello) echo matched;; esac",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertIn("matched", calls[-1]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_var_pattern(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "p=hello; case hello in $p) echo matched;; esac",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("matched", calls[0]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_exit_code_propagation(self) -> None:
+        """Exit code from matched clause propagates."""
+        calls = _install_stubs()
+        def fake_segment(command, work_dir, timeout, expansion=None, **kwargs):
+            if isinstance(command, CommandNode):
+                args, _, _ = _extract_redirects(command, expansion, work_dir)
+                cmd_str = " ".join(args)
+                if "echo fail" in cmd_str:
+                    return 3, "fail"
+            return 0, ""
+
+        server._run_segment = fake_segment
+        try:
+            result = server.shell_run(
+                "case x in x) echo fail;; esac",
+                cwd=str(self.allowed), timeout=30, structured=True,
+            )
+            self.assertEqual(result["rc"], 3)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_nested_if_in_body(self) -> None:
+        """Case clause body can contain an if statement."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "case x in x) if true; then echo inner; fi;; esac",
+                cwd=str(self.allowed), timeout=30,
+            )
+            # One call for 'true' (condition), one for 'echo inner' (body)
+            self.assertGreaterEqual(len(calls), 1)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_case_chained_with_and_and(self) -> None:
+        """&& chain after case works."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "case x in x) echo ok;; esac && echo NEXT",
+                cwd=str(self.allowed), timeout=30,
+            )
+            # echo ok runs (rc=0), then echo NEXT runs
+            self.assertGreaterEqual(len(calls), 2)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+
+# ------------------------------------------------------------------
+# subshell execution tests
+# ------------------------------------------------------------------
+
+
+class SubshellExecutionTest(unittest.TestCase):
+    """Test execution of subshells via shell_run."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.allowed = Path(tempfile.gettempdir()) / ("sandbox-sub-" + os.urandom(4).hex())
+        self.allowed.mkdir()
+        (self.allowed / "sub").mkdir()
+        self._orig_segment = server._run_segment
+        self._orig_pipeline = server._run_pipeline
+
+    def tearDown(self) -> None:
+        _remove_stubs(self._orig_segment, self._orig_pipeline)
+        shutil.rmtree(self.allowed, ignore_errors=True)
+        self._tmp.cleanup()
+
+    def test_subshell_basic(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "(echo hi)",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("hi", calls[0]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_subshell_var_isolation(self) -> None:
+        """Variable set inside subshell does NOT leak to parent."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "(x=2); echo $x",
+                cwd=str(self.allowed), timeout=30,
+            )
+            # echo $x should expand to empty string (x not set in parent)
+            self.assertIn("echo", calls[-1]["args"])
+            self.assertNotIn("2", calls[-1]["args"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_subshell_exit_code(self) -> None:
+        """Exit code from subshell propagates."""
+        calls = _install_stubs()
+        def fake_segment(command, work_dir, timeout, expansion=None, **kwargs):
+            if isinstance(command, CommandNode):
+                args, _, _ = _extract_redirects(command, expansion, work_dir)
+                cmd_str = " ".join(args)
+                if "false" in cmd_str:
+                    return 1, ""
+            return 0, ""
+
+        server._run_segment = fake_segment
+        try:
+            result = server.shell_run(
+                "(false)",
+                cwd=str(self.allowed), timeout=30, structured=True,
+            )
+            self.assertEqual(result["rc"], 1)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_subshell_cd_isolation(self) -> None:
+        """cd inside subshell does NOT leak."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "cd sub; (cd ..); echo hi",
+                cwd=str(self.allowed), timeout=30,
+            )
+            # echo hi should run in .../sub (cd sub persisted)
+            echo_call = calls[-1]
+            self.assertIn("sub", echo_call["work_dir"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_subshell_with_if(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "( if true; then echo inner; fi )",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertGreaterEqual(len(calls), 1)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_nested_subshell(self) -> None:
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "( ( echo inner ) )",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertGreaterEqual(len(calls), 1)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_subshell_chained_and_and(self) -> None:
+        """&& after subshell works."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "(echo hi) && echo NEXT",
+                cwd=str(self.allowed), timeout=30,
+            )
+            self.assertGreaterEqual(len(calls), 2)
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)
+
+    def test_subshell_chained_or_or_skip(self) -> None:
+        """|| after successful subshell skips."""
+        calls = _install_stubs()
+        try:
+            result = server.shell_run(
+                "(echo hi) || echo NO",
+                cwd=str(self.allowed), timeout=30, structured=True,
+            )
+            self.assertTrue(result["skipped"])
+        finally:
+            _remove_stubs(self._orig_segment, self._orig_pipeline)

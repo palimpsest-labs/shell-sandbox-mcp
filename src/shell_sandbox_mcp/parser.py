@@ -264,6 +264,11 @@ class TokenKind(enum.Enum):
     SUBST = 30          # $(...) — value is raw inner text
     VARREF = 31         # $VAR or ${VAR} — value is the variable name
 
+    # Parens and case terminator
+    LPAREN = 40         # (  (at command position)
+    RPAREN = 41         # )  (matching open paren)
+    DSEMI = 42          # ;;  (case clause terminator)
+
 
 # ---------------------------------------------------------------------------
 # Token
@@ -408,7 +413,27 @@ class ForNode:
     body: str
 
 
-CompoundCommand = "IfNode | WhileNode | ForNode"
+@dataclass(frozen=True)
+class CaseClause:
+    """A single clause of a ``case`` construct: pattern + body text."""
+    pattern: str
+    body: str
+
+
+@dataclass(frozen=True)
+class CaseNode:
+    """``case WORD in pat1) body ;; pat2) body ;; esac``."""
+    subject: str
+    clauses: tuple["CaseClause", ...]
+
+
+@dataclass(frozen=True)
+class SubshellNode:
+    """``( command; ... )`` — run commands in a subshell."""
+    body: str
+
+
+CompoundCommand = "IfNode | WhileNode | ForNode | CaseNode | SubshellNode"
 CommandLike = "CommandNode | CompoundCommand"
 
 
@@ -426,6 +451,9 @@ _RESERVED_WORDS = frozenset({
 
 # For-loop variable name validator (moved from builtins.py).
 _FOR_VAR_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+# Compound command types for pipe-rejection checks.
+_COMPOUND_TYPES = (IfNode, WhileNode, ForNode, CaseNode, SubshellNode)
 
 
 def _is_reserved(tok: Token, word: str) -> bool:
@@ -461,6 +489,11 @@ class Lexer:
         self._pos = 0
         self._tokens: list[Token] = []
         self._replay_mode = replay_mode
+        self._paren_depth: int = 0
+        # Track case/esac nesting so ')' after a case-pattern can be
+        # distinguished from a subshell-closing ')' (BLOCKER 1).
+        self._case_nesting: int = 0
+        self._expecting_case_rparen: bool = False
 
     def tokenize(self) -> list[Token]:
         """Run the lexer and return the token list."""
@@ -487,6 +520,28 @@ class Lexer:
         kw.setdefault("pos", self._pos)
         self._tokens.append(Token(kind=kind, value=value, **kw))
 
+    def _at_command_pos(self) -> bool:
+        """Return True if the next character is at command position.
+
+        Scans reversed ``_tokens`` past trailing whitespace.  Returns True
+        when the last non-WS token is NEWLINE / SEMI / DSEMI / AND_AND /
+        OR_OR / PIPE / BG / LPAREN, or a WORD whose value is in
+        ``(then, do, else, elif, in)``.  Returns True at start of input (empty
+        token list).  Returns False otherwise.
+        """
+        for t in reversed(self._tokens):
+            k = t.kind
+            if k in (TokenKind.WS, TokenKind.NEWLINE):
+                continue
+            if k in (TokenKind.SEMI, TokenKind.AND_AND, TokenKind.OR_OR,
+                     TokenKind.PIPE, TokenKind.BG, TokenKind.LPAREN,
+                     TokenKind.DSEMI):
+                return True
+            if k == TokenKind.WORD and t.value in ("then", "do", "else", "elif", "in"):
+                return True
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # main dispatch
     # ------------------------------------------------------------------
@@ -511,6 +566,32 @@ class Lexer:
         # --- unsupported: backtick ---
         if c == '`':
             raise ParseError("Backtick command substitution is not supported; use $(...)")
+
+        # --- DSEMI: ;; (case-clause terminator, must precede single-SEMI check) ---
+        if c == ';' and self._peek(1) == ';':
+            self._emit(TokenKind.DSEMI, ';;')
+            self._advance(2)
+            return
+
+        # --- LPAREN / RPAREN ---
+        if c == '(' and self._at_command_pos():
+            if self._peek(1) == '(':
+                raise ParseError("Arithmetic command ((...)) is not supported")
+            self._emit(TokenKind.LPAREN, '(')
+            self._advance()
+            self._paren_depth += 1
+            return
+        if c == ')' and self._paren_depth > 0:
+            self._emit(TokenKind.RPAREN, ')')
+            self._advance()
+            # When inside a case compound, the first ')' after 'in' closes
+            # the case *pattern*, not the subshell — do NOT decrement
+            # paren_depth so the real subshell closer is still recognised.
+            if self._expecting_case_rparen:
+                self._expecting_case_rparen = False
+            else:
+                self._paren_depth -= 1
+            return
 
         # At a word-start position — check for operators / redirects / subst
         rem = self._cmd[self._pos:]
@@ -665,17 +746,37 @@ class Lexer:
             raise ParseError(f"Redirects only support fds 1 and 2 (got {fd})")
 
         # -- none of the above: it's a regular word --
+        _before_word_cmd_pos = self._at_command_pos()
         self._lex_word()
+        # Track case/esac nesting so we can distinguish a case-pattern ')'
+        # from a subshell-closing ')' (BLOCKER 1).
+        if _before_word_cmd_pos and self._tokens:
+            _last = self._tokens[-1]
+            if _last.kind == TokenKind.WORD:
+                if _last.value == "case":
+                    self._case_nesting += 1
+                    self._expecting_case_rparen = True
+                elif _last.value == "esac" and self._case_nesting > 0:
+                    self._case_nesting -= 1
 
     # ------------------------------------------------------------------
     # word lexing (escape-aware)
     # ------------------------------------------------------------------
 
     def _lex_word(self) -> None:
-        """Read a shell word, handling escapes and quotes."""
+        """Read a shell word, handling escapes and quotes.
+
+        Tracks a word-local paren-balance counter so that ``(`` and ``)``
+        inside a word are consumed as regular characters when they form
+        matched pairs (e.g. ``(hi)``, ``x=(a)``).  An unmatched ``)``
+        terminates the word when *self._paren_depth* > 0 (i.e. inside a
+        subshell).  When *self._paren_depth* == 0, ``)`` is always a
+        regular character.
+        """
         start = self._pos
         chars: list[str] = []
         i = self._pos
+        word_paren_balance: int = 0  # ( increments, ) with balance>0 decrements
 
         while i < self._n:
             c = self._cmd[i]
@@ -737,8 +838,29 @@ class Lexer:
                 chars.append(self._cmd[dq_start:i])
                 continue
 
+            # word-local paren tracking (outside quotes)
+            if c == '(':
+                word_paren_balance += 1
+                chars.append(c)
+                i += 1
+                continue
+            if c == ')':
+                if word_paren_balance > 0:
+                    word_paren_balance -= 1
+                    chars.append(c)
+                    i += 1
+                    continue
+                # word_paren_balance == 0: this ')' is a potential subshell closer
+                if self._paren_depth > 0:
+                    break  # terminate word; ')' will be handled by _lex_one
+                # Outside a subshell, ')' is a regular character
+                chars.append(c)
+                i += 1
+                continue
+
             # word terminators (outside quotes)
-            if c in (' ', '\t', '\n', '|', ';', '&'):
+            _term = (' ', '\t', '\n', '|', ';', '&')
+            if c in _term:
                 break
 
             # $ outside quotes → let the main loop handle it (not mid-word)
@@ -1585,11 +1707,13 @@ def _build_ast(
 
         # Collect consecutive chain operators (last wins, matching
         # split_legacy's behaviour:  ;;  ,  ;&&  ,  ||;  etc.).
+        # DSEMI (;;) acts as a single ; outside case bodies.
         operator: Optional[str] = None
         while t is not None and t.kind in (TokenKind.SEMI,
                                              TokenKind.AND_AND,
-                                             TokenKind.OR_OR):
-            if t.kind == TokenKind.SEMI:
+                                             TokenKind.OR_OR,
+                                             TokenKind.DSEMI):
+            if t.kind in (TokenKind.SEMI, TokenKind.DSEMI):
                 operator = ";"
             elif t.kind == TokenKind.AND_AND:
                 operator = "&&"
@@ -1623,7 +1747,7 @@ def _build_ast(
             cmd = _parse_command()
             if cmd is not None:
                 # Compound commands must be the sole element of a pipeline.
-                if isinstance(cmd, (IfNode, WhileNode, ForNode)):
+                if isinstance(cmd, _COMPOUND_TYPES):
                     if commands:
                         raise ParseError(
                             "compound command cannot appear in a pipe"
@@ -1647,7 +1771,7 @@ def _build_ast(
         _skip_ws()
         t = _peek()
         if t is not None and t.kind == TokenKind.PIPE:
-            if any(isinstance(c, (IfNode, WhileNode, ForNode)) for c in commands):
+            if any(isinstance(c, _COMPOUND_TYPES) for c in commands):
                 raise ParseError(
                     "compound command cannot appear in a pipe"
                 )
@@ -1662,6 +1786,7 @@ def _build_ast(
         terminators: frozenset[str],
         *,
         track_nesting: bool = True,
+        unconditional_terminators: frozenset[str] = frozenset(),
     ) -> tuple[str, int]:
         """Scan tokens from *pos* forward, tracking compound nesting.
 
@@ -1672,6 +1797,9 @@ def _build_ast(
 
         *terminators* are the reserved words that end this body at depth 0
         (e.g. ``{"then"}``, ``{"done"}``, ``{"fi"}``, ``{"elif","else","fi"}``).
+
+        *unconditional_terminators* are words recognised even when NOT at
+        command position (used for ``esac`` when no ``;;`` precedes it).
 
         Raises :class:`ParseError` for unexpected reserved words at depth 0
         or missing terminators at EOF.
@@ -1685,18 +1813,22 @@ def _build_ast(
             )
 
         body_start = tokens[pos].pos
-        depth = 0
+        depth = 0           # tracks (…) subshell nesting (LPAREN/RPAREN)
+        compound_depth = 0  # tracks if/for/while/until/case … fi/done/esac
+        compound_stack: list[str] = []  # which compound opened each level
+        _in_case_compound = False       # set when the most recent compound is 'case'
         expect_command = True  # first token after opening keyword is at cmd position
 
         # Compound openers / closers that affect nesting depth.
-        _COMPOUND_OPENERS = frozenset({"if", "for", "while", "until", "case", "("})
-        _COMPOUND_CLOSERS = frozenset({"fi", "done", "esac", ")"})
+        # Parens are now separate TokenKind values (LPAREN/RPAREN), not WORD tokens.
+        _COMPOUND_OPENERS = frozenset({"if", "for", "while", "until", "case"})
+        _COMPOUND_CLOSERS = frozenset({"fi", "done", "esac"})
 
         # Keywords that are ALWAYS recognized as terminators, even without
-        # a preceding separator (then/do/else/elif).  These are "unconditional
+        # a preceding separator (then/do/else/elif/in).  These are "unconditional
         # keywords" in POSIX — they terminate the preceding construct regardless
         # of whether there's a ; or newline before them.
-        _ALWAYS_KEYWORD = frozenset({"then", "do", "else", "elif"})
+        _ALWAYS_KEYWORD = frozenset({"then", "do", "else", "elif", "in"})
 
         while pos < n:
             t = tokens[pos]
@@ -1749,44 +1881,110 @@ def _build_ast(
                 pos += 1
                 continue
 
+            # LPAREN — open a subshell (track_nesting controls depth tracking).
+            if kind == TokenKind.LPAREN:
+                if track_nesting:
+                    depth += 1
+                expect_command = True
+                pos += 1
+                continue
+
+            # RPAREN — close a subshell or act as a terminator.
+            if kind == TokenKind.RPAREN:
+                if track_nesting and depth > 0:
+                    depth -= 1
+                    expect_command = False
+                    pos += 1
+                    continue
+                # Not inside a tracked subshell — check if it's our terminator.
+                if ")" in terminators and compound_depth == 0:
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
+                raise ParseError("unexpected ')'")
+
+            # DSEMI — case-clause terminator.
+            if kind == TokenKind.DSEMI:
+                if depth == 0 and compound_depth == 0 and ";;" in terminators:
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
+                # Inside a nested compound: treat as a command separator,
+                # not our terminator.
+                expect_command = True
+                pos += 1
+                continue
+
             # WORD — check for reserved words.
             if kind == TokenKind.WORD:
                 word = t.value
                 if expect_command and track_nesting and word in _COMPOUND_OPENERS:
-                    depth += 1
+                    compound_depth += 1
+                    compound_stack.append(word)
+                    _in_case_compound = (word == "case")
                     expect_command = False
                     pos += 1
                     continue
                 if expect_command and track_nesting and word in _COMPOUND_CLOSERS:
-                    if depth > 0:
-                        depth -= 1
+                    if compound_depth > 0:
+                        compound_depth -= 1
+                        if compound_stack:
+                            compound_stack.pop()
+                        # Update _in_case_compound from the new top-of-stack
+                        _in_case_compound = (
+                            len(compound_stack) > 0
+                            and compound_stack[-1] == "case"
+                        )
                         expect_command = False
                         pos += 1
                         continue
-                    # depth == 0: this is a closer. Is it our terminator?
-                    if word in terminators:
+                    # compound_depth == 0: this is a closer. Is it our terminator?
+                    if word in terminators and depth == 0:
                         body_end = t.pos
                         return command[body_start:body_end], pos
                     raise ParseError(f"unexpected '{word}'")
-                if expect_command and word in terminators:
+                if expect_command and word in terminators and depth == 0 and compound_depth == 0:
                     # Found our terminator at depth 0.
                     body_end = t.pos
                     return command[body_start:body_end], pos
                 # Always-keyword terminators (then/do/else/elif) are
                 # recognized even without a preceding separator.
-                if word in _ALWAYS_KEYWORD and word in terminators:
+                if word in _ALWAYS_KEYWORD and word in terminators and depth == 0 and compound_depth == 0:
                     body_end = t.pos
                     return command[body_start:body_end], pos
+                # Unconditional terminators are recognised even when NOT at
+                # command position (e.g. esac when no ;; precedes it).
+                if word in unconditional_terminators and word in terminators and depth == 0 and compound_depth == 0:
+                    body_end = t.pos
+                    return command[body_start:body_end], pos
+                # Handle 'in' inside a case compound — consume the case pattern
+                # via _scan_case_pattern so the pattern's ')' doesn't disturb
+                # subshell-nesting tracking (BLOCKER 1).
+                if word == "in" and _in_case_compound and depth == 0 and compound_depth > 0:
+                    # The next token starts the case pattern.  Use
+                    # _scan_case_pattern to skip past the pattern and its
+                    # closing ')' without affecting depth tracking.
+                    _skip_ws()
+                    if pos < n:
+                        pattern_start = tokens[pos].pos
+                        _scan_case_pattern(pattern_start)
+                    expect_command = True
+                    continue
                 # An always-keyword at command position at depth 0 that's
                 # NOT a valid terminator is a syntax error (e.g. bare "then"
                 # or "do" at the top level of a body that isn't looking for
                 # them).  At depth > 0 they belong to a nested compound.
-                if expect_command and depth == 0 and word in _ALWAYS_KEYWORD:
+                if expect_command and depth == 0 and compound_depth == 0 and word in _ALWAYS_KEYWORD:
                     raise ParseError(f"unexpected '{word}'")
                 # An always-keyword at depth > 0 resets expect_command so the
                 # next word is at command position for nested compound
                 # tracking (matching split_chains' _CMD_START_KW behaviour).
                 if word in _ALWAYS_KEYWORD:
+                    # When 'in' appears inside a case compound at depth>0,
+                    # consume the pattern if we're directly inside the 'case'.
+                    if word == "in" and _in_case_compound:
+                        _skip_ws()
+                        if pos < n:
+                            pattern_start = tokens[pos].pos
+                            _scan_case_pattern(pattern_start)
                     expect_command = True
                     pos += 1
                     continue
@@ -1977,6 +2175,154 @@ def _build_ast(
             body=body_text,
         )
 
+    # ------------------------------------------------------------------
+    # _parse_case — parse case/esac
+    # ------------------------------------------------------------------
+
+    def _parse_case() -> CaseNode:
+        """Parse ``case WORD in [ [(] pattern ) body ;; ]... esac``.
+
+        Caller has already detected the ``case`` keyword.
+        """
+        nonlocal pos
+        _skip_ws()
+        case_tok = _consume()
+        assert case_tok is not None and _is_reserved(case_tok, "case")
+
+        # Read subject word (no nesting tracking — we stop at "in").
+        subject_text, subject_pos = _slice_body(frozenset({"in"}), track_nesting=False)
+        subject = subject_text.strip()
+        if not subject:
+            raise ParseError("case: missing subject before 'in'")
+
+        # Consume 'in'.
+        _skip_ws()
+        in_tok = _consume()
+        if in_tok is None or not _is_reserved(in_tok, "in"):
+            raise ParseError("case: expected 'in'")
+
+        clauses: list[CaseClause] = []
+
+        while True:
+            _skip_ws()
+            t = _peek()
+            if t is None:
+                raise ParseError("case: unexpected EOF looking for 'esac'")
+            if _is_reserved(t, "esac"):
+                _consume()
+                break
+
+            # Optional leading LPAREN before pattern.
+            if t.kind == TokenKind.LPAREN:
+                _consume()
+
+            # Scan the pattern text from the original command string.
+            pattern_start = tokens[pos].pos if pos < n else len(command)
+            pattern_text = _scan_case_pattern(pattern_start)
+            if not pattern_text:
+                raise ParseError("case: empty pattern")
+
+            # Slice body until ;; or esac.  The first pass uses normal
+            # terminators; if it fails (e.g. because esac appears without a
+            # preceding ;;), retry with esac as an unconditional terminator.
+            saved_body_pos = pos
+            try:
+                body_text, body_pos = _slice_body(frozenset({";;", "esac"}))
+            except ParseError:
+                pos = saved_body_pos
+                body_text, body_pos = _slice_body(
+                    frozenset({"esac"}),
+                    unconditional_terminators=frozenset({"esac"}),
+                )
+
+            # Check which terminator we hit.
+            _skip_ws()
+            bt = _peek()
+            if bt is not None and _is_reserved(bt, "esac"):
+                _consume()
+                clauses.append(CaseClause(pattern=pattern_text, body=body_text))
+                break
+            if bt is not None and bt.kind == TokenKind.DSEMI:
+                _consume()
+                clauses.append(CaseClause(pattern=pattern_text, body=body_text))
+                continue
+            raise ParseError("case: expected ';;' or 'esac' after clause body")
+
+        return CaseNode(subject=subject, clauses=tuple(clauses))
+
+    def _scan_case_pattern(start_pos: int) -> str:
+        """Scan a ``case`` pattern from the original command string.
+
+        Reads from *start_pos* in ``command``, quote-aware, tracking
+        ``(``/``)`` depth.  Stops at ``)`` at depth 0.  Returns the
+        pattern text (stripped).  Advances *pos* past the closing ``)``.
+        """
+        nonlocal pos
+        i = start_pos
+        n2 = len(command)
+        depth = 0
+        quote: Optional[str] = None
+
+        while i < n2:
+            c = command[i]
+            if quote is not None:
+                if c == quote:
+                    quote = None
+                i += 1
+                continue
+            if c == '\\' and i + 1 < n2:
+                i += 2  # skip escaped char
+                continue
+            if c in ("'", '"'):
+                quote = c
+                i += 1
+                continue
+            if c == '(':
+                depth += 1
+                i += 1
+                continue
+            if c == ')':
+                if depth == 0:
+                    # Found the closing paren at this depth.
+                    pattern_text = command[start_pos:i].strip()
+                    # Advance token stream position past this ')'.
+                    # The ')' may not have produced a token (when lexed
+                    # outside any subshell).  Skip forward past tokens
+                    # whose position is at or before i, then skip
+                    # trailing WS/NEWLINE.
+                    while pos < n and tokens[pos].pos <= i:
+                        pos += 1
+                    while pos < n and tokens[pos].kind in (TokenKind.WS, TokenKind.NEWLINE):
+                        pos += 1
+                    return pattern_text
+                depth -= 1
+                i += 1
+                continue
+            i += 1
+
+        raise ParseError("case: missing ')' in pattern")
+
+    # ------------------------------------------------------------------
+    # _parse_subshell — parse ( command; ... )
+    # ------------------------------------------------------------------
+
+    def _parse_subshell() -> SubshellNode:
+        """Parse ``( command; ... )`` — subshell compound command.
+
+        Caller has already detected the LPAREN token.
+        """
+        nonlocal pos
+        _skip_ws()
+        lparen = _consume()
+        assert lparen is not None and lparen.kind == TokenKind.LPAREN
+
+        body_text, _ = _slice_body(frozenset({")"}))
+        _skip_ws()
+        rparen = _consume()
+        if rparen is None or rparen.kind != TokenKind.RPAREN:
+            raise ParseError("subshell: missing ')'")
+        return SubshellNode(body=body_text)
+
     def _parse_command() -> Optional[CommandLike]:
         nonlocal pos
 
@@ -1994,11 +2340,16 @@ def _build_ast(
                 return _parse_while(until=True)
             if _is_reserved(t, "for"):
                 return _parse_for()
+            if _is_reserved(t, "case"):
+                return _parse_case()
             # Reserved words that should never appear at command position
             # (they only make sense inside a compound body).
             if t.value in ("fi", "then", "else", "elif", "do", "done",
-                           "esac", "case", "function", "in"):
+                           "esac", "function", "in"):
                 raise ParseError(f"unexpected '{t.value}'")
+        # LPAREN at command position — subshell.
+        if t is not None and t.kind == TokenKind.LPAREN:
+            return _parse_subshell()
         # Restore position for normal command parsing.
         pos = saved_pos
 
@@ -2280,6 +2631,10 @@ def _serialize_command(cmd: "CommandLike", sentinel: bool = False) -> str:
         return "<while loop>" if not cmd.until else "<until loop>"
     if isinstance(cmd, ForNode):
         return "<for loop>"
+    if isinstance(cmd, CaseNode):
+        return "<case statement>"
+    if isinstance(cmd, SubshellNode):
+        return "<subshell>"
 
     if sentinel:
         word_serialize = lambda w: w.serialized()  # noqa: E731
@@ -2388,10 +2743,11 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
     tokens = Lexer(command).tokenize()
 
     # First pass: compute which separators are at depth 0 (outside compounds).
-    _COMPOUND_OPENERS = frozenset({"if", "for", "while", "until", "case", "("})
-    _COMPOUND_CLOSERS = frozenset({"fi", "done", "esac", ")"})
+    # Parens are now LPAREN/RPAREN tokens, not WORD tokens.
+    _COMPOUND_OPENERS = frozenset({"if", "for", "while", "until", "case"})
+    _COMPOUND_CLOSERS = frozenset({"fi", "done", "esac"})
     # Keywords that start a new command context (like chain separators).
-    _CMD_START_KW = frozenset({"then", "else", "elif", "do"})
+    _CMD_START_KW = frozenset({"then", "else", "elif", "do", "in"})
 
     depth = 0
     expect_command = True
@@ -2407,6 +2763,8 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
             expect_command = True
             continue
         # Chain separators: ; && || & — but NOT | (pipe stays in segment).
+        # DSEMI (;;) is NOT a chain separator here — it only appears inside
+        # case constructs and must stay in the same segment as the case.
         if kind in (TokenKind.SEMI, TokenKind.AND_AND,
                     TokenKind.OR_OR, TokenKind.BG):
             if depth == 0:
@@ -2416,6 +2774,21 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
         # Pipe resets command position (pipeline stage boundary) but is
         # NOT a chain separator — the whole pipeline stays in one segment.
         if kind == TokenKind.PIPE:
+            expect_command = True
+            continue
+        # LPAREN / RPAREN — track subshell depth.
+        if kind == TokenKind.LPAREN:
+            depth += 1
+            expect_command = True
+            continue
+        if kind == TokenKind.RPAREN:
+            if depth > 0:
+                depth -= 1
+            expect_command = False
+            continue
+        # DSEMI — NOT a chain separator, but resets command position
+        # (so esac after ;; is at command position).
+        if kind == TokenKind.DSEMI:
             expect_command = True
             continue
         if kind == TokenKind.WORD and expect_command:
@@ -2462,7 +2835,7 @@ def split_chains(command: str) -> list[tuple[Optional[str], str, bool]]:
             result.append((next_op, seg_text, bg))
             next_op = None
 
-        if kind == TokenKind.SEMI:
+        if kind in (TokenKind.SEMI, TokenKind.DSEMI):
             next_op = ";"
         elif kind == TokenKind.AND_AND:
             next_op = "&&"
@@ -2531,6 +2904,9 @@ def segment_needs_variable_state(seg_text: str) -> bool:
             # This token is the redirect target (WORD, SUBST, or VARREF) — skip it
             expect_redirect_target = False
             continue
+        # LPAREN at command position — subshell, requires stateful execution.
+        if t.kind == TokenKind.LPAREN:
+            return True
         if t.kind == TokenKind.WORD:
             # Check assignment: VAR=value
             if _ASSIGN_WORD_RE.match(t.value):
