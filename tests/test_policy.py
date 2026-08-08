@@ -55,8 +55,8 @@ class GitConfigPathsTest(unittest.TestCase):
 class CosmoToolchainPathsTest(unittest.TestCase):
     def test_paths_resolved(self) -> None:
         paths = server._cosmo_toolchain_paths()
-        # toolchain tree + busybox binary + APE loader
-        self.assertEqual(len(paths), 3)
+        # toolchain tree + busybox binary
+        self.assertEqual(len(paths), 2)
         for p in paths:
             self.assertTrue(Path(p).is_absolute())
             self.assertEqual(str(Path(p).resolve()), p)

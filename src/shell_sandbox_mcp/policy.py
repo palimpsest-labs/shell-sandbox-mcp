@@ -110,14 +110,12 @@ def _stage_git_global_config() -> str:
 def _cosmo_toolchain_paths(work_dir: Optional[Path] = None) -> list[str]:
     """Return the paths that must be unveiled read-execute for the vendored
     cosmocc toolchain to run: the toolchain tree itself (its compilers read
-    headers/libs from it), the busybox binary (used as a non-preserving `mv`
-    by build tools), and the Cosmopolitan APE loader under $HOME. The loaders
-    at /usr/bin are already unveiled by the sandbox default.
+    headers/libs from it) and the busybox binary (used as a non-preserving `mv`
+    by build tools).
     """
     return [
         str(COSMO_TOOLCHAIN.resolve()),
         str(BUSYBOX_BIN.resolve()),
-        str((Path.home().resolve() / ".ape-1.10").resolve()),
     ]
 
 

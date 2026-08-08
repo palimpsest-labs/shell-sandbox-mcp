@@ -1,2 +1,32 @@
 #!/bin/sh
-exec "$(dirname "$0")/sandbox" "$@"
+# Always include the APE loader so cosmo APE toolchain binaries AND
+# user-compiled APE binaries can self-exec through their polyglot shell
+# stubs (which hardcode "${TMPDIR:-${HOME:-.}}/.ape-1.10" — no env
+# override). The stub falls back to /bin/sh on hosts without binfmt_misc,
+# which then needs the file at $HOME/.ape-1.10. We bootstrap it from the
+# vendored copy so the sandbox is self-contained on any host.
+set -u
+BIN_DIR=$(dirname "$0")
+APE_LOADER="${HOME}/.ape-1.10"
+
+# Pick the right arch (matches cosmocc's own ape installer convention).
+case "$(uname -m)" in
+    x86_64|amd64) VENDORED="${BIN_DIR}/cosmo-toolchain/bin/ape-x86_64.elf" ;;
+    aarch64|arm64) VENDORED="${BIN_DIR}/cosmo-toolchain/bin/ape-aarch64.elf" ;;
+    *) VENDORED="${BIN_DIR}/cosmo-toolchain/bin/ape-x86_64.elf" ;;
+esac
+
+# Bootstrap: if the host doesn't have it (or has a stale/different copy),
+# install the vendored loader. Atomic via temp+rename; tolerate races.
+if [ -f "$VENDORED" ] && ! cmp -s "$VENDORED" "$APE_LOADER" 2>/dev/null; then
+    tmp=$(mktemp "${HOME}/.ape-1.10.XXXXXX" 2>/dev/null) && \
+        cp "$VENDORED" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$APE_LOADER" \
+        || echo "run-sandbox: warning: could not install APE loader to $APE_LOADER" >&2
+fi
+
+if [ -n "${SANDBOX_UNVEIL_RX:-}" ]; then
+    export SANDBOX_UNVEIL_RX="${SANDBOX_UNVEIL_RX}:${APE_LOADER}"
+else
+    export SANDBOX_UNVEIL_RX="${APE_LOADER}"
+fi
+exec "${BIN_DIR}/sandbox" "$@"
