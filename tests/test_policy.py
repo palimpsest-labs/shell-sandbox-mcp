@@ -235,7 +235,8 @@ class NoPledgeFlagTest(unittest.TestCase):
 
 class BusyboxPromiseOverridesTest(unittest.TestCase):
     """Test that _resolve_command returns correct promises for busybox applets
-    with overrides (touch gets fattr; xargs/find stay at base promises)."""
+    with overrides (touch gets fattr; xargs/find get proc+prot_exec for
+    subprocess spawning)."""
 
     def test_touch_has_fattr(self) -> None:
         _bin, _args, cfg = server._resolve_command(["touch"])
@@ -243,14 +244,24 @@ class BusyboxPromiseOverridesTest(unittest.TestCase):
         self.assertNotIn("proc", cfg["promises"])
         self.assertNotIn("git_subprocess_aware", cfg)
 
-    def test_xargs_base_promises_only(self) -> None:
+    def test_xargs_can_spawn(self) -> None:
         _bin, _args, cfg = server._resolve_command(["xargs"])
-        self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
+        self.assertIn("proc", cfg["promises"])
+        self.assertIn("prot_exec", cfg["promises"])
+        self.assertIn("extra_unveil", cfg)
+        joined = ":".join(cfg["extra_unveil"])
+        self.assertIn(".gitconfig", joined)
+        self.assertNotIn(".git-credentials", joined)
         self.assertNotIn("git_subprocess_aware", cfg)
 
-    def test_find_base_promises_only(self) -> None:
+    def test_find_can_spawn(self) -> None:
         _bin, _args, cfg = server._resolve_command(["find"])
-        self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
+        self.assertIn("proc", cfg["promises"])
+        self.assertIn("prot_exec", cfg["promises"])
+        self.assertIn("extra_unveil", cfg)
+        joined = ":".join(cfg["extra_unveil"])
+        self.assertIn(".gitconfig", joined)
+        self.assertNotIn(".git-credentials", joined)
         self.assertNotIn("git_subprocess_aware", cfg)
 
     def test_cat_has_base_promises_only(self) -> None:
@@ -268,6 +279,55 @@ class BusyboxPromiseOverridesTest(unittest.TestCase):
         self.assertEqual(cfg["promises"], "stdio rpath wpath cpath")
         self.assertNotIn("git_subprocess_aware", cfg)
 
+
+# ---------------------------------------------------------------------------
+# Subprocess-spawning commands: git config unveil security
+# ---------------------------------------------------------------------------
+
+
+class SubprocessSpawningPromisesTest(unittest.TestCase):
+    """Verify that commands that can spawn subprocesses (and therefore might
+    run git as a child) get ~/.gitconfig unveiled read-only but NEVER
+    ~/.git-credentials."""
+
+    @staticmethod
+    def _assert_gitconfig_not_credentials(paths: list[str]) -> None:
+        joined = ":".join(paths)
+        assert ".gitconfig" in joined, (
+            f"expected .gitconfig in unveil paths: {joined}"
+        )
+        assert ".git-credentials" not in joined, (
+            f"SECURITY: .git-credentials leaked into unveil: {joined}"
+        )
+
+    def test_xargs_unveil_has_gitconfig_not_credentials(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["xargs"])
+        self.assertIn("extra_unveil", cfg)
+        self._assert_gitconfig_not_credentials(cfg["extra_unveil"])
+
+    def test_find_unveil_has_gitconfig_not_credentials(self) -> None:
+        _bin, _args, cfg = server._resolve_command(["find"])
+        self.assertIn("extra_unveil", cfg)
+        self._assert_gitconfig_not_credentials(cfg["extra_unveil"])
+
+    def test_python3_unveil_has_gitconfig_not_credentials(self) -> None:
+        cfg = server.COMMANDS["python3"]
+        self.assertIn("extra_unveil", cfg)
+        self._assert_gitconfig_not_credentials(cfg["extra_unveil"])
+
+    def test_local_binary_unveil_has_gitconfig_not_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+            script = work_dir / "test-script"
+            script.write_text("#!/bin/sh\necho hello\n")
+            script.chmod(0o755)
+            _bin, _args, cfg = server._resolve_command(
+                ["./test-script"], work_dir=work_dir,
+            )
+        self.assertIn("proc", cfg["promises"])
+        self.assertIn("prot_exec", cfg["promises"])
+        self.assertIn("extra_unveil", cfg)
+        self._assert_gitconfig_not_credentials(cfg["extra_unveil"])
 
 
 if __name__ == "__main__":

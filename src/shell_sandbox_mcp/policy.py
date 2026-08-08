@@ -327,6 +327,9 @@ COMMANDS = {
         # (the interpreter is dynamically linked, unlike the self-contained
         # cosmo APE).
         "extra_unveil_rx": _python_musl_paths,
+        # Let python-subprocess git read ~/.gitconfig (config only, never
+        # ~/.git-credentials — security invariant).
+        "extra_unveil": _git_config_paths(),
         # Set SSL_CERT_FILE so the vendored musl CPython can verify TLS
         # certificates from any cwd (its default CA bundle is under the
         # vendored deps/ tree, which is not unveiled; /etc/ssl is already
@@ -361,6 +364,16 @@ _BUSYBOX_BASE_PROMISES = "stdio rpath wpath cpath"
 # Per-applet promise suffix overrides (appended to _BUSYBOX_BASE_PROMISES).
 _BUSYBOX_PROMISE_OVERRIDES: dict[str, str] = {
     "touch": " fattr",
+    "xargs": " proc prot_exec",
+    "find": " proc prot_exec",
+}
+
+# Applets that spawn subprocesses get the user's git config unveiled (read-only,
+# never the credential file) so spawned git can read user.name/email. The cred
+# store stays out of the unveil of ANY fork/exec-capable parent (security).
+_BUSYBOX_UNVEIL_OVERRIDES: dict[str, list[str]] = {
+    "xargs": _git_config_paths(),
+    "find": _git_config_paths(),
 }
 
 
@@ -427,6 +440,7 @@ def _maybe_venv_cfg(
         "is_venv": True,
         "pythonpath_extra": COMMANDS["python3"].get("pythonpath_extra", []),
         "extra_unveil_rx": COMMANDS["python3"].get("extra_unveil_rx"),
+        "extra_unveil": COMMANDS["python3"].get("extra_unveil"),
         "env": dict(COMMANDS["python3"].get("env", {})),
     }
 
@@ -464,6 +478,7 @@ def _resolve_venv_fallback(
         "is_venv": True,
         "pythonpath_extra": COMMANDS["python3"].get("pythonpath_extra", []),
         "extra_unveil_rx": COMMANDS["python3"].get("extra_unveil_rx"),
+        "extra_unveil": COMMANDS["python3"].get("extra_unveil"),
         "env": dict(COMMANDS["python3"].get("env", {})),
     }
 
@@ -495,6 +510,8 @@ def _resolve_command(
             "promises": promises,
             "description": f"BusyBox {cmd_name}",
         }
+        if cmd_name in _BUSYBOX_UNVEIL_OVERRIDES:
+            cfg["extra_unveil"] = _BUSYBOX_UNVEIL_OVERRIDES[cmd_name]
         binary = cfg["binary"]
         full_args = [binary, cmd_name] + args[1:]
         return binary, full_args, cfg
@@ -520,9 +537,10 @@ def _resolve_command(
             if cfg is None:
                 cfg = {
                     "binary": binary,
-                    "promises": "stdio rpath wpath cpath prot_exec",
+                    "promises": "stdio rpath wpath cpath prot_exec proc",
                     "description": f"Local binary under cwd: {binary}",
                     "is_local_binary": True,
+                    "extra_unveil": _git_config_paths(),
                     "extra_unveil_rx": _musl_rtlib_paths,
                     "env": {
                         "SANDBOX_MUSL_LOADER": str(MUSL_LOADER.resolve()),

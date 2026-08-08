@@ -862,6 +862,60 @@ class BuildInvocationNoPledgeTest(unittest.TestCase):
                          "make must NOT set SANDBOX_NO_PLEDGE")
 
 
+class BuildInvocationUnveilRTest(unittest.TestCase):
+    """Test that _build_invocation correctly translates extra_unveil →
+    SANDBOX_UNVEIL_R without leaking credential paths.
+
+    These are pure unit tests — no sandbox binary or subprocess spawn needed.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _assert_unveil_r(self, command: str, expect_present: bool = True) -> dict:
+        """Call _build_invocation and assert SANDBOX_UNVEIL_R invariants."""
+        inv = _build_invocation(command, self.root)
+        self.assertIsInstance(inv, Invocation,
+                              f"Expected Invocation for {command!r}, got {type(inv).__name__}")
+        self.assertIsNotNone(inv.env, f"env must not be None for {command!r}")
+        unveil_r = inv.env.get("SANDBOX_UNVEIL_R")
+        if expect_present:
+            self.assertIsNotNone(unveil_r,
+                                 f"SANDBOX_UNVEIL_R must be set for {command!r}")
+            self.assertIn(".gitconfig", unveil_r,
+                          f"SANDBOX_UNVEIL_R must contain .gitconfig for {command!r}: {unveil_r}")
+            self.assertNotIn(".git-credentials", unveil_r,
+                             f"SANDBOX_UNVEIL_R must NOT contain .git-credentials "
+                             f"for {command!r}: {unveil_r}")
+        else:
+            self.assertIsNone(unveil_r,
+                              f"SANDBOX_UNVEIL_R should not be set for {command!r}")
+        return inv.env
+
+    def test_xargs_has_unveil_r_config_not_creds(self) -> None:
+        """xargs (busybox applet) — .gitconfig unveiled, credentials never."""
+        self._assert_unveil_r("xargs echo hi")
+
+    def test_find_has_unveil_r_config_not_creds(self) -> None:
+        """find (busybox applet) — .gitconfig unveiled, credentials never."""
+        self._assert_unveil_r("find . -name foo")
+
+    def test_python3_has_unveil_r_config_not_creds(self) -> None:
+        """python3 — .gitconfig unveiled for subprocess git, credentials never."""
+        self._assert_unveil_r("python3 -c pass")
+
+    def test_local_binary_has_unveil_r_config_not_creds(self) -> None:
+        """Local binary under cwd — .gitconfig unveiled, credentials never."""
+        mybin = self.root / "mybinary"
+        mybin.write_text("#!/bin/sh\necho hi")
+        mybin.chmod(0o755)
+        self._assert_unveil_r("./mybinary")
+
+
 # ---------------------------------------------------------------------------
 # timeout builtin real-subprocess integration tests
 # ---------------------------------------------------------------------------
