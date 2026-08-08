@@ -192,6 +192,28 @@ def _build_invocation(
     # path, so git uses the staged copy rather than ~/.gitconfig directly.
     if cfg.get("is_git"):
         unveil_env["GIT_CONFIG_GLOBAL"] = srv._stage_git_global_config()
+    # Redirect CARGO_HOME into the workspace (cargo_home is a relative dir
+    # under work_dir, e.g. ".cargo-home"). Cargo's registry cache, index, and
+    # global config then stay inside the sandboxed tree (which is unveiled
+    # rwcx), instead of $HOME/.cargo which is not unveiled. Without this,
+    # cargo builds that fetch dependencies fail with Permission denied. This
+    # mirrors the python3 site_dir_name pattern above.
+    cargo_home = cfg.get("cargo_home")
+    if cargo_home:
+        cargo_base = (work_dir / cargo_home).resolve()
+        # Defense-in-depth: cargo_home is a trusted constant (".cargo-home"),
+        # but guard against a future configurable value escaping the tree.
+        try:
+            cargo_base.relative_to(work_dir.resolve())
+        except ValueError:
+            return InvocationError(
+                f"cargo_home path '{cargo_home}' escapes the working directory"
+            )
+        try:
+            cargo_base.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return InvocationError(f"Error creating cargo home dir {cargo_base}: {e}")
+        unveil_env["CARGO_HOME"] = str(cargo_base)
     # Per-command no_pledge flag: when set, skip pledge entirely (set
     # SANDBOX_NO_PLEDGE=1). Used for commands whose subprocesses need
     # syscalls that no cosmocc pledge token permits (e.g. git-lfs needs

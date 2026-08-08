@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from shell_sandbox_mcp import server
+from shell_sandbox_mcp.server import _build_invocation, Invocation
 
 
 class CargoPromisesContractTest(unittest.TestCase):
@@ -45,6 +46,34 @@ class CargoPromisesContractTest(unittest.TestCase):
     def test_no_no_pledge(self) -> None:
         self.assertFalse(server.COMMANDS["cargo"].get("no_pledge", False),
                          "cargo must keep pledge() active (unveil+pledge boundary)")
+
+
+class CargoHomeEnvTest(unittest.TestCase):
+    """_build_invocation must redirect CARGO_HOME into the workspace so cargo's
+    registry cache / config stay inside the unveiled tree instead of $HOME/.cargo."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_cargo_invocation_sets_cargo_home_in_workdir(self) -> None:
+        inv = _build_invocation("cargo build", self.root)
+        self.assertIsInstance(inv, Invocation)
+        self.assertIsNotNone(inv.env)
+        ch = inv.env.get("CARGO_HOME")
+        self.assertIsNotNone(ch, "cargo invocation must set CARGO_HOME")
+        # must be inside the work_dir (the unveiled tree)
+        self.assertEqual(str(Path(ch).resolve()), str((self.root / ".cargo-home").resolve()))
+        self.assertTrue(Path(ch).is_dir(), "CARGO_HOME dir should be created")
+
+    def test_non_cargo_commands_do_not_set_cargo_home(self) -> None:
+        inv = _build_invocation("make build", self.root)
+        self.assertIsInstance(inv, Invocation)
+        self.assertIsNotNone(inv.env)
+        self.assertNotIn("CARGO_HOME", inv.env)
 
 
 class CargoEndToEndTest(unittest.TestCase):

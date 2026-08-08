@@ -192,6 +192,13 @@ COMMANDS = {
         # inet/dns: cargo may fetch crates from a registry (crates.io) during
         #   `cargo build`/`fetch` when the lockfile is regenerated.
         "promises": "stdio rpath wpath cpath proc prot_exec flock fattr inet dns",
+        # Redirect CARGO_HOME into the workspace (<cwd>/.cargo-home) so cargo's
+        # registry cache and global config stay inside the sandboxed tree
+        # (work_dir is unveiled rwcx, so no extra unveil is needed). Without
+        # this, cargo writes to $HOME/.cargo, which is not unveiled, and any
+        # build with [dependencies] fails with Permission denied. Mirrors the
+        # python3 site_dir_name pattern.
+        "cargo_home": ".cargo-home",
         "description": "Rust package manager (build, test, check, fmt, clippy)",
     },
     "make": {
